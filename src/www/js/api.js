@@ -169,4 +169,19 @@ class API {
     });
   }
 
+  async getServerConfig() {
+    return this.call({
+      method: 'get',
+      path: '/wireguard/server-config',
+    });
+  }
+
+  async updateServerConfig(settings) {
+    return this.call({
+      method: 'put',
+      path: '/wireguard/server-config',
+      body: settings,
+    });
+  }
+
 }

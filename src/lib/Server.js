@@ -274,6 +274,14 @@ module.exports = class Server {
         }
         await WireGuard.updatePortForward(clientId, Number(index), proto, Number(extPort), Number(intPort));
         return { success: true };
+      }))
+      .get('/api/wireguard/server-config', defineEventHandler(async () => {
+        return WireGuard.getServerConfig();
+      }))
+      .put('/api/wireguard/server-config', defineEventHandler(async (event) => {
+        const body = await readBody(event);
+        const result = await WireGuard.updateServerConfig(body);
+        return result;
       }));
 
     const safePathJoin = (base, target) => {

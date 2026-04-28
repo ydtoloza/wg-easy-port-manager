@@ -68,6 +68,13 @@ new Vue({
     editingPfClientId: null,
     editingPfIndex: null,
     editingPfRule: {},
+    expandedPfClients: {},
+
+    // Server config (global IP settings)
+    showServerConfig: false,
+    serverConfig: null,
+    serverConfigEdit: null,
+    serverConfigSaving: false,
 
     currentRelease: null,
     latestRelease: null,
@@ -170,6 +177,18 @@ new Vue({
         minute: 'numeric',
       }).format(value);
     },
+    getNewPf(clientId) {
+      if (!this.newPf[clientId]) {
+        this.$set(this.newPf, clientId, { proto: 'tcp', extPort: null, intPort: null });
+      }
+      return this.newPf[clientId];
+    },
+    isPfExpanded(clientId) {
+      return !!this.expandedPfClients[clientId];
+    },
+    togglePfExpanded(clientId) {
+      this.$set(this.expandedPfClients, clientId, !this.expandedPfClients[clientId]);
+    },
     async refresh({
       updateCharts = false,
     } = {}) {
@@ -189,8 +208,14 @@ new Vue({
           this.clientsPersist[client.id].transferTxPrevious = client.transferTx;
         }
 
+        // Ensure newPf entry exists for this client (reactive)
         if (!this.newPf[client.id]) {
           this.$set(this.newPf, client.id, { proto: 'tcp', extPort: null, intPort: null });
+        }
+
+        // Auto-expand if client has port forwards
+        if (client.portForwards && client.portForwards.length > 0 && this.expandedPfClients[client.id] === undefined) {
+          this.$set(this.expandedPfClients, client.id, true);
         }
 
         // Debug
@@ -333,13 +358,14 @@ new Vue({
         intPort: pf.intPort
       })
       .then(() => {
-        pf.extPort = null;
-        pf.intPort = null;
+        this.$set(this.newPf, client.id, { proto: 'tcp', extPort: null, intPort: null });
+        this.$set(this.expandedPfClients, client.id, true);
       })
       .catch((err) => alert(err.message || err.toString()))
       .finally(() => this.refresh().catch(console.error));
     },
     removePortForward(client, index) {
+      if (!confirm('¿Eliminar esta regla de redirección?')) return;
       this.api.removePortForward({ clientId: client.id, index })
         .catch((err) => alert(err.message || err.toString()))
         .finally(() => this.refresh().catch(console.error));
@@ -368,6 +394,35 @@ new Vue({
       })
       .catch((err) => alert(err.message || err.toString()))
       .finally(() => this.refresh().catch(console.error));
+    },
+    // Server Config methods
+    openServerConfig() {
+      this.serverConfigSaving = false;
+      this.api.getServerConfig()
+        .then((config) => {
+          this.serverConfig = config;
+          this.serverConfigEdit = { ...config };
+          this.showServerConfig = true;
+        })
+        .catch((err) => alert(err.message || err.toString()));
+    },
+    closeServerConfig() {
+      this.showServerConfig = false;
+      this.serverConfigEdit = null;
+    },
+    saveServerConfig() {
+      if (!this.serverConfigEdit) return;
+      this.serverConfigSaving = true;
+      this.api.updateServerConfig(this.serverConfigEdit)
+        .then((result) => {
+          this.serverConfig = result;
+          this.showServerConfig = false;
+          this.serverConfigEdit = null;
+        })
+        .catch((err) => alert(err.message || err.toString()))
+        .finally(() => {
+          this.serverConfigSaving = false;
+        });
     },
     toggleTheme() {
       const themes = ['light', 'dark', 'auto'];

@@ -27,9 +27,24 @@ const {
 
 module.exports = class WireGuard {
 
+  constructor() {
+    // Runtime-mutable server settings (seeded from env vars)
+    this.__serverSettings = {
+      host: WG_HOST,
+      port: WG_PORT,
+      configPort: WG_CONFIG_PORT,
+      device: process.env.WG_DEVICE || 'eth0',
+      defaultDns: WG_DEFAULT_DNS,
+      defaultAddress: WG_DEFAULT_ADDRESS,
+      mtu: WG_MTU,
+      allowedIps: WG_ALLOWED_IPS,
+      persistentKeepalive: WG_PERSISTENT_KEEPALIVE,
+    };
+  }
+
   async __buildConfig() {
     this.__configPromise = Promise.resolve().then(async () => {
-      if (!WG_HOST) {
+      if (!this.__serverSettings.host) {
         throw new Error('WG_HOST Environment Variable Not Set!');
       }
 
@@ -44,7 +59,7 @@ module.exports = class WireGuard {
         const publicKey = await Util.exec(`echo ${privateKey} | wg pubkey`, {
           log: 'echo ***hidden*** | wg pubkey',
         });
-        const address = WG_DEFAULT_ADDRESS.replace('x', '1');
+        const address = this.__serverSettings.defaultAddress.replace('x', '1');
 
         config = {
           server: {
@@ -55,6 +70,24 @@ module.exports = class WireGuard {
           clients: {},
         };
         debug('Configuration generated.');
+      }
+
+      // Ensure all clients have portForwards array
+      for (const client of Object.values(config.clients)) {
+        if (!Array.isArray(client.portForwards)) {
+          client.portForwards = [];
+        }
+      }
+
+      // Load persisted server settings if available
+      try {
+        const settingsRaw = await fs.readFile(path.join(WG_PATH, 'server-settings.json'), 'utf8');
+        const saved = JSON.parse(settingsRaw);
+        // Merge saved settings over env defaults
+        Object.assign(this.__serverSettings, saved);
+        debug('Server settings loaded from disk.');
+      } catch {
+        // No saved settings, use env defaults
       }
 
       return config;
@@ -81,6 +114,7 @@ module.exports = class WireGuard {
       // await Util.exec('iptables -A FORWARD -i wg0 -j ACCEPT');
       // await Util.exec('iptables -A FORWARD -o wg0 -j ACCEPT');
       await this.__syncConfig();
+      await this.__ensureNftablesSetup();
       await this.__applyAllDnatRules();
     }
 
@@ -102,7 +136,7 @@ module.exports = class WireGuard {
 [Interface]
 PrivateKey = ${config.server.privateKey}
 Address = ${config.server.address}/24
-ListenPort = ${WG_PORT}
+ListenPort = ${this.__serverSettings.port}
 PreUp = ${WG_PRE_UP}
 PostUp = ${WG_POST_UP}
 PreDown = ${WG_PRE_DOWN}
@@ -148,7 +182,7 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
       createdAt: new Date(client.createdAt),
       updatedAt: new Date(client.updatedAt),
       allowedIPs: client.allowedIPs,
-      portForwards: client.portForwards || [],
+      portForwards: Array.isArray(client.portForwards) ? client.portForwards : [],
       downloadableConfig: 'privateKey' in client,
       persistentKeepalive: null,
       latestHandshakeAt: null,
@@ -208,15 +242,15 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
 [Interface]
 PrivateKey = ${client.privateKey ? `${client.privateKey}` : 'REPLACE_ME'}
 Address = ${client.address}/24
-${WG_DEFAULT_DNS ? `DNS = ${WG_DEFAULT_DNS}\n` : ''}\
-${WG_MTU ? `MTU = ${WG_MTU}\n` : ''}\
+${this.__serverSettings.defaultDns ? `DNS = ${this.__serverSettings.defaultDns}\n` : ''}\
+${this.__serverSettings.mtu ? `MTU = ${this.__serverSettings.mtu}\n` : ''}\
 
 [Peer]
 PublicKey = ${config.server.publicKey}
 ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
-}AllowedIPs = ${WG_ALLOWED_IPS}
-PersistentKeepalive = ${WG_PERSISTENT_KEEPALIVE}
-Endpoint = ${WG_HOST}:${WG_CONFIG_PORT}`;
+}AllowedIPs = ${this.__serverSettings.allowedIps}
+PersistentKeepalive = ${this.__serverSettings.persistentKeepalive}
+Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   }
 
   async getClientQRCodeSVG({ clientId }) {
@@ -244,11 +278,11 @@ Endpoint = ${WG_HOST}:${WG_CONFIG_PORT}`;
     let address;
     for (let i = 2; i < 255; i++) {
       const client = Object.values(config.clients).find((client) => {
-        return client.address === WG_DEFAULT_ADDRESS.replace('x', i);
+        return client.address === this.__serverSettings.defaultAddress.replace('x', i);
       });
 
       if (!client) {
-        address = WG_DEFAULT_ADDRESS.replace('x', i);
+        address = this.__serverSettings.defaultAddress.replace('x', i);
         break;
       }
     }
@@ -285,8 +319,10 @@ Endpoint = ${WG_HOST}:${WG_CONFIG_PORT}`;
     const config = await this.getConfig();
 
     if (config.clients[clientId]) {
+      // Clean up DNAT rules for this client before deleting
       delete config.clients[clientId];
       await this.saveConfig();
+      await this.__applyAllDnatRules();
     }
   }
 
@@ -328,6 +364,8 @@ Endpoint = ${WG_HOST}:${WG_CONFIG_PORT}`;
     client.updatedAt = new Date();
 
     await this.saveConfig();
+    // Re-apply DNAT since IP changed
+    await this.__applyAllDnatRules();
   }
 
   async __reloadConfig() {
@@ -338,8 +376,17 @@ Endpoint = ${WG_HOST}:${WG_CONFIG_PORT}`;
   async restoreConfiguration(config) {
     debug('Starting configuration restore process.');
     const _config = JSON.parse(config);
+
+    // Ensure all clients have portForwards
+    for (const client of Object.values(_config.clients || {})) {
+      if (!Array.isArray(client.portForwards)) {
+        client.portForwards = [];
+      }
+    }
+
     await this.__saveConfig(_config);
     await this.__reloadConfig();
+    await this.__applyAllDnatRules();
     debug('Configuration restore process completed.');
   }
 
@@ -356,8 +403,51 @@ Endpoint = ${WG_HOST}:${WG_CONFIG_PORT}`;
     await Util.exec('wg-quick down wg0').catch(() => {});
   }
 
+  // ── Server Settings (Global IP Config) ──────────────────────────
+
+  async getServerConfig() {
+    // Ensure config is loaded (which also loads settings)
+    await this.getConfig();
+    return { ...this.__serverSettings };
+  }
+
+  async updateServerConfig(settings) {
+    await this.getConfig();
+
+    const allowed = ['host', 'port', 'configPort', 'device', 'defaultDns',
+      'defaultAddress', 'mtu', 'allowedIps', 'persistentKeepalive'];
+
+    for (const key of allowed) {
+      if (settings[key] !== undefined) {
+        this.__serverSettings[key] = settings[key];
+      }
+    }
+
+    // Persist to disk
+    await fs.writeFile(
+      path.join(WG_PATH, 'server-settings.json'),
+      JSON.stringify(this.__serverSettings, null, 2),
+      { mode: 0o660 },
+    );
+
+    debug('Server settings updated and persisted.');
+    return { ...this.__serverSettings };
+  }
+
+  // ── NFTables / DNAT ─────────────────────────────────────────────
+
+  async __ensureNftablesSetup() {
+    // Create the table and chain if they don't exist yet
+    await Util.exec('nft add table ip wgeasy_dnat').catch(() => {});
+    await Util.exec('nft add chain ip wgeasy_dnat prerouting "{ type nat hook prerouting priority dstnat; policy accept; }"').catch(() => {});
+    debug('nftables table/chain ensured.');
+  }
+
   async __applyAllDnatRules() {
-    // Vaciar el chain antes de re-aplicar todo
+    // Ensure table/chain exists before flushing
+    await this.__ensureNftablesSetup();
+
+    // Flush existing rules before re-applying
     await Util.exec('nft flush chain ip wgeasy_dnat prerouting').catch(() => {});
 
     const clients = await this.getClients();
@@ -378,18 +468,20 @@ Endpoint = ${WG_HOST}:${WG_CONFIG_PORT}`;
     const client = config.clients[clientId];
     if (!client) throw new ServerError('Client not found', 404);
 
-    if (!client.portForwards) client.portForwards = [];
+    if (!Array.isArray(client.portForwards)) client.portForwards = [];
 
-    // Validar que extPort no esté ya en uso por otro peer
+    // Validate extPort not already used by another peer
     const conflict = Object.values(config.clients).some(c =>
       c.id !== clientId &&
-      c.portForwards &&
+      Array.isArray(c.portForwards) &&
       c.portForwards.some(r => r.proto === proto && r.extPort === extPort)
     );
     if (conflict) throw new ServerError(`Puerto ${proto}/${extPort} ya está asignado a otro peer`, 400);
 
-    // Bloquear el puerto de WireGuard
-    if (extPort === WG_PORT) throw new ServerError(`El puerto ${WG_PORT} está reservado para WireGuard`, 400);
+    // Block the WireGuard port
+    if (extPort === Number(this.__serverSettings.port)) {
+      throw new ServerError(`El puerto ${this.__serverSettings.port} está reservado para WireGuard`, 400);
+    }
 
     client.portForwards.push({ proto, extPort: Number(extPort), intPort: Number(intPort) });
     await this.saveConfig();
@@ -401,7 +493,7 @@ Endpoint = ${WG_HOST}:${WG_CONFIG_PORT}`;
     const client = config.clients[clientId];
     if (!client) throw new ServerError('Client not found', 404);
 
-    if (client.portForwards && client.portForwards.length > index) {
+    if (Array.isArray(client.portForwards) && client.portForwards.length > index) {
       client.portForwards.splice(index, 1);
       await this.saveConfig();
       await this.__applyAllDnatRules();
@@ -413,23 +505,25 @@ Endpoint = ${WG_HOST}:${WG_CONFIG_PORT}`;
     const client = config.clients[clientId];
     if (!client) throw new ServerError('Client not found', 404);
 
-    if (!client.portForwards || client.portForwards.length <= index) {
+    if (!Array.isArray(client.portForwards) || client.portForwards.length <= index) {
       throw new ServerError('Port forward rule not found', 404);
     }
 
-    // Validar que extPort no esté ya en uso por otro peer, ignorando la regla actual
+    // Validate extPort not already used by another peer, ignoring current rule
     const conflict = Object.values(config.clients).some(c => {
-      if (!c.portForwards) return false;
+      if (!Array.isArray(c.portForwards)) return false;
       return c.portForwards.some((r, i) => {
-        // Si es el mismo cliente y la misma regla que estamos editando, ignorar
+        // If same client and same rule index, skip
         if (c.id === clientId && i === Number(index)) return false;
         return r.proto === proto && r.extPort === extPort;
       });
     });
     if (conflict) throw new ServerError(`Puerto ${proto}/${extPort} ya está asignado a otro peer`, 400);
 
-    // Bloquear el puerto de WireGuard
-    if (extPort === WG_PORT) throw new ServerError(`El puerto ${WG_PORT} está reservado para WireGuard`, 400);
+    // Block the WireGuard port
+    if (extPort === Number(this.__serverSettings.port)) {
+      throw new ServerError(`El puerto ${this.__serverSettings.port} está reservado para WireGuard`, 400);
+    }
 
     client.portForwards[index] = { proto, extPort: Number(extPort), intPort: Number(intPort) };
     await this.saveConfig();
