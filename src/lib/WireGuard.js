@@ -180,6 +180,23 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
   }
 
   async getClients() {
+    if (process.platform !== 'linux') {
+      return [{
+        id: 'dummy-client-preview',
+        name: 'Preview Client (Local)',
+        address: '10.8.0.2',
+        enabled: true,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        transferRx: 1024 * 1024 * 500,
+        transferTx: 1024 * 1024 * 120,
+        portForwards: [
+          { proto: 'tcp', extPort: 8080, intPort: 80 },
+          { proto: 'udp', extPort: 27015, intPort: 27015 }
+        ]
+      }];
+    }
+
     const config = await this.getConfig();
     const clients = Object.entries(config.clients).map(([clientId, client]) => ({
       id: clientId,
