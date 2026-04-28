@@ -40,65 +40,75 @@ module.exports = class WireGuard {
       allowedIps: WG_ALLOWED_IPS,
       persistentKeepalive: WG_PERSISTENT_KEEPALIVE,
     };
+    this.__config = null;
+    this.__initPromise = null;
   }
 
   async __buildConfig() {
-    this.__configPromise = Promise.resolve().then(async () => {
-      if (!this.__serverSettings.host) {
-        throw new Error('WG_HOST Environment Variable Not Set!');
+    if (this.__config) return this.__config;
+
+    if (!this.__serverSettings.host) {
+      throw new Error('WG_HOST Environment Variable Not Set!');
+    }
+
+    debug('Loading configuration...');
+    let config;
+    try {
+      config = await fs.readFile(path.join(WG_PATH, 'wg0.json'), 'utf8');
+      config = JSON.parse(config);
+      debug('Configuration loaded.');
+    } catch (err) {
+      const privateKey = await Util.exec('wg genkey');
+      const publicKey = await Util.exec(`echo ${privateKey} | wg pubkey`, {
+        log: 'echo ***hidden*** | wg pubkey',
+      });
+      const address = this.__serverSettings.defaultAddress.replace('x', '1');
+
+      config = {
+        server: {
+          privateKey,
+          publicKey,
+          address,
+        },
+        clients: {},
+      };
+      debug('Configuration generated.');
+    }
+
+    // Ensure all clients have portForwards array
+    for (const client of Object.values(config.clients)) {
+      if (!Array.isArray(client.portForwards)) {
+        client.portForwards = [];
       }
+    }
 
-      debug('Loading configuration...');
-      let config;
-      try {
-        config = await fs.readFile(path.join(WG_PATH, 'wg0.json'), 'utf8');
-        config = JSON.parse(config);
-        debug('Configuration loaded.');
-      } catch (err) {
-        const privateKey = await Util.exec('wg genkey');
-        const publicKey = await Util.exec(`echo ${privateKey} | wg pubkey`, {
-          log: 'echo ***hidden*** | wg pubkey',
-        });
-        const address = this.__serverSettings.defaultAddress.replace('x', '1');
+    // Load persisted server settings if available
+    try {
+      const settingsRaw = await fs.readFile(path.join(WG_PATH, 'server-settings.json'), 'utf8');
+      const saved = JSON.parse(settingsRaw);
+      // Merge saved settings over env defaults
+      Object.assign(this.__serverSettings, saved);
+      debug('Server settings loaded from disk.');
+    } catch {
+      // No saved settings, use env defaults
+    }
 
-        config = {
-          server: {
-            privateKey,
-            publicKey,
-            address,
-          },
-          clients: {},
-        };
-        debug('Configuration generated.');
-      }
-
-      // Ensure all clients have portForwards array
-      for (const client of Object.values(config.clients)) {
-        if (!Array.isArray(client.portForwards)) {
-          client.portForwards = [];
-        }
-      }
-
-      // Load persisted server settings if available
-      try {
-        const settingsRaw = await fs.readFile(path.join(WG_PATH, 'server-settings.json'), 'utf8');
-        const saved = JSON.parse(settingsRaw);
-        // Merge saved settings over env defaults
-        Object.assign(this.__serverSettings, saved);
-        debug('Server settings loaded from disk.');
-      } catch {
-        // No saved settings, use env defaults
-      }
-
-      return config;
-    });
-
-    return this.__configPromise;
+    this.__config = config;
+    return config;
   }
 
   async getConfig() {
-    if (!this.__configPromise) {
-      const config = await this.__buildConfig();
+    if (!this.__config) {
+      await this.__buildConfig();
+    }
+    return this.__config;
+  }
+
+  async init() {
+    if (this.__initPromise) return this.__initPromise;
+
+    this.__initPromise = (async () => {
+      const config = await this.getConfig();
 
       await this.__saveConfig(config);
       await Util.exec('wg-quick down wg0').catch(() => {});
@@ -106,19 +116,17 @@ module.exports = class WireGuard {
         if (err && err.message && err.message.includes('Cannot find device "wg0"')) {
           throw new Error('WireGuard exited with the error: Cannot find device "wg0"\nThis usually means that your host\'s kernel does not support WireGuard!');
         }
-
         throw err;
       });
-      // await Util.exec(`iptables -t nat -A POSTROUTING -s ${WG_DEFAULT_ADDRESS.replace('x', '0')}/24 -o ' + WG_DEVICE + ' -j MASQUERADE`);
-      // await Util.exec('iptables -A INPUT -p udp -m udp --dport 51820 -j ACCEPT');
-      // await Util.exec('iptables -A FORWARD -i wg0 -j ACCEPT');
-      // await Util.exec('iptables -A FORWARD -o wg0 -j ACCEPT');
+
       await this.__syncConfig();
       await this.__ensureNftablesSetup();
       await this.__applyAllDnatRules();
-    }
+      
+      debug('WireGuard initialization completed.');
+    })();
 
-    return this.__configPromise;
+    return this.__initPromise;
   }
 
   async saveConfig() {
@@ -447,13 +455,10 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   }
 
   async __applyAllDnatRules() {
-    // Ensure table/chain exists
-    await this.__ensureNftablesSetup();
-
     // Flush existing rules
     await Util.exec('nft flush chain ip wgeasy_dnat prerouting').catch(() => {});
 
-    // Use config directly instead of calling getClients() to avoid recursion
+    // Use config directly
     const config = await this.getConfig();
     for (const client of Object.values(config.clients)) {
       if (!client.enabled || !client.portForwards || !client.portForwards.length) continue;

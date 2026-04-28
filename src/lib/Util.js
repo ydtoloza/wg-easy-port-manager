@@ -70,6 +70,7 @@ module.exports = class Util {
     return new Promise((resolve, reject) => {
       childProcess.exec(cmd, {
         shell: 'bash',
+        timeout: 10000,
       }, (err, stdout) => {
         if (err) return reject(err);
         return resolve(String(stdout).trim());

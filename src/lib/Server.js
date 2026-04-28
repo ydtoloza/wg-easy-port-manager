@@ -124,7 +124,16 @@ module.exports = class Server {
         }
 
         event.node.req.session.authenticated = true;
-        event.node.req.session.save();
+        await new Promise((resolve, reject) => {
+          event.node.req.session.save((err) => {
+            if (err) {
+              debug(`Session Save Error: ${err.message}`);
+              reject(createError({ status: 500, message: 'Failed to save session' }));
+            } else {
+              resolve();
+            }
+          });
+        });
 
         debug(`New Session: ${event.node.req.session.id}`);
 
@@ -139,13 +148,18 @@ module.exports = class Server {
         }
 
         if (req.session && req.session.authenticated) {
+          debug(`Authenticated session: ${req.session.id}`);
           return next();
         }
 
+        debug(`Unauthenticated request to ${req.url} (Session: ${req.session ? req.session.id : 'none'})`);
+
         if (req.url.startsWith('/api/') && req.headers['authorization']) {
           if (isPasswordValid(req.headers['authorization'])) {
+            debug('Authenticated via authorization header');
             return next();
           }
+          debug('Invalid authorization header');
           return res.status(401).json({
             error: 'Incorrect Password',
           });

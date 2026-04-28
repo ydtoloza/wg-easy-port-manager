@@ -277,16 +277,14 @@ new Vue({
           const session = await this.api.getSession();
           this.authenticated = session.authenticated;
           this.requiresPassword = session.requiresPassword;
-          // Release spinner and redirect immediately,
-          // then load clients in the background
-          this.authenticating = false;
-          this.password = null;
-          this.refresh().catch((err) => console.error(err));
+          return this.refresh();
         })
         .catch((err) => {
+          alert(err.message || err.toString());
+        })
+        .finally(() => {
           this.authenticating = false;
           this.password = null;
-          alert(err.message || err.toString());
         });
     },
     logout(e) {
