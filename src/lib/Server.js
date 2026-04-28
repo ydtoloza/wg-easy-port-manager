@@ -160,14 +160,16 @@ module.exports = class Server {
             return next();
           }
           debug('Invalid authorization header');
-          return res.status(401).json({
-            error: 'Incorrect Password',
-          });
+          res.statusCode = 401;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: 'Incorrect Password' }));
+          return;
         }
 
-        return res.status(401).json({
-          error: 'Not Logged In',
-        });
+        res.statusCode = 401;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: 'Not Logged In' }));
+        return;
       }),
     );
 

@@ -8,6 +8,7 @@ class API {
   async call({ method, path, body }) {
     const res = await fetch(`./api${path}`, {
       method,
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
       },
