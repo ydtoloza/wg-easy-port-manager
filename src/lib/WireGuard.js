@@ -437,30 +437,35 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   // ── NFTables / DNAT ─────────────────────────────────────────────
 
   async __ensureNftablesSetup() {
-    // Create the table and chain if they don't exist yet
-    await Util.exec('nft add table ip wgeasy_dnat').catch(() => {});
-    await Util.exec('nft add chain ip wgeasy_dnat prerouting "{ type nat hook prerouting priority dstnat; policy accept; }"').catch(() => {});
-    debug('nftables table/chain ensured.');
+    try {
+      await Util.exec('nft add table ip wgeasy_dnat');
+      await Util.exec('nft add chain ip wgeasy_dnat prerouting { type nat hook prerouting priority dstnat; policy accept; }');
+      debug('nftables table/chain ensured.');
+    } catch (err) {
+      // It might already exist, which is fine
+    }
   }
 
   async __applyAllDnatRules() {
-    // Ensure table/chain exists before flushing
+    // Ensure table/chain exists
     await this.__ensureNftablesSetup();
 
-    // Flush existing rules before re-applying
+    // Flush existing rules
     await Util.exec('nft flush chain ip wgeasy_dnat prerouting').catch(() => {});
 
-    const clients = await this.getClients();
-    for (const client of clients) {
-      if (!client.portForwards || !client.portForwards.length) continue;
+    // Use config directly instead of calling getClients() to avoid recursion
+    const config = await this.getConfig();
+    for (const client of Object.values(config.clients)) {
+      if (!client.enabled || !client.portForwards || !client.portForwards.length) continue;
+      
+      const peerIP = client.address.split('/')[0];
       for (const rule of client.portForwards) {
         const { proto, extPort, intPort } = rule;
-        const peerIP = client.address.split('/')[0];
-        await Util.exec(
-          `nft add rule ip wgeasy_dnat prerouting ${proto} dport ${extPort} dnat to ${peerIP}:${intPort}`
-        ).catch((err) => debug(`Error applying DNAT rule: ${err.message}`));
+        const cmd = `nft add rule ip wgeasy_dnat prerouting ${proto} dport ${extPort} dnat to ${peerIP}:${intPort}`;
+        await Util.exec(cmd).catch((err) => debug(`Error applying DNAT rule: ${err.message}`));
       }
     }
+    debug('All DNAT rules applied.');
   }
 
   async addPortForward(clientId, proto, extPort, intPort) {
