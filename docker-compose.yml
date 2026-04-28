@@ -28,8 +28,7 @@ services:
       # - UI_TRAFFIC_STATS=true
       # - UI_CHART_TYPE=0 # (0 Charts disabled, 1 # Line chart, 2 # Area chart, 3 # Bar chart)
 
-    build: .
-    image: wg-easy-custom
+    image: ghcr.io/ydtoloza/wg-easy:latest
     container_name: wg-easy
     volumes:
       - etc_wireguard:/etc/wireguard
