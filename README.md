@@ -5,9 +5,6 @@
 ![GitHub repo size](https://img.shields.io/github/repo-size/ydtoloza/wg-easy-port-manager)
 ![GitHub last commit](https://img.shields.io/github/last-commit/ydtoloza/wg-easy-port-manager)
 
-<p align="center">
-  <img src="https://github.com/wg-easy/wg-easy/raw/master/Hero.png" alt="WG-Easy Hero" />
-</p>
 
 ### 📸 UI Preview (Port Forwarding Manager)
 <p align="center">
