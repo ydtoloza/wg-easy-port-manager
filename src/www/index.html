@@ -457,7 +457,9 @@
                       <!-- Edit Mode -->
                       <template v-else>
                         <select v-model="editingPfRule.proto" class="text-xs font-bold text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-300 dark:border-neutral-500 rounded-md px-2 py-1.5 focus:ring-2 focus:ring-red-800 outline-none">
-                          <option value="tcp" class="bg-white dark:bg-neutral-800">TCP</option><option value="udp" class="bg-white dark:bg-neutral-800">UDP</option>
+                          <option value="tcp" class="bg-white dark:bg-neutral-800">TCP</option>
+                          <option value="udp" class="bg-white dark:bg-neutral-800">UDP</option>
+                          <option value="both" class="bg-white dark:bg-neutral-800">Both</option>
                         </select>
                         <input v-model.number="editingPfRule.extPort" type="number" class="font-mono text-sm text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-300 dark:border-neutral-500 rounded-md px-2 py-1.5 focus:ring-2 focus:ring-red-800 outline-none w-full" />
                         <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3" /></svg>
@@ -478,9 +480,11 @@
                   <div class="bg-white dark:bg-neutral-700/50 p-3 rounded-lg border border-dashed border-gray-300 dark:border-neutral-600">
                     <div class="flex flex-wrap sm:flex-nowrap items-center gap-2">
                       <select v-model="newPf[client.id].proto" class="text-xs font-bold text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 outline-none flex-shrink-0">
-                        <option value="tcp" class="bg-white dark:bg-neutral-800">TCP</option><option value="udp" class="bg-white dark:bg-neutral-800">UDP</option>
+                        <option value="tcp" class="bg-white dark:bg-neutral-800">TCP</option>
+                        <option value="udp" class="bg-white dark:bg-neutral-800">UDP</option>
+                        <option value="both" class="bg-white dark:bg-neutral-800">Both (TCP+UDP)</option>
                       </select>
-                      <input v-model.number="newPf[client.id].extPort" type="number" placeholder="External Port (e.g. 8080)" @input="pfError = null" class="text-sm font-mono text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 outline-none flex-grow min-w-[100px]" />
+                      <input v-model.number="newPf[client.id].extPort" type="number" placeholder="External Port (e.g. 8080)" @input="pfError = null" :class="{'border-red-500 ring-2 ring-red-500/20': isPortConflicting(client)}" class="text-sm font-mono text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 outline-none flex-grow min-w-[100px]" />
                       <svg class="w-4 h-4 text-gray-400 flex-shrink-0 hidden sm:block" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3" /></svg>
                       <input v-model.number="newPf[client.id].intPort" type="number" placeholder="Internal Port (e.g. 80)" class="text-sm font-mono text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 outline-none flex-grow min-w-[100px]" />
                       <button @click="addPortForward(client)" class="flex items-center justify-center gap-2 bg-red-800 hover:bg-red-700 text-white font-medium text-sm px-4 py-2 rounded-md shadow-sm transition-colors flex-shrink-0 w-full sm:w-auto mt-2 sm:mt-0">

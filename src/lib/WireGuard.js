@@ -490,8 +490,12 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       const peerIP = client.address.split('/')[0];
       for (const rule of client.portForwards) {
         const { proto, extPort, intPort } = rule;
-        const cmd = `nft add rule ip wgeasy_dnat prerouting ${proto} dport ${extPort} dnat to ${peerIP}:${intPort}`;
-        await Util.exec(cmd).catch((err) => debug(`Error applying DNAT rule: ${err.message}`));
+        const protocols = proto === 'both' ? ['tcp', 'udp'] : [proto];
+        
+        for (const p of protocols) {
+          const cmd = `nft add rule ip wgeasy_dnat prerouting ${p} dport ${extPort} dnat to ${peerIP}:${intPort}`;
+          await Util.exec(cmd).catch((err) => debug(`Error applying DNAT rule: ${err.message}`));
+        }
       }
     }
     debug('All DNAT rules applied.');
@@ -524,14 +528,20 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     }
 
     // Validate extPort not already used by the same peer
-    const selfConflict = client.portForwards.some(r => r.proto === proto && r.extPort === port);
+    const selfConflict = client.portForwards.some(r => 
+      (r.proto === proto || r.proto === 'both' || proto === 'both') && 
+      r.extPort === port
+    );
     if (selfConflict) throw new ServerError(`El puerto ${proto}/${port} ya está configurado en este peer`, 400);
 
     // Validate extPort not already used by another peer
     const crossConflict = Object.values(config.clients).some(c =>
       c.id !== clientId &&
       Array.isArray(c.portForwards) &&
-      c.portForwards.some(r => r.proto === proto && r.extPort === port)
+      c.portForwards.some(r => 
+        (r.proto === proto || r.proto === 'both' || proto === 'both') && 
+        r.extPort === port
+      )
     );
     if (crossConflict) throw new ServerError(`El puerto ${proto}/${port} ya está asignado a otro peer`, 400);
 
@@ -588,7 +598,11 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     const idx = Number(index);
 
     // Validate extPort not already used by the same peer (excluding the rule being updated)
-    const selfConflict = client.portForwards.some((r, i) => i !== idx && r.proto === proto && r.extPort === port);
+    const selfConflict = client.portForwards.some((r, i) => 
+      i !== idx && 
+      (r.proto === proto || r.proto === 'both' || proto === 'both') && 
+      r.extPort === port
+    );
     if (selfConflict) throw new ServerError(`El puerto ${proto}/${port} ya está configurado en este peer`, 400);
 
     // Validate extPort not already used by another peer, ignoring current rule
@@ -596,7 +610,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       if (!Array.isArray(c.portForwards)) return false;
       return c.portForwards.some((r, i) => {
         if (c.id === clientId && i === idx) return false;
-        return r.proto === proto && r.extPort === port;
+        return (r.proto === proto || r.proto === 'both' || proto === 'both') && r.extPort === port;
       });
     });
     if (crossConflict) throw new ServerError(`El puerto ${proto}/${port} ya está asignado a otro peer`, 400);

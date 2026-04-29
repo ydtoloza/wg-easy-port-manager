@@ -207,6 +207,19 @@ new Vue({
     togglePfExpanded(clientId) {
       this.$set(this.expandedPfClients, clientId, !this.expandedPfClients[clientId]);
     },
+    isPortConflicting(client) {
+      const pf = this.newPf[client.id];
+      if (!pf || !pf.extPort) return false;
+      const port = Number(pf.extPort);
+      const proto = pf.proto || 'tcp';
+      return this.clients.some(c =>
+        Array.isArray(c.portForwards) &&
+        c.portForwards.some(r => 
+          (r.proto === proto || r.proto === 'both' || proto === 'both') && 
+          r.extPort === port
+        )
+      );
+    },
     async refresh({
       updateCharts = false,
     } = {}) {
@@ -371,7 +384,10 @@ new Vue({
       const proto = pf.proto || 'tcp';
       const alreadyUsed = this.clients.some(c =>
         Array.isArray(c.portForwards) &&
-        c.portForwards.some(r => r.proto === proto && r.extPort === extPort)
+        c.portForwards.some(r => 
+          (r.proto === proto || r.proto === 'both' || proto === 'both') && 
+          r.extPort === extPort
+        )
       );
       if (alreadyUsed) {
         this.pfError = { clientId: client.id, msg: `El puerto ${proto}/${extPort} ya está en uso.` };
@@ -430,7 +446,7 @@ new Vue({
         Array.isArray(c.portForwards) &&
         c.portForwards.some((r, i) => {
           if (c.id === client.id && i === idx) return false;
-          return r.proto === proto && r.extPort === extPort;
+          return (r.proto === proto || r.proto === 'both' || proto === 'both') && r.extPort === extPort;
         })
       );
       if (alreadyUsed) {
