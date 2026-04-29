@@ -257,8 +257,8 @@ module.exports = class Server {
           throw createError({ status: 403 });
         }
         const { proto, extPort, intPort } = await readBody(event);
-        if (!['tcp', 'udp'].includes(proto)) {
-          throw createError({ status: 400, message: 'proto debe ser tcp o udp' });
+        if (!['tcp', 'udp', 'both'].includes(proto)) {
+          throw createError({ status: 400, message: 'proto debe ser tcp, udp o both' });
         }
         if (!extPort || !intPort || extPort < 1 || extPort > 65535 || intPort < 1 || intPort > 65535) {
           throw createError({ status: 400, message: 'Puertos inválidos' });
@@ -282,8 +282,8 @@ module.exports = class Server {
           throw createError({ status: 403 });
         }
         const { proto, extPort, intPort } = await readBody(event);
-        if (!['tcp', 'udp'].includes(proto)) {
-          throw createError({ status: 400, message: 'proto debe ser tcp o udp' });
+        if (!['tcp', 'udp', 'both'].includes(proto)) {
+          throw createError({ status: 400, message: 'proto debe ser tcp, udp o both' });
         }
         if (!extPort || !intPort || extPort < 1 || extPort > 65535 || intPort < 1 || intPort > 65535) {
           throw createError({ status: 400, message: 'Puertos inválidos' });
