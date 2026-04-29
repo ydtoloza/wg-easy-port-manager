@@ -1,8 +1,5 @@
 # WG-Easy Port Manager (Advanced Fork)
 
-<p align="center">
-  <img src="https://github.com/wg-easy/wg-easy/raw/master/Hero.png" alt="WG-Easy Hero" />
-</p>
 
 ---
 
