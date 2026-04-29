@@ -1,5 +1,18 @@
 # WG-Easy Port Manager (Advanced Fork)
 
+[![Build & Publish Latest](https://github.com/ydtoloza/wg-easy-port-manager/actions/workflows/deploy.yml/badge.svg)](https://github.com/ydtoloza/wg-easy-port-manager/actions/workflows/deploy.yml)
+[![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+![GitHub repo size](https://img.shields.io/github/repo-size/ydtoloza/wg-easy-port-manager)
+![GitHub last commit](https://img.shields.io/github/last-commit/ydtoloza/wg-easy-port-manager)
+
+<p align="center">
+  <img src="https://github.com/wg-easy/wg-easy/raw/master/Hero.png" alt="WG-Easy Hero" />
+</p>
+
+### 📸 UI Preview (Port Forwarding Manager)
+<p align="center">
+  <img src="assets/ui_preview.png" alt="WG-Easy Port Manager UI" width="600" />
+</p>
 
 ---
 
