@@ -512,14 +512,14 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   async __ensureNftablesSetup() {
     try {
       await Util.exec('nft add table ip wgeasy_dnat');
-      await Util.exec('nft add chain ip wgeasy_dnat prerouting { type nat hook prerouting priority dstnat; policy accept; }');
+      await Util.exec("nft add chain ip wgeasy_dnat prerouting '{ type nat hook prerouting priority dstnat; policy accept; }'");
       debug('nftables IPv4 table/chain ensured.');
     } catch (err) {
       // It might already exist, which is fine
     }
     try {
       await Util.exec('nft add table ip6 wgeasy_dnat');
-      await Util.exec('nft add chain ip6 wgeasy_dnat prerouting { type nat hook prerouting priority dstnat; policy accept; }');
+      await Util.exec("nft add chain ip6 wgeasy_dnat prerouting '{ type nat hook prerouting priority dstnat; policy accept; }'");
       debug('nftables IPv6 table/chain ensured.');
     } catch (err) {
       // It might already exist, which is fine
