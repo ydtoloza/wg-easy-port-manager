@@ -59,6 +59,7 @@ module.exports = class WireGuard {
       defaultDns: WG_DEFAULT_DNS,
       defaultAddress: WG_DEFAULT_ADDRESS,
       defaultAddressV6: WG_DEFAULT_ADDRESS_V6,
+      enableIpv6: true,
       mtu: WG_MTU,
       allowedIps: WG_ALLOWED_IPS,
       persistentKeepalive: WG_PERSISTENT_KEEPALIVE,
@@ -86,7 +87,7 @@ module.exports = class WireGuard {
         log: 'echo ***hidden*** | wg pubkey',
       });
       const address = this.__serverSettings.defaultAddress.replace('x', '1');
-      const addressV6 = this.__serverSettings.defaultAddressV6.replace('x', '1');
+      const addressV6 = this.__serverSettings.enableIpv6 ? this.__serverSettings.defaultAddressV6.replace('x', '1') : null;
 
       config = {
         server: {
@@ -108,14 +109,15 @@ module.exports = class WireGuard {
     }
 
     // Migrate legacy server config: ensure server has addressV6
-    if (!config.server.addressV6) {
+    if (!config.server.addressV6 && this.__serverSettings.enableIpv6) {
       config.server.addressV6 = this.__serverSettings.defaultAddressV6.replace('x', '1');
       debug('Migrated server to include addressV6.');
     }
 
     // Migrate legacy clients: assign addressV6 to any client missing it
-    const usedV6 = new Set(
-      Object.values(config.clients)
+    if (this.__serverSettings.enableIpv6) {
+      const usedV6 = new Set(
+        Object.values(config.clients)
         .filter((c) => c.addressV6)
         .map((c) => c.addressV6)
     );
@@ -131,6 +133,7 @@ module.exports = class WireGuard {
           }
         }
       }
+    }
     }
 
     // Load persisted server settings if available
@@ -194,7 +197,7 @@ module.exports = class WireGuard {
 # Server
 [Interface]
 PrivateKey = ${config.server.privateKey}
-Address = ${config.server.address}/24${config.server.addressV6 ? `, ${config.server.addressV6}/64` : ''}
+Address = ${config.server.address}/24${this.__serverSettings.enableIpv6 && config.server.addressV6 ? `, ${config.server.addressV6}/64` : ''}
 ListenPort = ${this.__serverSettings.port}
 PreUp = ${WG_PRE_UP}
 PostUp = ${WG_POST_UP}
@@ -211,7 +214,7 @@ PostDown = ${WG_POST_DOWN}
 [Peer]
 PublicKey = ${client.publicKey}
 ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
-}AllowedIPs = ${client.address}/32${client.addressV6 ? `, ${client.addressV6}/128` : ''}`;
+}AllowedIPs = ${client.address}/32${this.__serverSettings.enableIpv6 && client.addressV6 ? `, ${client.addressV6}/128` : ''}`;
     }
 
     debug('Config saving...');
@@ -244,7 +247,7 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
       publicKey: client.publicKey,
       createdAt: new Date(client.createdAt),
       updatedAt: new Date(client.updatedAt),
-      allowedIPs: client.allowedIPs || [client.address + '/32', (client.addressV6 ? client.addressV6 + '/128' : null)].filter(Boolean),
+      allowedIPs: client.allowedIPs || [client.address + '/32', (this.__serverSettings.enableIpv6 && client.addressV6 ? client.addressV6 + '/128' : null)].filter(Boolean),
       addressV6: client.addressV6,
       portForwards: Array.isArray(client.portForwards) ? client.portForwards : [],
       downloadableConfig: 'privateKey' in client,
@@ -305,7 +308,7 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
     return `
 [Interface]
 PrivateKey = ${client.privateKey ? `${client.privateKey}` : 'REPLACE_ME'}
-Address = ${client.address}/24${client.addressV6 ? `, ${client.addressV6}/128` : ''}
+Address = ${client.address}/24${this.__serverSettings.enableIpv6 && client.addressV6 ? `, ${client.addressV6}/128` : ''}
 ${this.__serverSettings.defaultDns ? `DNS = ${this.__serverSettings.defaultDns}\n` : ''}\
 ${this.__serverSettings.mtu ? `MTU = ${this.__serverSettings.mtu}\n` : ''}\
 
@@ -344,12 +347,12 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     for (let i = 2; i < 255; i++) {
       const client = Object.values(config.clients).find((client) => {
         return client.address === this.__serverSettings.defaultAddress.replace('x', i) ||
-               client.addressV6 === this.__serverSettings.defaultAddressV6.replace('x', i);
+               (this.__serverSettings.enableIpv6 && client.addressV6 === this.__serverSettings.defaultAddressV6.replace('x', i));
       });
 
       if (!client) {
         address = this.__serverSettings.defaultAddress.replace('x', i);
-        addressV6 = this.__serverSettings.defaultAddressV6.replace('x', i);
+        addressV6 = this.__serverSettings.enableIpv6 ? this.__serverSettings.defaultAddressV6.replace('x', i) : null;
         break;
       }
     }
@@ -488,7 +491,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     await this.getConfig();
 
     const allowed = ['host', 'port', 'configPort', 'device', 'defaultDns',
-      'defaultAddress', 'defaultAddressV6', 'mtu', 'allowedIps', 'persistentKeepalive'];
+      'defaultAddress', 'defaultAddressV6', 'enableIpv6', 'mtu', 'allowedIps', 'persistentKeepalive'];
 
     for (const key of allowed) {
       if (settings[key] !== undefined) {
@@ -537,7 +540,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       if (!client.enabled || !client.portForwards || !client.portForwards.length) continue;
       
       const peerIP = client.address.split('/')[0];
-      const peerIPv6 = client.addressV6 ? client.addressV6.split('/')[0] : null;
+      const peerIPv6 = (this.__serverSettings.enableIpv6 && client.addressV6) ? client.addressV6.split('/')[0] : null;
 
       for (const rule of client.portForwards) {
         const { proto, extPort, intPort } = rule;

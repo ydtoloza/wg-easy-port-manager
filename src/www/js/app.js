@@ -67,6 +67,8 @@ new Vue({
     clientEditAddressV6: null,
     clientEditAddressV6Id: null,
     qrcode: null,
+    configDialog: null,
+    copyConfigSuccess: false,
     newPf: {},
     pfError: null,
     editingPfClientId: null,
@@ -374,6 +376,25 @@ new Vue({
       } else {
         this.notify('Error al cargar el archivo.');
       }
+    },
+    viewConfiguration(client) {
+      if (!client.downloadableConfig) return;
+      fetch(`./api/wireguard/client/${client.id}/configuration`)
+        .then(res => res.text())
+        .then(text => {
+          this.configDialog = { text };
+          this.copyConfigSuccess = false;
+        })
+        .catch(err => this.notify('Error al obtener la configuración: ' + err.message));
+    },
+    copyConfigToClipboard() {
+      if (!this.configDialog || !this.configDialog.text) return;
+      navigator.clipboard.writeText(this.configDialog.text).then(() => {
+        this.copyConfigSuccess = true;
+        setTimeout(() => { this.copyConfigSuccess = false; }, 3000);
+      }).catch(err => {
+        this.notify('Error al copiar al portapapeles: ' + err.message);
+      });
     },
     addPortForward(client) {
       const pf = this.newPf[client.id];

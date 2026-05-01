@@ -393,11 +393,26 @@
                       </svg>
                     </button>
 
+                    <!-- View Config -->
+                    <button :disabled="!client.downloadableConfig"
+                      class="align-middle bg-gray-100 dark:bg-neutral-600 dark:text-neutral-300 p-2 rounded transition ml-1"
+                      :class="{
+                        'hover:bg-red-800 dark:hover:bg-red-800 hover:text-white dark:hover:text-white': client.downloadableConfig,
+                        'is-disabled': !client.downloadableConfig
+                      }"
+                      :title="!client.downloadableConfig ? $t('noPrivKey') : 'View Configuration'"
+                      @click="viewConfiguration(client)">
+                      <svg class="w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                      </svg>
+                    </button>
+
                     <!-- Download Config -->
                     <a :disabled="!client.downloadableConfig"
                       :href="'./api/wireguard/client/' + client.id + '/configuration'"
                       :download="client.downloadableConfig ? 'configuration' : null"
-                      class="align-middle inline-block bg-gray-100 dark:bg-neutral-600 dark:text-neutral-300 p-2 rounded transition"
+                      class="align-middle inline-block bg-gray-100 dark:bg-neutral-600 dark:text-neutral-300 p-2 rounded transition ml-1 mr-1"
                       :class="{
                         'hover:bg-red-800 dark:hover:bg-red-800 hover:text-white dark:hover:text-white': client.downloadableConfig,
                         'is-disabled': !client.downloadableConfig
@@ -462,8 +477,12 @@
                       <!-- View Mode -->
                       <template v-if="editingPfClientId !== client.id || editingPfIndex !== index">
                         <span class="inline-flex items-center justify-center px-2 py-1 text-xs font-bold rounded-md" 
-                              :class="rule.proto === 'tcp' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300' : 'bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300'">
-                          {{ rule.proto.toUpperCase() }}
+                              :class="{
+                                'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300': rule.proto === 'tcp',
+                                'bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300': rule.proto === 'udp',
+                                'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300': rule.proto === 'both'
+                              }">
+                          {{ rule.proto === 'both' ? 'TCP + UDP' : rule.proto.toUpperCase() }}
                         </span>
                         <span class="font-mono text-sm text-gray-800 dark:text-neutral-200">{{ rule.extPort }}</span>
                         <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3" /></svg>
@@ -569,6 +588,40 @@
                 </svg>
               </button>
               <img :src="qrcode" />
+            </div>
+          </div>
+        </div>
+
+        <!-- View Config Dialog -->
+        <div v-if="configDialog" class="fixed z-20 inset-0 overflow-y-auto">
+          <div class="flex items-center justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
+            <div class="fixed inset-0 transition-opacity" aria-hidden="true" @click="configDialog = null">
+              <div class="absolute inset-0 bg-gray-500 dark:bg-black opacity-75 dark:opacity-50"></div>
+            </div>
+            <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
+            <div class="inline-block align-bottom bg-white dark:bg-neutral-700 rounded-lg text-left shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-3xl w-full"
+              role="dialog" aria-modal="true">
+              <div class="bg-white dark:bg-neutral-700 px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
+                <div class="sm:flex sm:items-start">
+                  <div class="mt-3 text-center sm:mt-0 sm:text-left w-full">
+                    <h3 class="text-lg leading-6 font-medium text-gray-900 dark:text-neutral-200 mb-4 flex justify-between">
+                      Configuration
+                      <button @click="copyConfigToClipboard()" class="text-sm bg-gray-200 dark:bg-neutral-600 hover:bg-gray-300 dark:hover:bg-neutral-500 text-gray-800 dark:text-white py-1 px-3 rounded inline-flex items-center transition">
+                        <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                        <span>{{ copyConfigSuccess ? 'Copied!' : 'Copy' }}</span>
+                      </button>
+                    </h3>
+                    <div class="mt-2 w-full">
+                      <textarea readonly class="w-full h-64 font-mono text-sm p-4 bg-gray-50 dark:bg-neutral-900 text-gray-800 dark:text-neutral-200 border border-gray-200 dark:border-neutral-600 rounded-md focus:outline-none resize-none">{{ configDialog.text }}</textarea>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="bg-gray-50 dark:bg-neutral-700 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
+                <button type="button" @click="configDialog = null; copyConfigSuccess = false;" class="w-full inline-flex justify-center rounded-md border border-gray-300 dark:border-neutral-500 shadow-sm px-4 py-2 bg-white dark:bg-neutral-500 text-base font-medium text-gray-700 dark:text-neutral-50 hover:bg-gray-50 dark:hover:bg-neutral-600 focus:outline-none sm:mt-0 sm:ml-3 sm:w-auto sm:text-sm transition">
+                  Close
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -744,7 +797,7 @@
                       <p class="text-sm text-gray-500 dark:text-neutral-300">
                         ¿Estás seguro de que deseas eliminar esta regla? 
                         <br><br>
-                        <strong>{{pfDelete.rule.proto.toUpperCase()}} {{pfDelete.rule.extPort}} → {{pfDelete.rule.intPort}}</strong>
+                        <strong>{{pfDelete.rule.proto === 'both' ? 'TCP + UDP' : pfDelete.rule.proto.toUpperCase()}} {{pfDelete.rule.extPort}} → {{pfDelete.rule.intPort}}</strong>
                       </p>
                     </div>
                   </div>
@@ -812,6 +865,12 @@
                           class="rounded p-2 border-2 dark:bg-neutral-600 dark:text-neutral-200 border-gray-100 dark:border-neutral-500 focus:border-red-800 dark:focus:border-red-700 outline-none w-full text-sm" placeholder="10.8.0.x" />
                       </div>
                       <div>
+                        <label class="flex items-center gap-2 block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider cursor-pointer">
+                          <input type="checkbox" v-model="serverConfigEdit.enableIpv6" class="rounded text-red-800 focus:ring-red-800 border-gray-300 dark:border-neutral-600 dark:bg-neutral-700" />
+                          Enable IPv6
+                        </label>
+                      </div>
+                      <div v-if="serverConfigEdit.enableIpv6">
                         <label class="block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider">Default Address Range (IPv6)</label>
                         <input type="text" v-model="serverConfigEdit.defaultAddressV6"
                           class="rounded p-2 border-2 dark:bg-neutral-600 dark:text-neutral-200 border-gray-100 dark:border-neutral-500 focus:border-red-800 dark:focus:border-red-700 outline-none w-full text-sm" placeholder="fd42:42:42::x" />
