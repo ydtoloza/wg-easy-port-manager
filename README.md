@@ -26,9 +26,10 @@
 
 Este fork mantiene la simplicidad de la interfaz original de WireGuard e introduce potentes capacidades nuevas:
 
-*   **Gestor de Puertos por Cliente (DNAT/Port Forwarding)**: Una interfaz totalmente integrada para gestionar el redireccionamiento de puertos por cada cliente de WireGuard. Puedes mapear dinámicamente puertos externos del servidor a las IPs internas de los clientes.
+*   **Gestor de Puertos por Cliente (DNAT/Port Forwarding)**: Una interfaz totalmente integrada para gestionar el redireccionamiento de puertos por cada cliente de WireGuard. Puedes mapear dinámicamente puertos externos del servidor a las IPs internas de los clientes (Soporta IPv4 e IPv6).
+*   **Soporte Completo IPv6 (Dual-Stack)**: Conectividad nativa IPv6. El servidor asigna automáticamente direcciones IPv6 a nuevos clientes y migra de forma transparente los clientes existentes.
 *   **Soporte para Protocolo "Ambos" (TCP + UDP)**: Capacidad de abrir puertos tanto en TCP como en UDP con una sola regla, ideal para juegos y servicios complejos.
-*   **Integración Automatizada con `nftables`**: El backend provisiona, sincroniza y limpia automáticamente las reglas DNAT de `nftables` basándose en la configuración de la interfaz. No requiere configuración manual del firewall.
+*   **Integración Automatizada con `nftables`**: El backend provisiona, sincroniza y limpia automáticamente las reglas DNAT de `nftables` para IPv4 e IPv6 basándose en la configuración de la interfaz.
 *   **Validación en Tiempo Real**: La interfaz te avisa instantáneamente si intentas usar un puerto que ya está ocupado o reservado.
 *   **Estabilidad Mejorada**: Se corrigieron condiciones de carrera (race conditions) durante la inicialización de WireGuard, asegurando un arranque mucho más estable.
 *   **Gestión de Sesiones Robusta**: Se resolvieron problemas de bloqueos silenciosos durante el inicio de sesión y caídas de tokens de autenticación en entornos con proxy inverso o alta latencia.
@@ -61,9 +62,7 @@ services:
       - PASSWORD_HASH=$$2y$$10$$hBCoykrB95WSzuV4fafBzOHWKu9sbyVa34GJr8VV5R/pIelfEMYyG # Genera tu propio hash bcrypt
       - WG_PERSISTENT_KEEPALIVE=25
       - WG_DEVICE=eth0 # Cambia si tu interfaz principal no es eth0
-      # Reglas necesarias para permitir el acceso a internet a los clientes conectados
-      - WG_POST_UP=iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE; iptables -I INPUT -p udp -m udp --dport 51820 -j ACCEPT; iptables -I FORWARD -i wg0 -j ACCEPT; iptables -I FORWARD -o wg0 -j ACCEPT;
-      - WG_POST_DOWN=iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE; iptables -D INPUT -p udp -m udp --dport 51820 -j ACCEPT; iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT;
+      - WG_DEFAULT_ADDRESS_V6=fd42:42:42::x # Rango IPv6 opcional
     volumes:
       - etc_wireguard:/etc/wireguard
     restart: unless-stopped
@@ -87,9 +86,10 @@ services:
 
 This fork maintains the simplicity of the original WireGuard UI while injecting powerful new capabilities:
 
-*   **Peer Port Manager (DNAT/Port Forwarding)**: A fully integrated UI to manage port forwarding per WireGuard peer. You can dynamically map external server ports to internal peer IPs.
+*   **Peer Port Manager (DNAT/Port Forwarding)**: A fully integrated UI to manage port forwarding per WireGuard peer. You can dynamically map external server ports to internal peer IPs (Supports IPv4 & IPv6).
+*   **Full IPv6 Support (Dual-Stack)**: Native IPv6 connectivity. The server automatically assigns IPv6 addresses to new peers and transparently migrates existing ones.
 *   **"Both" Protocol Support (TCP + UDP)**: Ability to open both TCP and UDP ports with a single rule, perfect for games and complex services.
-*   **Automated `nftables` Integration**: The backend automatically provisions, syncs, and flushes `nftables` DNAT rules based on the UI configuration. No manual firewall configuration required.
+*   **Automated `nftables` Integration**: The backend automatically provisions, syncs, and flushes `nftables` DNAT rules for both IPv4 and IPv6 based on the UI configuration.
 *   **Real-Time Validation**: The UI instantly warns you if you try to use a port that is already occupied or reserved.
 *   **Enhanced Stability**: Fixed underlying race conditions during WireGuard initialization, ensuring a smoother startup sequence.
 *   **Robust Session Management**: Resolved silent hanging issues during login and authentication token drops in reverse-proxy or high-latency environments.
@@ -122,9 +122,7 @@ services:
       - PASSWORD_HASH=$$2y$$10$$hBCoykrB95WSzuV4fafBzOHWKu9sbyVa34GJr8VV5R/pIelfEMYyG # Replace with your bcrypt hash
       - WG_PERSISTENT_KEEPALIVE=25
       - WG_DEVICE=eth0 # Change if your main interface is not eth0
-      # Required rules to allow internet access to connected peers
-      - WG_POST_UP=iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE; iptables -I INPUT -p udp -m udp --dport 51820 -j ACCEPT; iptables -I FORWARD -i wg0 -j ACCEPT; iptables -I FORWARD -o wg0 -j ACCEPT;
-      - WG_POST_DOWN=iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE; iptables -D INPUT -p udp -m udp --dport 51820 -j ACCEPT; iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT;
+      - WG_DEFAULT_ADDRESS_V6=fd42:42:42::x # Optional IPv6 range
     volumes:
       - etc_wireguard:/etc/wireguard
     restart: unless-stopped

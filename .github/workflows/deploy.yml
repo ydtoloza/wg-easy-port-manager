@@ -30,6 +30,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Extract version from package.json
+        id: package_version
+        run: |
+          VERSION=$(node -p "require('./src/package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
       - name: Build & Publish Docker Image
         uses: docker/build-push-action@v6
         with:
@@ -38,4 +44,5 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: |
             ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ steps.package_version.outputs.version }}
             ghcr.io/${{ github.repository }}:v14-custom
