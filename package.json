@@ -1,9 +1,0 @@
-{
-  "name": "wg-easy-port-manager",
-  "version": "1.2.0",
-  "description": "WireGuard Easy – Port Manager Fork",
-  "scripts": {
-    "build": "docker build --tag wg-easy-port-manager .",
-    "serve": "docker compose -f docker-compose.yml -f docker-compose.dev.yml up"
-  }
-}
