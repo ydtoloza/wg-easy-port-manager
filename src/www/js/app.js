@@ -392,12 +392,34 @@ new Vue({
     },
     copyConfigToClipboard() {
       if (!this.configDialog || !this.configDialog.text) return;
-      navigator.clipboard.writeText(this.configDialog.text).then(() => {
+      const text = this.configDialog.text;
+      // Try modern clipboard API first (requires HTTPS)
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(() => {
+          this.copyConfigSuccess = true;
+          setTimeout(() => { this.copyConfigSuccess = false; }, 3000);
+        }).catch(() => this._fallbackCopy(text));
+      } else {
+        // Fallback for HTTP
+        this._fallbackCopy(text);
+      }
+    },
+    _fallbackCopy(text) {
+      const el = document.createElement('textarea');
+      el.value = text;
+      el.style.position = 'fixed';
+      el.style.opacity = '0';
+      document.body.appendChild(el);
+      el.focus();
+      el.select();
+      try {
+        document.execCommand('copy');
         this.copyConfigSuccess = true;
         setTimeout(() => { this.copyConfigSuccess = false; }, 3000);
-      }).catch(err => {
-        this.notify('Error al copiar al portapapeles: ' + err.message);
-      });
+      } catch (err) {
+        this.notify('No se pudo copiar al portapapeles.');
+      }
+      document.body.removeChild(el);
     },
     addPortForward(client) {
       const pf = this.newPf[client.id];
