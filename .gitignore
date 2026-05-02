@@ -1,6 +1,18 @@
-/config
+# WireGuard local runtime data (never commit private keys or configs)
+/etc_wireguard/
+/config/
 /wg0.conf
 /wg0.json
-/src/node_modules
+
+# Node
+/src/node_modules/
+node_modules/
+npm-debug.log*
+
+# OS & editors
 .DS_Store
 *.swp
+*.swo
+Thumbs.db
+.vscode/
+.idea/
