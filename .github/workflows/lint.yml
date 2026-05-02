@@ -3,14 +3,14 @@ name: Lint
 on:
   push:
     branches:
-      - v14
+      - main
   pull_request:
 
 jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
-    if: github.repository_owner == 'wg-easy'
+    if: github.repository_owner == 'ydtoloza'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

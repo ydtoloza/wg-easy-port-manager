@@ -2,17 +2,17 @@
   "release": {
     "version": "15"
   },
-  "name": "wg-easy",
+  "name": "wg-easy-port-manager",
   "version": "1.2.0",
-  "description": "The easiest way to run WireGuard VPN + Web-based Admin UI.",
+  "description": "WireGuard Easy – Port Manager fork with DNAT/port forwarding support.",
   "main": "server.js",
   "scripts": {
-    "serve": "DEBUG=Server,WireGuard npx nodemon server.js",
-    "serve-with-password": "PASSWORD=wg npm run serve",
+    "serve": "npx cross-env DEBUG=Server,WireGuard npx nodemon server.js",
+    "serve-dev": "npx nodemon server.js",
     "lint": "eslint .",
     "buildcss": "npx tailwindcss -i ./www/src/css/app.css -o ./www/css/app.css"
   },
-  "author": "Emile Nijssen",
+  "author": "ydtoloza",
   "license": "CC BY-NC-SA 4.0",
   "dependencies": {
     "bcryptjs": "^2.4.3",

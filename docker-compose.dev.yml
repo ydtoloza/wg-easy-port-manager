@@ -1,8 +1,8 @@
 services:
-  wg-easy:
+  wg-easy-port-manager:
     build:
       dockerfile: ./Dockerfile
-    command: npm run serve
+    command: npm run serve-dev
     volumes:
       - ./src/:/app/
       # - ./data/:/etc/wireguard
@@ -13,5 +13,5 @@ services:
       - NET_ADMIN
       - SYS_MODULE
     environment:
-      # - PASSWORD_HASH=p
+      # - PASSWORD_HASH=your_hash_here
       - WG_HOST=192.168.1.233
