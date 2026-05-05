@@ -58,6 +58,7 @@ jobs:
             - Docker Image: `ghcr.io/${{ github.repository }}:${{ steps.package_version.outputs.version }}`
             - Full Dual-Stack IPv6 Support
             - Automated Port Forwarding for IPv4 & IPv6
+            - **Fix:** Update iptables rule priority to prevent conflicts with Tailscale/Docker (`-I` instead of `-A`).
           draft: false
           prerelease: false
         env:
