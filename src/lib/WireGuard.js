@@ -475,8 +475,8 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
           const ep = Number(rule.extPort);
           const ip = Number(rule.intPort);
           if (!['tcp', 'udp', 'both'].includes(rule.proto)) return false;
-          if (!Number.isFinite(ep) || ep < 1 || ep > 65535) return false;
-          if (!Number.isFinite(ip) || ip < 1 || ip > 65535) return false;
+          if (!Number.isInteger(ep) || ep < 1 || ep > 65535) return false;
+          if (!Number.isInteger(ip) || ip < 1 || ip > 65535) return false;
           if (blockedPorts.has(ep)) {
             debug(`restoreConfiguration: dropping blocked port ${ep} for client ${client.name}`);
             return false;
@@ -562,13 +562,14 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     }
   }
 
-  async __applyAllDnatRules() {
+  async __applyAllDnatRules(throwOnError = false) {
     // Flush existing rules (IPv4 + IPv6)
     await Util.exec('nft flush chain ip wgeasy_dnat prerouting').catch(() => {});
     await Util.exec('nft flush chain ip6 wgeasy_dnat prerouting').catch(() => {});
 
     // Use config directly
     const config = await this.getConfig();
+    const errors = [];
     for (const client of Object.values(config.clients)) {
       if (!client.enabled || !client.portForwards || !client.portForwards.length) continue;
 
@@ -592,7 +593,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         // Prevención de inyección: forzar tipos y validar estrictamente
         extPort = Number(extPort);
         intPort = Number(intPort);
-        if (Number.isNaN(extPort) || Number.isNaN(intPort) || extPort < 1 || extPort > 65535 || intPort < 1 || intPort > 65535) {
+        if (!Number.isInteger(extPort) || !Number.isInteger(intPort) || extPort < 1 || extPort > 65535 || intPort < 1 || intPort > 65535) {
           debug(`Skipping rule with invalid ports: extPort=${extPort}, intPort=${intPort}`);
           continue;
         }
@@ -606,17 +607,26 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         for (const p of protocols) {
           // IPv4 DNAT rule
           const cmd4 = `nft add rule ip wgeasy_dnat prerouting ${p} dport ${extPort} dnat to ${peerIP}:${intPort}`;
-          await Util.exec(cmd4).catch((err) => debug(`Error applying IPv4 DNAT rule: ${err.message}`));
+          await Util.exec(cmd4).catch((err) => {
+            debug(`Error applying IPv4 DNAT rule: ${err.message}`);
+            errors.push(err);
+          });
 
           // IPv6 DNAT rule (only if client has an IPv6 address)
           if (peerIPv6) {
             const cmd6 = `nft add rule ip6 wgeasy_dnat prerouting ${p} dport ${extPort} dnat to [${peerIPv6}]:${intPort}`;
-            await Util.exec(cmd6).catch((err) => debug(`Error applying IPv6 DNAT rule: ${err.message}`));
+            await Util.exec(cmd6).catch((err) => {
+              debug(`Error applying IPv6 DNAT rule: ${err.message}`);
+              errors.push(err);
+            });
           }
         }
       }
     }
     debug('All DNAT rules applied (IPv4 + IPv6).');
+    if (throwOnError && errors.length > 0) {
+      throw new ServerError(`Failed to apply DNAT rules: ${errors.map(e => e.message).join(', ')}`, 500);
+    }
   }
 
   async addPortForward(clientId, proto, extPort, intPort) {
@@ -663,10 +673,16 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     if (crossConflict) throw new ServerError(`El puerto ${proto}/${port} ya está asignado a otro peer`, 400);
 
     client.portForwards.push({ proto, extPort: port, intPort: Number(intPort) });
-    // Apply nftables rules BEFORE persisting: if nft fails the config is not
-    // saved, keeping UI state and host state in sync.
-    await this.__applyAllDnatRules();
-    await this.saveConfig();
+    try {
+      // Apply nftables rules BEFORE persisting: if nft fails the config is not
+      // saved, keeping UI state and host state in sync.
+      await this.__applyAllDnatRules(true);
+      await this.saveConfig();
+    } catch (err) {
+      // Rollback memory if nftables fails
+      client.portForwards.pop();
+      throw err;
+    }
   }
 
   async removePortForward(clientId, index) {
@@ -680,9 +696,15 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     if (!client) throw new ServerError(`Client not found: ${clientId}`, 404);
 
     if (Array.isArray(client.portForwards) && client.portForwards.length > index) {
-      client.portForwards.splice(index, 1);
-      await this.saveConfig();
-      await this.__applyAllDnatRules();
+      const [removed] = client.portForwards.splice(index, 1);
+      try {
+        await this.__applyAllDnatRules(true);
+        await this.saveConfig();
+      } catch (err) {
+        // Rollback memory if nftables fails
+        client.portForwards.splice(index, 0, removed);
+        throw err;
+      }
     }
   }
 
@@ -737,11 +759,18 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     });
     if (crossConflict) throw new ServerError(`El puerto ${proto}/${port} ya está asignado a otro peer`, 400);
 
+    const oldRule = client.portForwards[idx];
     client.portForwards[idx] = { proto, extPort: port, intPort: Number(intPort) };
-    // Apply nftables rules BEFORE persisting: if nft fails the config is not
-    // saved, keeping UI state and host state in sync.
-    await this.__applyAllDnatRules();
-    await this.saveConfig();
+    try {
+      // Apply nftables rules BEFORE persisting: if nft fails the config is not
+      // saved, keeping UI state and host state in sync.
+      await this.__applyAllDnatRules(true);
+      await this.saveConfig();
+    } catch (err) {
+      // Rollback memory if nftables fails
+      client.portForwards[idx] = oldRule;
+      throw err;
+    }
   }
 
 };
