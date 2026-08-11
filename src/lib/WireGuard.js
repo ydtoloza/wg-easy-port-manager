@@ -490,10 +490,16 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         }));
     }
 
-    await this.__saveConfig(_config);
-    await this.__reloadConfig();
-    await this.__applyAllDnatRules();
-    debug('Configuration restore process completed.');
+    try {
+      await this.__applyAllDnatRules(true);
+      await this.__saveConfig(_config);
+      await this.__reloadConfig();
+      debug('Configuration restore process completed.');
+    } catch (err) {
+      debug('Configuration restore failed, reverting to previous state');
+      await this.__reloadConfig();
+      throw err;
+    }
   }
 
   async backupConfiguration() {
@@ -563,9 +569,15 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   }
 
   async __applyAllDnatRules(throwOnError = false) {
-    // Flush existing rules (IPv4 + IPv6)
-    await Util.exec('nft flush chain ip wgeasy_dnat prerouting').catch(() => {});
-    await Util.exec('nft flush chain ip6 wgeasy_dnat prerouting').catch(() => {});
+    try {
+      await Util.exec('nft flush chain ip wgeasy_dnat prerouting');
+      await Util.exec('nft flush chain ip6 wgeasy_dnat prerouting');
+    } catch (err) {
+      if (throwOnError) {
+        throw new ServerError(`Failed to flush DNAT chains: ${err.message}`, 500);
+      }
+      debug(`Failed to flush DNAT chains: ${err.message}`);
+    }
 
     // Use config directly
     const config = await this.getConfig();
@@ -594,10 +606,12 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         extPort = Number(extPort);
         intPort = Number(intPort);
         if (!Number.isInteger(extPort) || !Number.isInteger(intPort) || extPort < 1 || extPort > 65535 || intPort < 1 || intPort > 65535) {
+          if (throwOnError) errors.push(new Error(`Invalid port: extPort=${extPort}, intPort=${intPort}`));
           debug(`Skipping rule with invalid ports: extPort=${extPort}, intPort=${intPort}`);
           continue;
         }
         if (!['tcp', 'udp', 'both'].includes(proto)) {
+          if (throwOnError) errors.push(new Error(`Invalid proto: ${proto}`));
           debug(`Skipping rule with invalid proto: ${proto}`);
           continue;
         }
@@ -625,7 +639,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     }
     debug('All DNAT rules applied (IPv4 + IPv6).');
     if (throwOnError && errors.length > 0) {
-      throw new ServerError(`Failed to apply DNAT rules: ${errors.map(e => e.message).join(', ')}`, 500);
+      throw new ServerError(`Failed to apply DNAT rules: ${errors.map((e) => e.message).join(', ')}`, 500);
     }
   }
 
@@ -641,9 +655,8 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
     if (!Array.isArray(client.portForwards)) client.portForwards = [];
 
-    // Validate port range
     const port = Number(extPort);
-    if (!port || port < 1 || port > 65535) {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
       throw new ServerError('Puerto externo inválido (debe ser 1–65535)', 400);
     }
 
@@ -722,9 +735,8 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       throw new ServerError('Port forward rule not found', 404);
     }
 
-    // Validate port range
     const port = Number(extPort);
-    if (!port || port < 1 || port > 65535) {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
       throw new ServerError('Puerto externo inválido (debe ser 1–65535)', 400);
     }
 
