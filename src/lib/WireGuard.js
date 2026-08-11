@@ -477,6 +477,9 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   // Shutdown wireguard
   async Shutdown() {
     await Util.exec('wg-quick down wg0').catch(() => {});
+    // Eliminar las tablas de DNAT para no dejar reglas huérfanas en el host
+    await Util.exec('nft delete table ip wgeasy_dnat').catch(() => {});
+    await Util.exec('nft delete table ip6 wgeasy_dnat').catch(() => {});
   }
 
   // ── Server Settings (Global IP Config) ──────────────────────────
@@ -542,8 +545,31 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       const peerIP = client.address.split('/')[0];
       const peerIPv6 = (this.__serverSettings.enableIpv6 && client.addressV6) ? client.addressV6.split('/')[0] : null;
 
+      // Prevención de inyección: validar IPs antes de usarlas en comandos shell
+      if (!Util.isValidIPv4(peerIP)) {
+        debug(`Skipping client with invalid IPv4: ${peerIP}`);
+        continue;
+      }
+      if (peerIPv6 && !Util.isValidIPv6(peerIPv6)) {
+        debug(`Skipping client with invalid IPv6: ${peerIPv6}`);
+        continue;
+      }
+
       for (const rule of client.portForwards) {
-        const { proto, extPort, intPort } = rule;
+        let { proto, extPort, intPort } = rule;
+
+        // Prevención de inyección: forzar tipos y validar estrictamente
+        extPort = Number(extPort);
+        intPort = Number(intPort);
+        if (Number.isNaN(extPort) || Number.isNaN(intPort) || extPort < 1 || extPort > 65535 || intPort < 1 || intPort > 65535) {
+          debug(`Skipping rule with invalid ports: extPort=${extPort}, intPort=${intPort}`);
+          continue;
+        }
+        if (!['tcp', 'udp', 'both'].includes(proto)) {
+          debug(`Skipping rule with invalid proto: ${proto}`);
+          continue;
+        }
+
         const protocols = proto === 'both' ? ['tcp', 'udp'] : [proto];
 
         for (const p of protocols) {
@@ -580,12 +606,17 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       throw new ServerError('Puerto externo inválido (debe ser 1–65535)', 400);
     }
 
-    // Block reserved ports (WG and admin panel)
+    // Block reserved ports (WG, admin panel, and critical host services)
     if (port === Number(this.__serverSettings.port)) {
       throw new ServerError(`El puerto ${port} está reservado para WireGuard`, 400);
     }
     if (port === Number(this.__serverSettings.configPort)) {
       throw new ServerError(`El puerto ${port} está reservado para el panel de administración`, 400);
+    }
+    // Block SSH to prevent host service hijacking
+    const BLOCKED_HOST_PORTS = [22];
+    if (BLOCKED_HOST_PORTS.includes(port)) {
+      throw new ServerError(`El puerto ${port} está reservado para servicios críticos del host`, 400);
     }
 
     // Validate extPort not already used by the same peer
@@ -642,12 +673,17 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       throw new ServerError('Puerto externo inválido (debe ser 1–65535)', 400);
     }
 
-    // Block reserved ports (WG and admin panel)
+    // Block reserved ports (WG, admin panel, and critical host services)
     if (port === Number(this.__serverSettings.port)) {
       throw new ServerError(`El puerto ${port} está reservado para WireGuard`, 400);
     }
     if (port === Number(this.__serverSettings.configPort)) {
       throw new ServerError(`El puerto ${port} está reservado para el panel de administración`, 400);
+    }
+    // Block SSH to prevent host service hijacking
+    const BLOCKED_HOST_PORTS = [22];
+    if (BLOCKED_HOST_PORTS.includes(port)) {
+      throw new ServerError(`El puerto ${port} está reservado para servicios críticos del host`, 400);
     }
 
     const idx = Number(index);
