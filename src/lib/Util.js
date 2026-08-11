@@ -5,16 +5,16 @@ const childProcess = require('child_process');
 module.exports = class Util {
 
   static isValidIPv4(str) {
+    // Use strict digit-only check per octet to prevent injection via parseInt quirks.
+    // e.g. parseInt('2; touch /tmp/pwn', 10) === 2, which would bypass the old validator.
     const blocks = str.split('.');
     if (blocks.length !== 4) return false;
 
-    for (let value of blocks) {
-      value = parseInt(value, 10);
-      if (Number.isNaN(value)) return false;
-      if (value < 0 || value > 255) return false;
-    }
-
-    return true;
+    return blocks.every((block) => {
+      if (!/^\d+$/.test(block)) return false;
+      const value = Number(block);
+      return value >= 0 && value <= 255;
+    });
   }
 
   static isValidIPv6(str) {

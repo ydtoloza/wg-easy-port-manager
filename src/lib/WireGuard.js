@@ -445,6 +445,8 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   }
 
   async __reloadConfig() {
+    // Clear cache to force re-read from disk (needed after restoreConfiguration)
+    this.__config = null;
     await this.__buildConfig();
     await this.__syncConfig();
   }
@@ -453,11 +455,39 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     debug('Starting configuration restore process.');
     const _config = JSON.parse(config);
 
-    // Ensure all clients have portForwards
+    // Centralised set of ports that must never be forwarded
+    const blockedPorts = new Set([
+      22, // SSH — prevent host service hijacking
+      Number(this.__serverSettings.port),
+      Number(this.__serverSettings.configPort),
+    ]);
+
+    // Validate and sanitize all port forward rules in the backup before saving.
+    // This closes the path that lets blocked ports (e.g. 22) enter via a
+    // crafted backup JSON even though addPortForward() would reject them via API.
     for (const client of Object.values(_config.clients || {})) {
       if (!Array.isArray(client.portForwards)) {
         client.portForwards = [];
+        continue;
       }
+      client.portForwards = client.portForwards
+        .filter((rule) => {
+          const ep = Number(rule.extPort);
+          const ip = Number(rule.intPort);
+          if (!['tcp', 'udp', 'both'].includes(rule.proto)) return false;
+          if (!Number.isFinite(ep) || ep < 1 || ep > 65535) return false;
+          if (!Number.isFinite(ip) || ip < 1 || ip > 65535) return false;
+          if (blockedPorts.has(ep)) {
+            debug(`restoreConfiguration: dropping blocked port ${ep} for client ${client.name}`);
+            return false;
+          }
+          return true;
+        })
+        .map((rule) => ({
+          proto: rule.proto,
+          extPort: Number(rule.extPort),
+          intPort: Number(rule.intPort),
+        }));
     }
 
     await this.__saveConfig(_config);
@@ -556,7 +586,8 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       }
 
       for (const rule of client.portForwards) {
-        let { proto, extPort, intPort } = rule;
+        const { proto } = rule;
+        let { extPort, intPort } = rule;
 
         // Prevención de inyección: forzar tipos y validar estrictamente
         extPort = Number(extPort);
@@ -632,8 +663,10 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     if (crossConflict) throw new ServerError(`El puerto ${proto}/${port} ya está asignado a otro peer`, 400);
 
     client.portForwards.push({ proto, extPort: port, intPort: Number(intPort) });
-    await this.saveConfig();
+    // Apply nftables rules BEFORE persisting: if nft fails the config is not
+    // saved, keeping UI state and host state in sync.
     await this.__applyAllDnatRules();
+    await this.saveConfig();
   }
 
   async removePortForward(clientId, index) {
@@ -705,8 +738,10 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     if (crossConflict) throw new ServerError(`El puerto ${proto}/${port} ya está asignado a otro peer`, 400);
 
     client.portForwards[idx] = { proto, extPort: port, intPort: Number(intPort) };
-    await this.saveConfig();
+    // Apply nftables rules BEFORE persisting: if nft fails the config is not
+    // saved, keeping UI state and host state in sync.
     await this.__applyAllDnatRules();
+    await this.saveConfig();
   }
 
 };
