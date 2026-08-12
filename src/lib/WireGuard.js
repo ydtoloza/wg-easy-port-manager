@@ -500,7 +500,12 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     } catch (err) {
       debug('Configuration restore failed, reverting to previous state');
       this.__config = oldConfig;
-      await this.__applyAllDnatRules(false).catch(() => {});
+      await this.__applyAllDnatRules(false).catch((rollbackErr) => {
+        debug(`Host rollback failed during restore: ${rollbackErr.message}`);
+      });
+      await this.__saveConfig(oldConfig).catch((diskErr) => {
+        debug(`Disk rollback failed during restore: ${diskErr.message}`);
+      });
       throw err;
     }
   }
@@ -593,10 +598,12 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
       // Prevención de inyección: validar IPs antes de usarlas en comandos shell
       if (!Util.isValidIPv4(peerIP)) {
+        if (throwOnError) errors.push(new Error(`Invalid IPv4 address: ${peerIP}`));
         debug(`Skipping client with invalid IPv4: ${peerIP}`);
         continue;
       }
       if (peerIPv6 && !Util.isValidIPv6(peerIPv6)) {
+        if (throwOnError) errors.push(new Error(`Invalid IPv6 address: ${peerIPv6}`));
         debug(`Skipping client with invalid IPv6: ${peerIPv6}`);
         continue;
       }
@@ -699,9 +706,14 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       await this.__applyAllDnatRules(true);
       await this.saveConfig();
     } catch (err) {
-      // Rollback memory if nftables fails
+      // Rollback: memory → host → disk
       client.portForwards.pop();
-      await this.__applyAllDnatRules(false).catch(() => {}); // Rollback host
+      await this.__applyAllDnatRules(false).catch((rollbackErr) => {
+        debug(`Host rollback failed in addPortForward: ${rollbackErr.message}`);
+      });
+      await this.__saveConfig(this.__config).catch((diskErr) => {
+        debug(`Disk rollback failed in addPortForward: ${diskErr.message}`);
+      });
       throw err;
     }
   }
@@ -722,9 +734,14 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         await this.__applyAllDnatRules(true);
         await this.saveConfig();
       } catch (err) {
-        // Rollback memory if nftables fails
+        // Rollback: memory → host → disk
         client.portForwards.splice(index, 0, removed);
-        await this.__applyAllDnatRules(false).catch(() => {}); // Rollback host
+        await this.__applyAllDnatRules(false).catch((rollbackErr) => {
+          debug(`Host rollback failed in removePortForward: ${rollbackErr.message}`);
+        });
+        await this.__saveConfig(this.__config).catch((diskErr) => {
+          debug(`Disk rollback failed in removePortForward: ${diskErr.message}`);
+        });
         throw err;
       }
     }
@@ -792,9 +809,14 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       await this.__applyAllDnatRules(true);
       await this.saveConfig();
     } catch (err) {
-      // Rollback memory if nftables fails
+      // Rollback: memory → host → disk
       client.portForwards[idx] = oldRule;
-      await this.__applyAllDnatRules(false).catch(() => {}); // Rollback host
+      await this.__applyAllDnatRules(false).catch((rollbackErr) => {
+        debug(`Host rollback failed in updatePortForward: ${rollbackErr.message}`);
+      });
+      await this.__saveConfig(this.__config).catch((diskErr) => {
+        debug(`Disk rollback failed in updatePortForward: ${diskErr.message}`);
+      });
       throw err;
     }
   }
