@@ -490,6 +490,8 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         }));
     }
 
+    const oldConfig = this.__config;
+    this.__config = _config;
     try {
       await this.__applyAllDnatRules(true);
       await this.__saveConfig(_config);
@@ -497,7 +499,8 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       debug('Configuration restore process completed.');
     } catch (err) {
       debug('Configuration restore failed, reverting to previous state');
-      await this.__reloadConfig();
+      this.__config = oldConfig;
+      await this.__applyAllDnatRules(false).catch(() => {});
       throw err;
     }
   }
@@ -656,8 +659,12 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     if (!Array.isArray(client.portForwards)) client.portForwards = [];
 
     const port = Number(extPort);
+    const internalPort = Number(intPort);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       throw new ServerError('Puerto externo inválido (debe ser 1–65535)', 400);
+    }
+    if (!Number.isInteger(internalPort) || internalPort < 1 || internalPort > 65535) {
+      throw new ServerError('Puerto interno inválido (debe ser 1–65535)', 400);
     }
 
     // Block reserved ports (WG, admin panel, and critical host services)
@@ -685,7 +692,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         && r.extPort === port));
     if (crossConflict) throw new ServerError(`El puerto ${proto}/${port} ya está asignado a otro peer`, 400);
 
-    client.portForwards.push({ proto, extPort: port, intPort: Number(intPort) });
+    client.portForwards.push({ proto, extPort: port, intPort: internalPort });
     try {
       // Apply nftables rules BEFORE persisting: if nft fails the config is not
       // saved, keeping UI state and host state in sync.
@@ -694,6 +701,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     } catch (err) {
       // Rollback memory if nftables fails
       client.portForwards.pop();
+      await this.__applyAllDnatRules(false).catch(() => {}); // Rollback host
       throw err;
     }
   }
@@ -716,6 +724,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       } catch (err) {
         // Rollback memory if nftables fails
         client.portForwards.splice(index, 0, removed);
+        await this.__applyAllDnatRules(false).catch(() => {}); // Rollback host
         throw err;
       }
     }
@@ -736,8 +745,12 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     }
 
     const port = Number(extPort);
+    const internalPort = Number(intPort);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       throw new ServerError('Puerto externo inválido (debe ser 1–65535)', 400);
+    }
+    if (!Number.isInteger(internalPort) || internalPort < 1 || internalPort > 65535) {
+      throw new ServerError('Puerto interno inválido (debe ser 1–65535)', 400);
     }
 
     // Block reserved ports (WG, admin panel, and critical host services)
@@ -772,7 +785,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     if (crossConflict) throw new ServerError(`El puerto ${proto}/${port} ya está asignado a otro peer`, 400);
 
     const oldRule = client.portForwards[idx];
-    client.portForwards[idx] = { proto, extPort: port, intPort: Number(intPort) };
+    client.portForwards[idx] = { proto, extPort: port, intPort: internalPort };
     try {
       // Apply nftables rules BEFORE persisting: if nft fails the config is not
       // saved, keeping UI state and host state in sync.
@@ -781,6 +794,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     } catch (err) {
       // Rollback memory if nftables fails
       client.portForwards[idx] = oldRule;
+      await this.__applyAllDnatRules(false).catch(() => {}); // Rollback host
       throw err;
     }
   }
