@@ -265,10 +265,12 @@ module.exports = class Server {
         if (!['tcp', 'udp', 'both'].includes(proto)) {
           throw createError({ status: 400, message: 'proto debe ser tcp, udp o both' });
         }
-        if (!extPort || !intPort || extPort < 1 || extPort > 65535 || intPort < 1 || intPort > 65535) {
+        const p = Number(extPort);
+        const ip = Number(intPort);
+        if (!Number.isInteger(p) || !Number.isInteger(ip) || p < 1 || p > 65535 || ip < 1 || ip > 65535) {
           throw createError({ status: 400, message: 'Puertos inválidos' });
         }
-        await WireGuard.addPortForward(clientId, proto, Number(extPort), Number(intPort));
+        await WireGuard.addPortForward(clientId, proto, p, ip);
         return { success: true };
       }))
       .delete('/api/wireguard/client/:clientId/port-forward/:index', defineEventHandler(async (event) => {
@@ -277,7 +279,11 @@ module.exports = class Server {
           throw createError({ status: 403 });
         }
         const index = getRouterParam(event, 'index');
-        await WireGuard.removePortForward(clientId, Number(index));
+        const numIndex = Number(index);
+        if (!Number.isInteger(numIndex) || numIndex < 0) {
+          throw createError({ status: 400, message: 'Invalid index' });
+        }
+        await WireGuard.removePortForward(clientId, numIndex);
         return { success: true };
       }))
       .put('/api/wireguard/client/:clientId/port-forward/:index', defineEventHandler(async (event) => {
@@ -286,14 +292,20 @@ module.exports = class Server {
         if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
           throw createError({ status: 403 });
         }
+        const numIndex = Number(index);
+        if (!Number.isInteger(numIndex) || numIndex < 0) {
+          throw createError({ status: 400, message: 'Invalid index' });
+        }
         const { proto, extPort, intPort } = await readBody(event);
         if (!['tcp', 'udp', 'both'].includes(proto)) {
           throw createError({ status: 400, message: 'proto debe ser tcp, udp o both' });
         }
-        if (!extPort || !intPort || extPort < 1 || extPort > 65535 || intPort < 1 || intPort > 65535) {
+        const p = Number(extPort);
+        const ip = Number(intPort);
+        if (!Number.isInteger(p) || !Number.isInteger(ip) || p < 1 || p > 65535 || ip < 1 || ip > 65535) {
           throw createError({ status: 400, message: 'Puertos inválidos' });
         }
-        await WireGuard.updatePortForward(clientId, Number(index), proto, Number(extPort), Number(intPort));
+        await WireGuard.updatePortForward(clientId, numIndex, proto, p, ip);
         return { success: true };
       }))
       .get('/api/wireguard/server-config', defineEventHandler(async () => {

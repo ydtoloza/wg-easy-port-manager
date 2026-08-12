@@ -24,6 +24,8 @@ const {
   WG_POST_UP,
   WG_PRE_DOWN,
   WG_POST_DOWN,
+  WG_PORT_FWD_MIN,
+  WG_PORT_FWD_MAX,
 } = require('../config');
 
 const DUMMY_CLIENT_PREVIEW = {
@@ -63,6 +65,8 @@ module.exports = class WireGuard {
       mtu: WG_MTU,
       allowedIps: WG_ALLOWED_IPS,
       persistentKeepalive: WG_PERSISTENT_KEEPALIVE,
+      portFwdMin: Number(WG_PORT_FWD_MIN),
+      portFwdMax: Number(WG_PORT_FWD_MAX),
     };
     this.__config = null;
     this.__initPromise = null;
@@ -218,13 +222,25 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
     }
 
     debug('Config saving...');
-    await fs.writeFile(path.join(WG_PATH, 'wg0.json'), JSON.stringify(config, false, 2), {
-      mode: 0o660,
-    });
-    await fs.writeFile(path.join(WG_PATH, 'wg0.conf'), result, {
-      mode: 0o600,
-    });
-    debug('Config saved.');
+    const jsonTmp = path.join(WG_PATH, 'wg0.json.tmp');
+    const confTmp = path.join(WG_PATH, 'wg0.conf.tmp');
+    const jsonFile = path.join(WG_PATH, 'wg0.json');
+    const confFile = path.join(WG_PATH, 'wg0.conf');
+
+    try {
+      await fs.writeFile(jsonTmp, JSON.stringify(config, false, 2), { mode: 0o660 });
+      await fs.writeFile(confTmp, result, { mode: 0o600 });
+
+      await fs.rename(jsonTmp, jsonFile);
+      await fs.rename(confTmp, confFile);
+
+      debug('Config saved.');
+    } catch (err) {
+      debug(`Error saving config: ${err.message}`);
+      await fs.unlink(jsonTmp).catch(() => {});
+      await fs.unlink(confTmp).catch(() => {});
+      throw err;
+    }
   }
 
   async __syncConfig() {
@@ -390,10 +406,16 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     const config = await this.getConfig();
 
     if (config.clients[clientId]) {
-      // Clean up DNAT rules for this client before deleting
-      delete config.clients[clientId];
-      await this.saveConfig();
-      await this.__applyAllDnatRules();
+      const removedClient = config.clients[clientId];
+      await this.__transactionalDnatChange(
+        () => {
+          delete config.clients[clientId];
+        },
+        () => {
+          config.clients[clientId] = removedClient;
+        },
+        'delete-client',
+      );
     }
   }
 
@@ -435,13 +457,23 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       throw new ServerError(`Invalid IPv6 Address: ${addressV6}`, 400);
     }
 
-    if (address) client.address = address;
-    if (addressV6) client.addressV6 = addressV6;
-    client.updatedAt = new Date();
+    const oldAddress = client.address;
+    const oldAddressV6 = client.addressV6;
+    const oldUpdatedAt = client.updatedAt;
 
-    await this.saveConfig();
-    // Re-apply DNAT since IP changed
-    await this.__applyAllDnatRules();
+    await this.__transactionalDnatChange(
+      () => {
+        if (address) client.address = address;
+        if (addressV6) client.addressV6 = addressV6;
+        client.updatedAt = new Date();
+      },
+      () => {
+        client.address = oldAddress;
+        client.addressV6 = oldAddressV6;
+        client.updatedAt = oldUpdatedAt;
+      },
+      'update-client-address',
+    );
   }
 
   async __reloadConfig() {
@@ -455,16 +487,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     debug('Starting configuration restore process.');
     const _config = JSON.parse(config);
 
-    // Centralised set of ports that must never be forwarded
-    const blockedPorts = new Set([
-      22, // SSH — prevent host service hijacking
-      Number(this.__serverSettings.port),
-      Number(this.__serverSettings.configPort),
-    ]);
-
     // Validate and sanitize all port forward rules in the backup before saving.
-    // This closes the path that lets blocked ports (e.g. 22) enter via a
-    // crafted backup JSON even though addPortForward() would reject them via API.
     for (const client of Object.values(_config.clients || {})) {
       if (!Array.isArray(client.portForwards)) {
         client.portForwards = [];
@@ -477,8 +500,8 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
           if (!['tcp', 'udp', 'both'].includes(rule.proto)) return false;
           if (!Number.isInteger(ep) || ep < 1 || ep > 65535) return false;
           if (!Number.isInteger(ip) || ip < 1 || ip > 65535) return false;
-          if (blockedPorts.has(ep)) {
-            debug(`restoreConfiguration: dropping blocked port ${ep} for client ${client.name}`);
+          if (!this.__isPortAllowed(ep)) {
+            debug(`restoreConfiguration: dropping unallowed port ${ep} for client ${client.name}`);
             return false;
           }
           return true;
@@ -491,21 +514,44 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     }
 
     const oldConfig = this.__config;
-    this.__config = _config;
+    await this.__transactionalDnatChange(
+      () => {
+        this.__config = _config;
+      },
+      () => {
+        this.__config = oldConfig;
+      },
+      'restore',
+    );
+    // restoreConfiguration forces a reload after a successful save so wg0 interface syncs properly.
+    await this.__reloadConfig();
+    debug('Configuration restore process completed.');
+  }
+
+  async __transactionalDnatChange(mutate, rollback, context = 'dnat-change') {
+    mutate();
     try {
       await this.__applyAllDnatRules(true);
-      await this.__saveConfig(_config);
-      await this.__reloadConfig();
-      debug('Configuration restore process completed.');
+      await this.saveConfig();
     } catch (err) {
-      debug('Configuration restore failed, reverting to previous state');
-      this.__config = oldConfig;
+      rollback();
+      const rollbackErrors = [];
       await this.__applyAllDnatRules(false).catch((rollbackErr) => {
-        debug(`Host rollback failed during restore: ${rollbackErr.message}`);
+        const msg = `Host rollback failed in ${context}: ${rollbackErr.message}`;
+        debug(msg);
+        rollbackErrors.push(msg);
       });
-      await this.__saveConfig(oldConfig).catch((diskErr) => {
-        debug(`Disk rollback failed during restore: ${diskErr.message}`);
+      await this.__saveConfig(this.__config).catch((diskErr) => {
+        const msg = `Disk rollback failed in ${context}: ${diskErr.message}`;
+        debug(msg);
+        rollbackErrors.push(msg);
       });
+      await this.__syncConfig().catch((syncErr) => {
+        const msg = `WG sync rollback failed in ${context}: ${syncErr.message}`;
+        debug(msg);
+        rollbackErrors.push(msg);
+      });
+      err.rollbackErrors = rollbackErrors;
       throw err;
     }
   }
@@ -538,7 +584,8 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     await this.getConfig();
 
     const allowed = ['host', 'port', 'configPort', 'device', 'defaultDns',
-      'defaultAddress', 'defaultAddressV6', 'enableIpv6', 'mtu', 'allowedIps', 'persistentKeepalive'];
+      'defaultAddress', 'defaultAddressV6', 'enableIpv6', 'mtu', 'allowedIps',
+      'persistentKeepalive', 'portFwdMin', 'portFwdMax'];
 
     for (const key of allowed) {
       if (settings[key] !== undefined) {
@@ -558,6 +605,16 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   }
 
   // ── NFTables / DNAT ─────────────────────────────────────────────
+
+  __isPortAllowed(port) {
+    const p = Number(port);
+    if (!Number.isInteger(p)) return false;
+    if (p === Number(this.__serverSettings.port) || p === Number(this.__serverSettings.configPort)) return false;
+
+    const min = this.__serverSettings.portFwdMin;
+    const max = this.__serverSettings.portFwdMax;
+    return p >= min && p <= max;
+  }
 
   async __ensureNftablesSetup() {
     try {
@@ -674,17 +731,9 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       throw new ServerError('Puerto interno inválido (debe ser 1–65535)', 400);
     }
 
-    // Block reserved ports (WG, admin panel, and critical host services)
-    if (port === Number(this.__serverSettings.port)) {
-      throw new ServerError(`El puerto ${port} está reservado para WireGuard`, 400);
-    }
-    if (port === Number(this.__serverSettings.configPort)) {
-      throw new ServerError(`El puerto ${port} está reservado para el panel de administración`, 400);
-    }
-    // Block SSH to prevent host service hijacking
-    const BLOCKED_HOST_PORTS = [22];
-    if (BLOCKED_HOST_PORTS.includes(port)) {
-      throw new ServerError(`El puerto ${port} está reservado para servicios críticos del host`, 400);
+    // Block unallowed ports
+    if (!this.__isPortAllowed(port)) {
+      throw new ServerError(`El puerto ${port} no está permitido por la política o está reservado`, 400);
     }
 
     // Validate extPort not already used by the same peer
@@ -699,23 +748,15 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         && r.extPort === port));
     if (crossConflict) throw new ServerError(`El puerto ${proto}/${port} ya está asignado a otro peer`, 400);
 
-    client.portForwards.push({ proto, extPort: port, intPort: internalPort });
-    try {
-      // Apply nftables rules BEFORE persisting: if nft fails the config is not
-      // saved, keeping UI state and host state in sync.
-      await this.__applyAllDnatRules(true);
-      await this.saveConfig();
-    } catch (err) {
-      // Rollback: memory → host → disk
-      client.portForwards.pop();
-      await this.__applyAllDnatRules(false).catch((rollbackErr) => {
-        debug(`Host rollback failed in addPortForward: ${rollbackErr.message}`);
-      });
-      await this.__saveConfig(this.__config).catch((diskErr) => {
-        debug(`Disk rollback failed in addPortForward: ${diskErr.message}`);
-      });
-      throw err;
-    }
+    await this.__transactionalDnatChange(
+      () => {
+        client.portForwards.push({ proto, extPort: port, intPort: internalPort });
+      },
+      () => {
+        client.portForwards.pop();
+      },
+      'add-port-forward',
+    );
   }
 
   async removePortForward(clientId, index) {
@@ -728,22 +769,21 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     const client = config.clients[clientId];
     if (!client) throw new ServerError(`Client not found: ${clientId}`, 404);
 
+    if (!Number.isInteger(index) || index < 0) {
+      throw new ServerError('Invalid index', 400);
+    }
+
     if (Array.isArray(client.portForwards) && client.portForwards.length > index) {
-      const [removed] = client.portForwards.splice(index, 1);
-      try {
-        await this.__applyAllDnatRules(true);
-        await this.saveConfig();
-      } catch (err) {
-        // Rollback: memory → host → disk
-        client.portForwards.splice(index, 0, removed);
-        await this.__applyAllDnatRules(false).catch((rollbackErr) => {
-          debug(`Host rollback failed in removePortForward: ${rollbackErr.message}`);
-        });
-        await this.__saveConfig(this.__config).catch((diskErr) => {
-          debug(`Disk rollback failed in removePortForward: ${diskErr.message}`);
-        });
-        throw err;
-      }
+      const ruleToRemove = client.portForwards[index];
+      await this.__transactionalDnatChange(
+        () => {
+          client.portForwards.splice(index, 1);
+        },
+        () => {
+          client.portForwards.splice(index, 0, ruleToRemove);
+        },
+        'remove-port-forward',
+      );
     }
   }
 
@@ -757,7 +797,11 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     const client = config.clients[clientId];
     if (!client) throw new ServerError(`Client not found: ${clientId}`, 404);
 
-    if (!Array.isArray(client.portForwards) || client.portForwards.length <= index) {
+    const idx = Number(index);
+    if (!Number.isInteger(idx) || idx < 0) {
+      throw new ServerError('Invalid index', 400);
+    }
+    if (!Array.isArray(client.portForwards) || client.portForwards.length <= idx) {
       throw new ServerError('Port forward rule not found', 404);
     }
 
@@ -770,20 +814,10 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       throw new ServerError('Puerto interno inválido (debe ser 1–65535)', 400);
     }
 
-    // Block reserved ports (WG, admin panel, and critical host services)
-    if (port === Number(this.__serverSettings.port)) {
-      throw new ServerError(`El puerto ${port} está reservado para WireGuard`, 400);
+    // Block unallowed ports
+    if (!this.__isPortAllowed(port)) {
+      throw new ServerError(`El puerto ${port} no está permitido por la política o está reservado`, 400);
     }
-    if (port === Number(this.__serverSettings.configPort)) {
-      throw new ServerError(`El puerto ${port} está reservado para el panel de administración`, 400);
-    }
-    // Block SSH to prevent host service hijacking
-    const BLOCKED_HOST_PORTS = [22];
-    if (BLOCKED_HOST_PORTS.includes(port)) {
-      throw new ServerError(`El puerto ${port} está reservado para servicios críticos del host`, 400);
-    }
-
-    const idx = Number(index);
 
     // Validate extPort not already used by the same peer (excluding the rule being updated)
     const selfConflict = client.portForwards.some((r, i) => i !== idx
@@ -802,23 +836,15 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     if (crossConflict) throw new ServerError(`El puerto ${proto}/${port} ya está asignado a otro peer`, 400);
 
     const oldRule = client.portForwards[idx];
-    client.portForwards[idx] = { proto, extPort: port, intPort: internalPort };
-    try {
-      // Apply nftables rules BEFORE persisting: if nft fails the config is not
-      // saved, keeping UI state and host state in sync.
-      await this.__applyAllDnatRules(true);
-      await this.saveConfig();
-    } catch (err) {
-      // Rollback: memory → host → disk
-      client.portForwards[idx] = oldRule;
-      await this.__applyAllDnatRules(false).catch((rollbackErr) => {
-        debug(`Host rollback failed in updatePortForward: ${rollbackErr.message}`);
-      });
-      await this.__saveConfig(this.__config).catch((diskErr) => {
-        debug(`Disk rollback failed in updatePortForward: ${diskErr.message}`);
-      });
-      throw err;
-    }
+    await this.__transactionalDnatChange(
+      () => {
+        client.portForwards[idx] = { proto, extPort: port, intPort: internalPort };
+      },
+      () => {
+        client.portForwards[idx] = oldRule;
+      },
+      'update-port-forward',
+    );
   }
 
 };
