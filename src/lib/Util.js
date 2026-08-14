@@ -26,39 +26,13 @@ module.exports = class Util {
     return this.isValidIPv4(str) || this.isValidIPv6(str);
   }
 
-  static promisify(fn) {
-    // eslint-disable-next-line func-names
-    return function(req, res) {
-      Promise.resolve().then(async () => fn(req, res))
-        .then((result) => {
-          if (res.headersSent) return;
-
-          if (typeof result === 'undefined') {
-            return res
-              .status(204)
-              .end();
-          }
-
-          return res
-            .status(200)
-            .json(result);
-        })
-        .catch((error) => {
-          if (typeof error === 'string') {
-            error = new Error(error);
-          }
-
-          // eslint-disable-next-line no-console
-          console.error(error);
-
-          return res
-            .status(error.statusCode || 500)
-            .json({
-              error: error.message || error.toString(),
-              stack: error.stack,
-            });
-        });
-    };
+  static isValidName(str) {
+    if (typeof str !== 'string' || str.length === 0 || str.length > 128) {
+      return false;
+    }
+    // Reject control characters (e.g. newlines) that could break config files.
+    // eslint-disable-next-line no-control-regex
+    return !/[\u0000-\u001f\u007f]/.test(str);
   }
 
   static async exec(cmd, {

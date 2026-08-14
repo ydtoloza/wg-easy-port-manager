@@ -308,6 +308,10 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
   }
 
   async getClient({ clientId }) {
+    if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+      throw new ServerError(`Client Not Found: ${clientId}`, 404);
+    }
+
     const config = await this.getConfig();
     const client = config.clients[clientId];
     if (!client) {
@@ -345,8 +349,8 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   }
 
   async createClient({ name }) {
-    if (!name) {
-      throw new Error('Missing: Name');
+    if (!Util.isValidName(name)) {
+      throw new ServerError('Invalid name: 1-64 chars, no control characters', 400);
     }
 
     const config = await this.getConfig();
@@ -405,6 +409,10 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   async deleteClient({ clientId }) {
     const config = await this.getConfig();
 
+    if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+      throw new ServerError(`Client Not Found: ${clientId}`, 404);
+    }
+
     if (config.clients[clientId]) {
       const removedClient = config.clients[clientId];
       await this.__transactionalDnatChange(
@@ -439,6 +447,10 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
   async updateClientName({ clientId, name }) {
     const client = await this.getClient({ clientId });
+
+    if (!Util.isValidName(name)) {
+      throw new ServerError('Invalid name: 1-64 chars, no control characters', 400);
+    }
 
     client.name = name;
     client.updatedAt = new Date();
@@ -485,10 +497,48 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
   async restoreConfiguration(config) {
     debug('Starting configuration restore process.');
-    const _config = JSON.parse(config);
 
-    // Validate and sanitize all port forward rules in the backup before saving.
+    let _config;
+    try {
+      _config = JSON.parse(config);
+    } catch {
+      throw new ServerError('Invalid backup: not valid JSON', 400);
+    }
+
+    if (!_config || typeof _config !== 'object') {
+      throw new ServerError('Invalid backup: expected an object', 400);
+    }
+
+    // Validate server settings (prevents injection of [Interface] directives).
+    const server = _config.server || {};
+    for (const key of ['privateKey', 'publicKey']) {
+      const value = server[key];
+      if (typeof value !== 'string' || !/^[A-Za-z0-9+/=_-]+$/.test(value)) {
+        throw new ServerError(`Invalid backup: invalid server.${key}`, 400);
+      }
+    }
+    if (typeof server.address !== 'string' || !Util.isValidIPv4(server.address)) {
+      throw new ServerError(`Invalid backup: invalid server.address: ${server.address}`, 400);
+    }
+    if (server.addressV6 != null && (typeof server.addressV6 !== 'string' || !Util.isValidIPv6(server.addressV6))) {
+      throw new ServerError(`Invalid backup: invalid server.addressV6: ${server.addressV6}`, 400);
+    }
+
+    // Validate clients (names, addresses) and sanitize port forward rules.
     for (const client of Object.values(_config.clients || {})) {
+      if (!client || typeof client !== 'object') {
+        throw new ServerError('Invalid backup: invalid client entry', 400);
+      }
+      if (client.name !== undefined && !Util.isValidName(client.name)) {
+        throw new ServerError(`Invalid backup: invalid client name: ${client.name}`, 400);
+      }
+      if (typeof client.address !== 'string' || !Util.isValidIPv4(client.address)) {
+        throw new ServerError(`Invalid IPv4 address: ${client.address}`, 400);
+      }
+      if (client.addressV6 != null && (typeof client.addressV6 !== 'string' || !Util.isValidIPv6(client.addressV6))) {
+        throw new ServerError(`Invalid IPv6 address: ${client.addressV6}`, 400);
+      }
+
       if (!Array.isArray(client.portForwards)) {
         client.portForwards = [];
         continue;
@@ -583,14 +633,54 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   async updateServerConfig(settings) {
     await this.getConfig();
 
+    if (!settings || typeof settings !== 'object') {
+      throw new ServerError('Invalid body: expected an object', 400);
+    }
+
+    const isPort = (v) => Number.isInteger(Number(v)) && Number(v) >= 1 && Number(v) <= 65535;
+    const isPlainString = (v) => typeof v === 'string' && !/[\r\n]/.test(v);
+
+    const validators = {
+      host: (v) => typeof v === 'string' && v.length > 0 && v.length <= 255 && isPlainString(v),
+      port: (v) => isPort(v),
+      configPort: (v) => isPort(v),
+      device: (v) => typeof v === 'string' && /^[A-Za-z0-9_.-]+$/.test(v),
+      defaultDns: (v) => typeof v === 'string' && v.length <= 255 && isPlainString(v),
+      defaultAddress: (v) => typeof v === 'string' && v.length <= 255 && isPlainString(v)
+        && /^[0-9A-Fa-f.:/x]+$/.test(v) && v.includes('x'),
+      defaultAddressV6: (v) => typeof v === 'string' && v.length <= 255 && isPlainString(v)
+        && /^[0-9A-Fa-f:x]+$/.test(v) && v.includes('x'),
+      enableIpv6: (v) => typeof v === 'boolean',
+      mtu: (v) => v === null || (Number.isInteger(Number(v)) && Number(v) >= 576 && Number(v) <= 65535),
+      allowedIps: (v) => typeof v === 'string' && v.length <= 255 && isPlainString(v),
+      persistentKeepalive: (v) => v === null || (Number.isInteger(Number(v)) && Number(v) >= 0 && Number(v) <= 65535),
+      portFwdMin: (v) => isPort(v),
+      portFwdMax: (v) => isPort(v),
+    };
+
     const allowed = ['host', 'port', 'configPort', 'device', 'defaultDns',
       'defaultAddress', 'defaultAddressV6', 'enableIpv6', 'mtu', 'allowedIps',
       'persistentKeepalive', 'portFwdMin', 'portFwdMax'];
 
     for (const key of allowed) {
-      if (settings[key] !== undefined) {
-        this.__serverSettings[key] = settings[key];
+      if (settings[key] === undefined) continue;
+
+      if (!validators[key](settings[key])) {
+        throw new ServerError(`Invalid value for ${key}`, 400);
       }
+      this.__serverSettings[key] = settings[key];
+    }
+
+    // Normalize numeric settings
+    for (const key of ['port', 'configPort', 'mtu', 'persistentKeepalive', 'portFwdMin', 'portFwdMax']) {
+      const value = this.__serverSettings[key];
+      if (value !== null && value !== undefined) {
+        this.__serverSettings[key] = Number(value);
+      }
+    }
+
+    if (this.__serverSettings.portFwdMin > this.__serverSettings.portFwdMax) {
+      throw new ServerError('portFwdMin cannot be greater than portFwdMax', 400);
     }
 
     // Persist to disk

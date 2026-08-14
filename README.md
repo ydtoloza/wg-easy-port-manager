@@ -56,10 +56,11 @@ services:
   wg-easy-port-manager:
     image: ghcr.io/ydtoloza/wg-easy-port-manager:latest
     container_name: wg-easy-port-manager
+    env_file: .env
     environment:
       - LANG=es # Idioma de la interfaz
-      - WG_HOST=TU_IP_PUBLICA # Cambia por la IP pública de tu servidor
-      - PASSWORD_HASH=$$2y$$10$$hBCoykrB95WSzuV4fafBzOHWKu9sbyVa34GJr8VV5R/pIelfEMYyG # Genera tu propio hash bcrypt
+      - WG_HOST=${WG_HOST} # Cambia por la IP pública de tu servidor
+      - PASSWORD_HASH=${PASSWORD_HASH} # Genera tu propio hash bcrypt (ver abajo)
       - WG_PERSISTENT_KEEPALIVE=25
       - WG_DEVICE=eth0 # Cambia si tu interfaz principal no es eth0
       - WG_DEFAULT_ADDRESS_V6=fd42:42:42::x # Rango IPv6 opcional
@@ -73,7 +74,7 @@ services:
       - NET_RAW
 ```
 
-> **Nota sobre `PASSWORD_HASH`**: No uses contraseñas en texto plano. Debes generar un hash bcrypt. En docker-compose, escapa los símbolos `$` usando doble `$$`.
+> **Nota sobre `PASSWORD_HASH`**: No uses contraseñas en texto plano y **nunca subas tu hash real al repositorio**. Copia `.env.example` a `.env`, genera tu propio hash con `docker run --rm ghcr.io/ydtoloza/wg-easy-port-manager wgpw TU_PASSWORD` y rellénalo allí. En docker-compose, los símbolos `$` del hash van escapados con doble `$$` (en un archivo `.env` no hace falta escapar).
 
 ---
 
@@ -116,10 +117,11 @@ services:
   wg-easy-port-manager:
     image: ghcr.io/ydtoloza/wg-easy-port-manager:latest
     container_name: wg-easy-port-manager
+    env_file: .env
     environment:
       - LANG=en # Set UI Language
-      - WG_HOST=YOUR_SERVER_IP # Change to your server's public IP
-      - PASSWORD_HASH=$$2y$$10$$hBCoykrB95WSzuV4fafBzOHWKu9sbyVa34GJr8VV5R/pIelfEMYyG # Replace with your bcrypt hash
+      - WG_HOST=${WG_HOST} # Change to your server's public IP
+      - PASSWORD_HASH=${PASSWORD_HASH} # Replace with your own bcrypt hash (see below)
       - WG_PERSISTENT_KEEPALIVE=25
       - WG_DEVICE=eth0 # Change if your main interface is not eth0
       - WG_DEFAULT_ADDRESS_V6=fd42:42:42::x # Optional IPv6 range
@@ -132,6 +134,8 @@ services:
       - SYS_MODULE
       - NET_RAW
 ```
+
+> **Note on `PASSWORD_HASH`**: Never use plain-text passwords and **never commit your real hash to the repository**. Copy `.env.example` to `.env`, generate your own hash with `docker run --rm ghcr.io/ydtoloza/wg-easy-port-manager wgpw YOUR_PASSWORD` and fill it in there. In docker-compose files the `$` characters of the hash must be escaped as `$$` (no escaping needed in a `.env` file).
 
 ---
 

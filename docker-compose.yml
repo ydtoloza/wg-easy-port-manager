@@ -7,8 +7,8 @@ services:
     container_name: wg-easy-port-manager
     environment:
       - LANG=es
-      - WG_HOST=209.141.61.72
-      - PASSWORD_HASH=$$2y$$10$$hBCoykrB95WSzuV4fafBzOHWKu9sbyVa34GJr8VV5R/pIelfEMYyG
+      - WG_HOST=${WG_HOST}
+      - PASSWORD_HASH=${PASSWORD_HASH:?Set PASSWORD_HASH en .env (genera uno con: docker run --rm ghcr.io/ydtoloza/wg-easy-port-manager wgpw TU_PASSWORD)}
       - WG_PERSISTENT_KEEPALIVE=25
       - WG_DEVICE=eth0
 

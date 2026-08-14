@@ -57,8 +57,11 @@ describe('WireGuard', () => {
     fs.unlink.mockResolvedValue();
 
     Util.exec.mockResolvedValue();
-    Util.isValidIPv4.mockImplementation((ip) => ip === '10.8.0.2');
+    Util.isValidIPv4.mockImplementation((ip) => /^10\.8\.0\.\d+$/.test(ip));
     Util.isValidIPv6.mockReturnValue(true);
+    Util.isValidName.mockImplementation((s) => typeof s === 'string' && s.length > 0 && s.length <= 128
+      // eslint-disable-next-line no-control-regex
+      && !/[\u0000-\u001f\u007f]/.test(s));
 
     // mock linux to bypass process.platform check in mutating methods
     Object.defineProperty(process, 'platform', { value: 'linux' });
@@ -164,7 +167,11 @@ describe('WireGuard', () => {
       await wg.getConfig(); // init state
 
       const backupJson = JSON.stringify({
-        server: { address: '10.8.0.1' },
+        server: {
+          privateKey: 'server-priv-valid-key==',
+          publicKey: 'server-pub-valid-key==',
+          address: '10.8.0.1',
+        },
         clients: {
           client1: {
             id: 'client1',
@@ -198,7 +205,11 @@ describe('WireGuard', () => {
       await wg.getConfig(); // init state
 
       const backupJson = JSON.stringify({
-        server: { address: '10.8.0.1' },
+        server: {
+          privateKey: 'server-priv-valid-key==',
+          publicKey: 'server-pub-valid-key==',
+          address: '10.8.0.1',
+        },
         clients: {
           client1: {
             id: 'client1',
@@ -217,6 +228,58 @@ describe('WireGuard', () => {
 
       const config = await wg.getConfig();
       expect(config.clients.client1.address).toBe('10.8.0.2');
+    });
+
+    it('rejects backup with injected server keys (config injection)', async () => {
+      await wg.getConfig(); // init state
+
+      const backupJson = JSON.stringify({
+        server: {
+          privateKey: 'a\nPostUp = touch /pwn', // Injected newline
+          publicKey: 'valid-public-key==',
+          address: '10.8.0.1',
+        },
+        clients: {},
+      });
+
+      await expect(wg.restoreConfiguration(backupJson))
+        .rejects.toThrow(/invalid server\.privateKey/);
+
+      const config = await wg.getConfig();
+      expect(config.server.privateKey).toBe('server-priv');
+    });
+
+    it('rejects backup with invalid client name', async () => {
+      await wg.getConfig(); // init state
+
+      const backupJson = JSON.stringify({
+        server: {
+          privateKey: 'server-priv-valid-key==',
+          publicKey: 'server-pub-valid-key==',
+          address: '10.8.0.1',
+        },
+        clients: {
+          client1: {
+            id: 'client1',
+            name: 'evil\n[Peer]',
+            address: '10.8.0.2',
+            portForwards: [],
+          },
+        },
+      });
+
+      await expect(wg.restoreConfiguration(backupJson))
+        .rejects.toThrow(/invalid client name/);
+    });
+  });
+
+  describe('name validation', () => {
+    it('rejects client names with newlines/control chars', async () => {
+      await expect(wg.createClient({ name: 'evil\n[Peer]\nPublicKey = x' })).rejects.toThrow(ServerError);
+      await expect(wg.createClient({ name: '' })).rejects.toThrow(ServerError);
+      await expect(wg.createClient({ name: 'a'.repeat(200) })).rejects.toThrow(ServerError);
+      await expect(wg.updateClientName({ clientId: 'client1', name: 'evil\r\n' })).rejects.toThrow(ServerError);
+      await expect(wg.updateClientName({ clientId: 'client1', name: 'ok-name' })).resolves.toBeUndefined();
     });
   });
 });

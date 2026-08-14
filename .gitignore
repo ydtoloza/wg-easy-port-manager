@@ -4,6 +4,9 @@
 /wg0.conf
 /wg0.json
 
+# Secrets (never commit)
+.env
+
 # Node
 /src/node_modules/
 node_modules/

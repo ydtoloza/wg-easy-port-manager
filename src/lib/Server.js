@@ -18,6 +18,7 @@ const {
   getRouterParam,
   toNodeListener,
   readBody,
+  readRawBody,
   setHeader,
   send,
   serveStatic,
@@ -31,12 +32,73 @@ const {
   RELEASE,
   PASSWORD,
   PASSWORD_HASH,
+  SESSION_SECRET,
   LANG,
   UI_TRAFFIC_STATS,
   UI_CHART_TYPE,
 } = require('../config');
 
 const requiresPassword = !!PASSWORD_HASH;
+
+const SESSION_COOKIE_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
+const LOGIN_MAX_ATTEMPTS = 20; // per IP per window
+const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const MAX_BODY_SIZE = 1024 * 1024; // 1 MB
+
+// In-memory login rate limiter (key: client IP)
+const loginAttempts = new Map();
+
+const isLoginRateLimited = (key) => {
+  const now = Date.now();
+  let entry = loginAttempts.get(key);
+  if (!entry || entry.resetAt <= now) {
+    entry = { count: 0, resetAt: now + LOGIN_WINDOW_MS };
+    loginAttempts.set(key, entry);
+  }
+  entry.count += 1;
+  return entry.count > LOGIN_MAX_ATTEMPTS;
+};
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of loginAttempts) {
+    if (entry.resetAt <= now) {
+      loginAttempts.delete(key);
+    }
+  }
+}, LOGIN_WINDOW_MS).unref();
+
+const getClientIp = (req) => {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string') {
+    return forwarded.split(',')[0].trim() || req.socket.remoteAddress;
+  }
+  return req.socket.remoteAddress;
+};
+
+// Read a JSON body with a hard size limit (prevents memory exhaustion).
+const readBodyLimited = async (event) => {
+  const raw = await readRawBody(event);
+  if (raw && raw.length > MAX_BODY_SIZE) {
+    throw createError({ status: 413, message: 'Payload too large' });
+  }
+  return readBody(event);
+};
+
+// Validate that cross-site requests cannot use the session cookie.
+const isSameOrigin = (req) => {
+  const { origin } = req.headers;
+  if (!origin) {
+    // Non-browser clients (curl, wg CLI) don't send Origin.
+    return true;
+  }
+  try {
+    const { host } = new URL(origin);
+    return host === req.headers.host;
+  } catch {
+    return false;
+  }
+};
 
 /**
  * Checks if `password` matches the PASSWORD_HASH.
@@ -65,10 +127,48 @@ module.exports = class Server {
     this.app = app;
 
     app.use(fromNodeMiddleware(expressSession({
-      secret: crypto.randomBytes(256).toString('hex'),
+      secret: SESSION_SECRET || crypto.randomBytes(256).toString('hex'),
       resave: true,
-      saveUninitialized: true,
+      rolling: true,
+      saveUninitialized: false,
+      cookie: {
+        httpOnly: true,
+        sameSite: 'lax',
+        maxAge: SESSION_COOKIE_MAX_AGE,
+      },
     })));
+
+    // Security headers
+    app.use(fromNodeMiddleware((req, res, next) => {
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('X-Frame-Options', 'DENY');
+      res.setHeader('Referrer-Policy', 'same-origin');
+      res.setHeader('Content-Security-Policy', [
+        "default-src 'self'",
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data: https://gravatar.com",
+        "connect-src 'self' https://wg-easy.github.io",
+        "font-src 'self' data:",
+        "frame-ancestors 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+      ].join('; '));
+      next();
+    }));
+
+    // CSRF protection: reject cross-origin state-changing requests.
+    app.use(fromNodeMiddleware((req, res, next) => {
+      if (!['POST', 'PUT', 'DELETE'].includes(req.method) || !req.url.startsWith('/api/')) {
+        return next();
+      }
+      if (isSameOrigin(req)) {
+        return next();
+      }
+      res.statusCode = 403;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ error: 'Forbidden: cross-origin request' }));
+    }));
 
     const router = createRouter();
     app.use(router);
@@ -106,7 +206,15 @@ module.exports = class Server {
         };
       }))
       .post('/api/session', defineEventHandler(async (event) => {
-        const { password } = await readBody(event);
+        const ip = getClientIp(event.node.req);
+        if (isLoginRateLimited(ip)) {
+          throw createError({
+            status: 429,
+            message: 'Too many attempts, try again later',
+          });
+        }
+
+        const { password } = await readBodyLimited(event);
 
         if (!requiresPassword) {
           // if no password is required, the API should never be called.
@@ -124,15 +232,23 @@ module.exports = class Server {
           });
         }
 
-        event.node.req.session.authenticated = true;
+        // Regenerate the session ID on login to prevent session fixation.
         await new Promise((resolve, reject) => {
-          event.node.req.session.save((err) => {
+          event.node.req.session.regenerate((err) => {
             if (err) {
-              debug(`Session Save Error: ${err.message}`);
-              reject(createError({ status: 500, message: 'Failed to save session' }));
-            } else {
-              resolve();
+              reject(createError({ status: 500, message: 'Failed to regenerate session' }));
+              return;
             }
+
+            event.node.req.session.authenticated = true;
+            event.node.req.session.save((saveErr) => {
+              if (saveErr) {
+                debug(`Session Save Error: ${saveErr.message}`);
+                reject(createError({ status: 500, message: 'Failed to save session' }));
+              } else {
+                resolve();
+              }
+            });
           });
         });
 
@@ -156,6 +272,13 @@ module.exports = class Server {
         debug(`Unauthenticated request to ${req.url} (Session: ${req.session ? req.session.id : 'none'})`);
 
         if (req.url.startsWith('/api/') && req.headers['authorization']) {
+          if (isLoginRateLimited(getClientIp(req))) {
+            res.statusCode = 429;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'Too many attempts, try again later' }));
+            return;
+          }
+
           if (isPasswordValid(req.headers['authorization'])) {
             debug('Authenticated via authorization header');
             return next();
@@ -190,12 +313,18 @@ module.exports = class Server {
       }))
       .get('/api/wireguard/client/:clientId/qrcode.svg', defineEventHandler(async (event) => {
         const clientId = getRouterParam(event, 'clientId');
+        if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+          throw createError({ status: 404 });
+        }
         const svg = await WireGuard.getClientQRCodeSVG({ clientId });
         setHeader(event, 'Content-Type', 'image/svg+xml');
         return svg;
       }))
       .get('/api/wireguard/client/:clientId/configuration', defineEventHandler(async (event) => {
         const clientId = getRouterParam(event, 'clientId');
+        if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+          throw createError({ status: 404 });
+        }
         const client = await WireGuard.getClient({ clientId });
         const config = await WireGuard.getClientConfiguration({ clientId });
         const configName = client.name
@@ -209,16 +338,22 @@ module.exports = class Server {
       }))
       .get('/api/wireguard/client/:clientId/configuration/raw', defineEventHandler(async (event) => {
         const clientId = getRouterParam(event, 'clientId');
+        if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+          throw createError({ status: 404 });
+        }
         const config = await WireGuard.getClientConfiguration({ clientId });
         return send(event, config.trim(), 'text/plain');
       }))
       .post('/api/wireguard/client', defineEventHandler(async (event) => {
-        const { name } = await readBody(event);
+        const { name } = await readBodyLimited(event);
         await WireGuard.createClient({ name });
         return { success: true };
       }))
       .delete('/api/wireguard/client/:clientId', defineEventHandler(async (event) => {
         const clientId = getRouterParam(event, 'clientId');
+        if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+          throw createError({ status: 404 });
+        }
         await WireGuard.deleteClient({ clientId });
         return { success: true };
       }))
@@ -243,7 +378,7 @@ module.exports = class Server {
         if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
           throw createError({ status: 403 });
         }
-        const { name } = await readBody(event);
+        const { name } = await readBodyLimited(event);
         await WireGuard.updateClientName({ clientId, name });
         return { success: true };
       }))
@@ -252,7 +387,7 @@ module.exports = class Server {
         if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
           throw createError({ status: 403 });
         }
-        const { address, addressV6 } = await readBody(event);
+        const { address, addressV6 } = await readBodyLimited(event);
         await WireGuard.updateClientAddress({ clientId, address, addressV6 });
         return { success: true };
       }))
@@ -261,7 +396,7 @@ module.exports = class Server {
         if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
           throw createError({ status: 403 });
         }
-        const { proto, extPort, intPort } = await readBody(event);
+        const { proto, extPort, intPort } = await readBodyLimited(event);
         if (!['tcp', 'udp', 'both'].includes(proto)) {
           throw createError({ status: 400, message: 'proto debe ser tcp, udp o both' });
         }
@@ -296,7 +431,7 @@ module.exports = class Server {
         if (!Number.isInteger(numIndex) || numIndex < 0) {
           throw createError({ status: 400, message: 'Invalid index' });
         }
-        const { proto, extPort, intPort } = await readBody(event);
+        const { proto, extPort, intPort } = await readBodyLimited(event);
         if (!['tcp', 'udp', 'both'].includes(proto)) {
           throw createError({ status: 400, message: 'proto debe ser tcp, udp o both' });
         }
@@ -312,7 +447,7 @@ module.exports = class Server {
         return WireGuard.getServerConfig();
       }))
       .put('/api/wireguard/server-config', defineEventHandler(async (event) => {
-        const body = await readBody(event);
+        const body = await readBodyLimited(event);
         const result = await WireGuard.updateServerConfig(body);
         return result;
       }));
@@ -352,7 +487,7 @@ module.exports = class Server {
         return config;
       }))
       .put('/api/wireguard/restore', defineEventHandler(async (event) => {
-        const { file } = await readBody(event);
+        const { file } = await readBodyLimited(event);
         await WireGuard.restoreConfiguration(file);
         return { success: true };
       }));

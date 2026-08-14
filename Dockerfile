@@ -32,6 +32,7 @@ RUN chmod +x /bin/wgpw
 
 # Install Linux packages
 RUN apk add --no-cache \
+    bash \
     dpkg \
     dumb-init \
     iptables \
