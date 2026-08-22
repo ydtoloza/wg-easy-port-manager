@@ -46,12 +46,15 @@ const LOGIN_MAX_ATTEMPTS = 20; // per IP per window
 const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
 const MAX_BODY_SIZE = 1024 * 1024; // 1 MB
 const MAX_LOGIN_BUCKETS = 10000;
-const MAX_ACTIVE_PASSWORD_CHECKS = 8;
+// Concurrent bcrypt work is capped per client IP so one address cannot hold all
+// slots and lock out every other admin. The total cap only bounds CPU.
+const MAX_ACTIVE_PASSWORD_CHECKS_PER_IP = 8;
+const MAX_ACTIVE_PASSWORD_CHECKS_TOTAL = 64;
 const SESSION_COOKIE_NAME = 'connect.sid';
 
 // In-memory login rate limiter (key: client IP)
 const loginAttempts = new Map();
-let activePasswordChecks = 0;
+let activePasswordChecksTotal = 0;
 
 const getLoginAttempt = (key) => {
   const now = Date.now();
@@ -64,7 +67,6 @@ const getLoginAttempt = (key) => {
 };
 
 const beginPasswordCheck = (key) => {
-  if (activePasswordChecks >= MAX_ACTIVE_PASSWORD_CHECKS) return false;
   let entry = getLoginAttempt(key);
   if (!entry) {
     if (loginAttempts.size >= MAX_LOGIN_BUCKETS) {
@@ -74,13 +76,15 @@ const beginPasswordCheck = (key) => {
     loginAttempts.set(key, entry);
   }
   if (entry.failures + entry.pending >= LOGIN_MAX_ATTEMPTS) return false;
+  if (entry.pending >= MAX_ACTIVE_PASSWORD_CHECKS_PER_IP) return false;
+  if (activePasswordChecksTotal >= MAX_ACTIVE_PASSWORD_CHECKS_TOTAL) return false;
   entry.pending += 1;
-  activePasswordChecks += 1;
+  activePasswordChecksTotal += 1;
   return true;
 };
 
 const completePasswordCheck = (key, valid) => {
-  activePasswordChecks = Math.max(0, activePasswordChecks - 1);
+  activePasswordChecksTotal = Math.max(0, activePasswordChecksTotal - 1);
   const entry = loginAttempts.get(key);
   if (!entry) return;
   entry.pending = Math.max(0, entry.pending - 1);
