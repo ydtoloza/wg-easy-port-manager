@@ -488,7 +488,7 @@ module.exports = class WireGuard {
         const protocols = rule.proto === 'both' ? ['tcp', 'udp'] : [rule.proto];
         for (const protocol of protocols) {
           const key = `${protocol}:${rule.extPort}`;
-          if (forwardedPorts.has(key)) throw new ServerError(`Duplicate forwarded port: ${key}`, 400);
+          if (forwardedPorts.has(key)) throw new ServerError(`Duplicate forwarded port: ${key}`, 409);
           forwardedPorts.add(key);
         }
       }
@@ -979,11 +979,11 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       if (addressV6 && !Util.isValidIPv6(addressV6)) throw new ServerError(`Invalid IPv6 Address: ${addressV6}`, 400);
       if (address && (address === config.server.address
         || Object.values(config.clients).some((candidate) => candidate !== client && candidate.address === address))) {
-        throw new ServerError(`IPv4 address already in use: ${address}`, 400);
+        throw new ServerError(`IPv4 address already in use: ${address}`, 409);
       }
       if (addressV6 && (addressV6 === config.server.addressV6
         || Object.values(config.clients).some((candidate) => candidate !== client && candidate.addressV6 === addressV6))) {
-        throw new ServerError(`IPv6 address already in use: ${addressV6}`, 400);
+        throw new ServerError(`IPv6 address already in use: ${addressV6}`, 409);
       }
       if (addressV6 && config.server.addressV6 && !isSameIPv6Subnet64(config.server.addressV6, addressV6)) {
         throw new ServerError('IPv6 address must be in the server /64', 400);
@@ -1513,28 +1513,28 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     const port = Number(extPort);
     const internalPort = Number(intPort);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new ServerError('Puerto externo inválido (debe ser 1–65535)', 400);
+      throw new ServerError('Invalid external port (must be 1-65535)', 400);
     }
     if (!Number.isInteger(internalPort) || internalPort < 1 || internalPort > 65535) {
-      throw new ServerError('Puerto interno inválido (debe ser 1–65535)', 400);
+      throw new ServerError('Invalid internal port (must be 1-65535)', 400);
     }
 
     // Block unallowed ports
     if (!this.__isPortAllowed(port)) {
-      throw new ServerError(`El puerto ${port} no está permitido por la política o está reservado`, 400);
+      throw new ServerError(`Port ${port} is not allowed by policy or is reserved`, 400);
     }
 
     // Validate extPort not already used by the same peer
     const selfConflict = client.portForwards.some((r) => (r.proto === proto || r.proto === 'both' || proto === 'both')
       && r.extPort === port);
-    if (selfConflict) throw new ServerError(`El puerto ${proto}/${port} ya está configurado en este peer`, 400);
+    if (selfConflict) throw new ServerError(`Port ${proto}/${port} is already configured on this peer`, 409);
 
     // Validate extPort not already used by another peer
     const crossConflict = Object.values(config.clients).some((c) => c.id !== clientId
       && Array.isArray(c.portForwards)
       && c.portForwards.some((r) => (r.proto === proto || r.proto === 'both' || proto === 'both')
         && r.extPort === port));
-    if (crossConflict) throw new ServerError(`El puerto ${proto}/${port} ya está asignado a otro peer`, 400);
+    if (crossConflict) throw new ServerError(`Port ${proto}/${port} is already assigned to another peer`, 409);
 
     await this.__transactionalDnatChange(
       () => {
@@ -1604,22 +1604,22 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     const port = Number(extPort);
     const internalPort = Number(intPort);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new ServerError('Puerto externo inválido (debe ser 1–65535)', 400);
+      throw new ServerError('Invalid external port (must be 1-65535)', 400);
     }
     if (!Number.isInteger(internalPort) || internalPort < 1 || internalPort > 65535) {
-      throw new ServerError('Puerto interno inválido (debe ser 1–65535)', 400);
+      throw new ServerError('Invalid internal port (must be 1-65535)', 400);
     }
 
     // Block unallowed ports
     if (!this.__isPortAllowed(port)) {
-      throw new ServerError(`El puerto ${port} no está permitido por la política o está reservado`, 400);
+      throw new ServerError(`Port ${port} is not allowed by policy or is reserved`, 400);
     }
 
     // Validate extPort not already used by the same peer (excluding the rule being updated)
     const selfConflict = client.portForwards.some((r, i) => i !== idx
       && (r.proto === proto || r.proto === 'both' || proto === 'both')
       && r.extPort === port);
-    if (selfConflict) throw new ServerError(`El puerto ${proto}/${port} ya está configurado en este peer`, 400);
+    if (selfConflict) throw new ServerError(`Port ${proto}/${port} is already configured on this peer`, 409);
 
     // Validate extPort not already used by another peer, ignoring current rule
     const crossConflict = Object.values(config.clients).some((c) => {
@@ -1629,7 +1629,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         return (r.proto === proto || r.proto === 'both' || proto === 'both') && r.extPort === port;
       });
     });
-    if (crossConflict) throw new ServerError(`El puerto ${proto}/${port} ya está asignado a otro peer`, 400);
+    if (crossConflict) throw new ServerError(`Port ${proto}/${port} is already assigned to another peer`, 409);
 
     const oldRule = client.portForwards[idx];
     await this.__transactionalDnatChange(

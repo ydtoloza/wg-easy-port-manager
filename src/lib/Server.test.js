@@ -156,8 +156,10 @@ describe('HTTP server security', () => {
       });
       expect(response.status).toBe(500);
       const body = await response.json();
-      expect(body.data).toEqual({ rollbackFailed: true });
+      expect(body).toEqual({ statusCode: 500, error: 'Internal server error' });
+      expect(body.data).toBeUndefined();
       expect(JSON.stringify(body)).not.toContain('internal rollback details');
+      expect(consoleError).toHaveBeenCalled();
     } finally {
       consoleError.mockRestore();
     }
@@ -191,6 +193,33 @@ describe('HTTP server security', () => {
       await Promise.all(attackers);
       globalThis.__deferPasswordCompares = false;
     }
+  });
+
+  it('exposes validation error messages for sub-500 errors', async () => {
+    const failure = new Error('Invalid client name: X');
+    failure.statusCode = 400;
+    WireGuard.getClients.mockRejectedValueOnce(failure);
+
+    const response = await fetch(`${baseUrl}/api/wireguard/client`, {
+      headers: { Authorization: 'correct-password' },
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ statusCode: 400, error: 'Invalid client name: X' });
+  });
+
+  it('propagates 409 conflict statuses with their message', async () => {
+    const conflict = new Error('Port tcp/8080 is already assigned to another peer');
+    conflict.statusCode = 409;
+    WireGuard.getClients.mockRejectedValueOnce(conflict);
+
+    const response = await fetch(`${baseUrl}/api/wireguard/client`, {
+      headers: { Authorization: 'correct-password' },
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      statusCode: 409,
+      error: 'Port tcp/8080 is already assigned to another peer',
+    });
   });
 
   it('caps concurrent password checks', async () => {

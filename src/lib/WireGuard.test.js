@@ -144,6 +144,14 @@ describe('WireGuard', () => {
       await expect(wg.addPortForward('client1', 'tcp', 22, 3000)).rejects.toThrow(ServerError);
     });
 
+    it('rejects port conflicts as 409 state conflicts', async () => {
+      // client1 already forwards tcp/2000 (see mocked wg0.json above).
+      await expect(wg.addPortForward('client1', 'tcp', 2000, 3000))
+        .rejects.toMatchObject({ statusCode: 409 });
+      await expect(wg.addPortForward('client1', 'both', 2000, 3000))
+        .rejects.toMatchObject({ statusCode: 409 });
+    });
+
     it('validates intPort type and range', async () => {
       await expect(wg.addPortForward('client1', 'tcp', 3000, 80.5)).rejects.toThrow(ServerError);
       await expect(wg.addPortForward('client1', 'tcp', 3000, 70000)).rejects.toThrow(ServerError);
