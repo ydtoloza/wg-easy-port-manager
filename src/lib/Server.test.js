@@ -20,6 +20,11 @@ jest.mock('../config', () => ({
 
 jest.mock('../services/WireGuard', () => ({
   getClients: jest.fn().mockResolvedValue([]),
+  getNetworkPolicyOptions: jest.fn().mockReturnValue({ protocolPresets: [], maxCustomRules: 32 }),
+  updateClientNetworkPolicy: jest.fn().mockResolvedValue({
+    networkPolicy: { blockedProtocols: ['http'], customRules: [], peerAllowlist: [] },
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  }),
 }));
 
 const WireGuard = require('../services/WireGuard');
@@ -68,6 +73,24 @@ describe('HTTP server security', () => {
     });
     expect(clients.status).toBe(200);
     expect(await clients.json()).toEqual([]);
+
+    const options = await fetch(`${baseUrl}/api/wireguard/network-policy-options`, {
+      headers: { Cookie: cookie },
+    });
+    expect(options.status).toBe(200);
+    expect(await options.json()).toEqual({ protocolPresets: [], maxCustomRules: 32 });
+
+    const policy = { blockedProtocols: ['http'], customRules: [], peerAllowlist: [] };
+    const expectedUpdatedAt = '2026-01-01T00:00:00.000Z';
+    const updatePolicy = await fetch(`${baseUrl}/api/wireguard/client/client1/network-policy`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ policy, expectedUpdatedAt }),
+    });
+    expect(updatePolicy.status).toBe(200);
+    expect(WireGuard.updateClientNetworkPolicy).toHaveBeenCalledWith({
+      clientId: 'client1', policy, expectedUpdatedAt,
+    });
 
     const logout = await fetch(`${baseUrl}/api/session`, {
       method: 'DELETE',

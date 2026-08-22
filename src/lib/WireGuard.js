@@ -8,6 +8,13 @@ const QRCode = require('qrcode');
 
 const Util = require('./Util');
 const ServerError = require('./ServerError');
+const {
+  MAX_CUSTOM_RULES,
+  PROTOCOL_PRESETS,
+  PROTOCOL_PRESET_IDS,
+  createDefaultNetworkPolicy,
+  getProtocolPresets,
+} = require('./NetworkPolicy');
 
 const {
   WG_PATH,
@@ -31,6 +38,7 @@ const {
 
 const WIREGUARD_KEY_RE = /^[A-Za-z0-9+/]{43}=$/;
 const CLIENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+const RESERVED_CLIENT_IDS = new Set(['__proto__', 'constructor', 'prototype']);
 const SERVER_SETTING_KEYS = ['host', 'port', 'configPort', 'device', 'defaultDns',
   'defaultAddress', 'defaultAddressV6', 'enableIpv6', 'mtu', 'allowedIps',
   'persistentKeepalive', 'portFwdMin', 'portFwdMax'];
@@ -80,6 +88,7 @@ const DUMMY_CLIENT_PREVIEW = {
     { proto: 'tcp', extPort: 8080, intPort: 80 },
     { proto: 'udp', extPort: 27015, intPort: 27015 },
   ],
+  networkPolicy: createDefaultNetworkPolicy(),
 };
 
 module.exports = class WireGuard {
@@ -332,7 +341,7 @@ module.exports = class WireGuard {
       throw new Error('wg0.json has an invalid structure and was not overwritten.');
     }
 
-    // Ensure all clients have portForwards array
+    // Migrate fields introduced after the initial configuration format.
     for (const [clientId, client] of Object.entries(config.clients)) {
       if (!isPlainObject(client)) throw new Error(`Invalid client entry: ${clientId}`);
       if (client.id === undefined) client.id = clientId;
@@ -340,6 +349,10 @@ module.exports = class WireGuard {
       if (!Array.isArray(client.portForwards)) {
         client.portForwards = [];
       }
+      if (client.networkPolicy === undefined) {
+        client.networkPolicy = createDefaultNetworkPolicy();
+      }
+      client.networkPolicy = this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false });
     }
 
     if (this.__serverSettings.enableIpv6 && !config.server.addressV6) {
@@ -396,11 +409,12 @@ module.exports = class WireGuard {
     const addressesV6 = new Set(config.server.addressV6 ? [config.server.addressV6] : []);
     const publicKeys = new Set([config.server.publicKey]);
     const forwardedPorts = new Set();
+    const networkPolicies = new Map();
     const allowedClientKeys = ['id', 'name', 'address', 'addressV6', 'privateKey', 'publicKey',
-      'preSharedKey', 'createdAt', 'updatedAt', 'enabled', 'portForwards', 'allowedIPs'];
+      'preSharedKey', 'createdAt', 'updatedAt', 'enabled', 'portForwards', 'allowedIPs', 'networkPolicy'];
 
     for (const [clientId, client] of Object.entries(config.clients)) {
-      if (!CLIENT_ID_RE.test(clientId) || !isPlainObject(client)) {
+      if (!CLIENT_ID_RE.test(clientId) || RESERVED_CLIENT_IDS.has(clientId) || !isPlainObject(client)) {
         throw new ServerError(`Invalid client entry: ${clientId}`, 400);
       }
       if (strict) {
@@ -440,6 +454,7 @@ module.exports = class WireGuard {
       if (!Array.isArray(client.portForwards)) {
         throw new ServerError(`Invalid client.portForwards: ${clientId}`, 400);
       }
+      networkPolicies.set(clientId, this.__normalizeNetworkPolicy(client.networkPolicy, { strict }));
 
       for (const rule of client.portForwards) {
         if (!isPlainObject(rule)) throw new ServerError(`Invalid port forward for ${clientId}`, 400);
@@ -461,6 +476,72 @@ module.exports = class WireGuard {
         }
       }
     }
+
+    for (const [clientId, policy] of networkPolicies) {
+      for (const allowedId of policy.peerAllowlist) {
+        if (allowedId === clientId || !Object.hasOwn(config.clients, allowedId)) {
+          throw new ServerError(`Invalid peer allowlist entry for ${clientId}: ${allowedId}`, 400);
+        }
+        if (!networkPolicies.get(allowedId).peerAllowlist.includes(clientId)) {
+          throw new ServerError(`Peer allowlist must be symmetric: ${clientId} and ${allowedId}`, 400);
+        }
+      }
+    }
+  }
+
+  __normalizeNetworkPolicy(policy, { strict = true } = {}) {
+    if (!isPlainObject(policy)) throw new ServerError('Invalid network policy: expected an object', 400);
+    const allowedKeys = ['blockedProtocols', 'customRules', 'peerAllowlist'];
+    if (strict) {
+      const unknown = Object.keys(policy).find((key) => !allowedKeys.includes(key));
+      if (unknown) throw new ServerError(`Invalid network policy field: ${unknown}`, 400);
+      const missing = allowedKeys.find((key) => policy[key] === undefined);
+      if (missing) throw new ServerError(`Missing network policy field: ${missing}`, 400);
+    }
+
+    const blockedProtocols = policy.blockedProtocols ?? [];
+    const customRules = policy.customRules ?? [];
+    const peerAllowlist = policy.peerAllowlist ?? [];
+    if (!Array.isArray(blockedProtocols)
+      || blockedProtocols.some((id) => typeof id !== 'string' || !PROTOCOL_PRESET_IDS.has(id))
+      || new Set(blockedProtocols).size !== blockedProtocols.length) {
+      throw new ServerError('Invalid blocked protocol selection', 400);
+    }
+    if (!Array.isArray(peerAllowlist)
+      || peerAllowlist.some((id) => typeof id !== 'string' || !CLIENT_ID_RE.test(id))
+      || new Set(peerAllowlist).size !== peerAllowlist.length) {
+      throw new ServerError('Invalid peer allowlist', 400);
+    }
+    if (!Array.isArray(customRules) || customRules.length > MAX_CUSTOM_RULES) {
+      throw new ServerError(`A maximum of ${MAX_CUSTOM_RULES} custom rules is allowed`, 400);
+    }
+
+    const normalizedRules = customRules.map((rule) => {
+      if (!isPlainObject(rule)) throw new ServerError('Invalid custom network rule', 400);
+      if (strict) {
+        const unknown = Object.keys(rule).find((key) => !['proto', 'startPort', 'endPort', 'label'].includes(key));
+        if (unknown) throw new ServerError(`Invalid custom network rule field: ${unknown}`, 400);
+      }
+      const label = rule.label ?? '';
+      if (!['tcp', 'udp'].includes(rule.proto)
+        || !Number.isInteger(rule.startPort) || !Number.isInteger(rule.endPort)
+        || rule.startPort < 1 || rule.endPort > 65535 || rule.startPort > rule.endPort
+        || typeof label !== 'string' || label.length > 64 || /[\r\n]/.test(label)) {
+        throw new ServerError('Invalid custom network rule', 400);
+      }
+      return {
+        proto: rule.proto,
+        startPort: rule.startPort,
+        endPort: rule.endPort,
+        label,
+      };
+    });
+
+    return {
+      blockedProtocols: [...blockedProtocols],
+      customRules: normalizedRules,
+      peerAllowlist: [...peerAllowlist],
+    };
   }
 
   async getConfig() {
@@ -479,11 +560,10 @@ module.exports = class WireGuard {
       // Down reads the currently active wg0.conf. Replace it only afterwards.
       await this.__bringWireGuardDown();
       await this.__saveConfig(config);
-      await this.__bringWireGuardUp();
-
-      await this.__syncConfig();
       await this.__ensureNftablesSetup();
-      await this.__applyAllDnatRules();
+      await this.__applyAllNetworkRules();
+      await this.__bringWireGuardUp();
+      await this.__syncConfig();
       if (this.__settingsRecoveryPending) await this.__completeSettingsTransaction();
 
       debug('WireGuard initialization completed.');
@@ -625,6 +705,7 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
       allowedIPs: client.allowedIPs || [`${client.address}/32`, (this.__serverSettings.enableIpv6 && client.addressV6 ? `${client.addressV6}/128` : null)].filter(Boolean),
       addressV6: client.addressV6,
       portForwards: Array.isArray(client.portForwards) ? client.portForwards : [],
+      networkPolicy: this.__normalizeNetworkPolicy(client.networkPolicy),
       downloadableConfig: 'privateKey' in client,
       persistentKeepalive: null,
       latestHandshakeAt: null,
@@ -667,15 +748,15 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
   }
 
   async getClient({ clientId }) {
-    if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+    if (RESERVED_CLIENT_IDS.has(clientId)) {
       throw new ServerError(`Client Not Found: ${clientId}`, 404);
     }
 
     const config = await this.getConfig();
-    const client = config.clients[clientId];
-    if (!client) {
+    if (!Object.hasOwn(config.clients, clientId)) {
       throw new ServerError(`Client Not Found: ${clientId}`, 404);
     }
+    const client = config.clients[clientId];
 
     return client;
   }
@@ -746,15 +827,16 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         updatedAt: new Date(),
         enabled: true,
         portForwards: [],
+        networkPolicy: createDefaultNetworkPolicy(),
       };
-      await this.__transactionalConfigChange(
+      await this.__transactionalDnatChange(
         () => {
           config.clients[id] = client;
         },
         () => {
           delete config.clients[id];
         },
-        { context: 'create-client' },
+        'create-client',
       );
       return client;
     });
@@ -763,19 +845,35 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   async deleteClient({ clientId }) {
     return this.__withMutation(async () => {
       const config = await this.getConfig();
-      if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+      if (RESERVED_CLIENT_IDS.has(clientId)) {
         throw new ServerError(`Client Not Found: ${clientId}`, 404);
       }
-      if (config.clients[clientId]) {
+      if (Object.hasOwn(config.clients, clientId)) {
         const removedClient = config.clients[clientId];
+        const previousPolicies = Object.fromEntries(Object.entries(config.clients).map(([id, client]) => [id, {
+          networkPolicy: this.__normalizeNetworkPolicy(client.networkPolicy),
+          updatedAt: client.updatedAt,
+        }]));
         await this.__transactionalDnatChange(
           () => {
             delete config.clients[clientId];
+            for (const client of Object.values(config.clients)) {
+              if (client.networkPolicy.peerAllowlist.includes(clientId)) {
+                client.networkPolicy.peerAllowlist = client.networkPolicy.peerAllowlist
+                  .filter((allowedId) => allowedId !== clientId);
+                client.updatedAt = new Date();
+              }
+            }
           },
           () => {
             config.clients[clientId] = removedClient;
+            for (const [id, snapshot] of Object.entries(previousPolicies)) {
+              config.clients[id].networkPolicy = snapshot.networkPolicy;
+              config.clients[id].updatedAt = snapshot.updatedAt;
+            }
           },
           'delete-client',
+          { reloadWireGuard: true },
         );
       }
     });
@@ -809,6 +907,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
           Object.assign(client, previous);
         },
         'disable-client',
+        { reloadWireGuard: true },
       );
     });
   }
@@ -869,7 +968,82 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
           Object.assign(client, previous);
         },
         'update-client-address',
+        { reloadWireGuard: true },
       );
+    });
+  }
+
+  getNetworkPolicyOptions() {
+    return {
+      protocolPresets: getProtocolPresets(),
+      maxCustomRules: MAX_CUSTOM_RULES,
+    };
+  }
+
+  async updateClientNetworkPolicy({ clientId, policy, expectedUpdatedAt }) {
+    if (process.platform !== 'linux') {
+      DUMMY_CLIENT_PREVIEW.networkPolicy = this.__normalizeNetworkPolicy(policy);
+      DUMMY_CLIENT_PREVIEW.updatedAt = new Date();
+      return {
+        networkPolicy: DUMMY_CLIENT_PREVIEW.networkPolicy,
+        updatedAt: DUMMY_CLIENT_PREVIEW.updatedAt,
+      };
+    }
+
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      const client = await this.getClient({ clientId });
+      if (expectedUpdatedAt !== undefined) {
+        const expectedTime = Date.parse(expectedUpdatedAt);
+        if (Number.isNaN(expectedTime)) throw new ServerError('Invalid policy version', 400);
+        if (new Date(client.updatedAt).getTime() !== expectedTime) {
+          throw new ServerError('The client changed since this policy was opened', 409);
+        }
+      }
+      const nextPolicy = this.__normalizeNetworkPolicy(policy);
+      if (nextPolicy.peerAllowlist.includes(clientId)) {
+        throw new ServerError('A client cannot allow itself', 400);
+      }
+      for (const allowedId of nextPolicy.peerAllowlist) {
+        if (!Object.hasOwn(config.clients, allowedId)) {
+          throw new ServerError(`Client Not Found: ${allowedId}`, 404);
+        }
+      }
+
+      const previous = Object.fromEntries(Object.entries(config.clients).map(([id, candidate]) => [id, {
+        networkPolicy: this.__normalizeNetworkPolicy(candidate.networkPolicy),
+        updatedAt: candidate.updatedAt,
+      }]));
+      const allowedIds = new Set(nextPolicy.peerAllowlist);
+      await this.__transactionalDnatChange(
+        () => {
+          const updatedAt = new Date();
+          client.networkPolicy = nextPolicy;
+          client.updatedAt = updatedAt;
+          for (const [id, candidate] of Object.entries(config.clients)) {
+            if (id === clientId) continue;
+            const reverse = new Set(candidate.networkPolicy.peerAllowlist);
+            const previouslyAllowed = reverse.has(clientId);
+            if (allowedIds.has(id)) reverse.add(clientId);
+            else reverse.delete(clientId);
+            if (previouslyAllowed !== reverse.has(clientId)) {
+              candidate.networkPolicy.peerAllowlist = [...reverse];
+              candidate.updatedAt = updatedAt;
+            }
+          }
+        },
+        () => {
+          for (const [id, snapshot] of Object.entries(previous)) {
+            config.clients[id].networkPolicy = snapshot.networkPolicy;
+            config.clients[id].updatedAt = snapshot.updatedAt;
+          }
+        },
+        'update-client-network-policy',
+      );
+      return {
+        networkPolicy: this.__normalizeNetworkPolicy(client.networkPolicy),
+        updatedAt: client.updatedAt,
+      };
     });
   }
 
@@ -889,6 +1063,13 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       } catch {
         throw new ServerError('Invalid backup: not valid JSON', 400);
       }
+      if (isPlainObject(restored) && isPlainObject(restored.clients)) {
+        for (const client of Object.values(restored.clients)) {
+          if (isPlainObject(client) && client.networkPolicy === undefined) {
+            client.networkPolicy = createDefaultNetworkPolicy();
+          }
+        }
+      }
       this.__validateConfig(restored, { strict: true });
 
       const oldConfig = this.__config;
@@ -900,6 +1081,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
           this.__config = oldConfig;
         },
         'restore',
+        { reloadWireGuard: true },
       );
       debug('Configuration restore process completed.');
     });
@@ -908,14 +1090,35 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   async __transactionalConfigChange(mutate, rollback, {
     applyDnat = false,
     context = 'config-change',
+    reloadWireGuard = false,
   } = {}) {
     await mutate();
+    let interfaceDown = false;
     try {
-      if (applyDnat) await this.__applyAllDnatRules();
-      await this.saveConfig();
+      if (reloadWireGuard) {
+        await this.__bringWireGuardDown();
+        interfaceDown = true;
+        if (applyDnat) await this.__applyAllDnatRules();
+        await this.__saveConfig(this.__config);
+        await this.__bringWireGuardUp();
+        interfaceDown = false;
+      } else {
+        if (applyDnat) await this.__applyAllDnatRules();
+        await this.saveConfig();
+      }
     } catch (err) {
       await rollback();
       const rollbackErrors = [];
+      if (reloadWireGuard) {
+        interfaceDown = false;
+        await this.__bringWireGuardDown().then(() => {
+          interfaceDown = true;
+        }).catch((downErr) => {
+          const msg = `WireGuard shutdown rollback failed in ${context}: ${downErr.message}`;
+          debug(msg);
+          rollbackErrors.push(msg);
+        });
+      }
       if (applyDnat) {
         await this.__applyAllDnatRules().catch((rollbackErr) => {
           const msg = `Host rollback failed in ${context}: ${rollbackErr.message}`;
@@ -928,19 +1131,31 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         debug(msg);
         rollbackErrors.push(msg);
       });
-      await this.__syncConfig().catch((syncErr) => {
-        const msg = `WG sync rollback failed in ${context}: ${syncErr.message}`;
-        debug(msg);
-        rollbackErrors.push(msg);
-      });
+      if (reloadWireGuard && interfaceDown) {
+        await this.__bringWireGuardUp().catch((upErr) => {
+          const msg = `WireGuard startup rollback failed in ${context}: ${upErr.message}`;
+          debug(msg);
+          rollbackErrors.push(msg);
+        });
+      } else {
+        await this.__syncConfig().catch((syncErr) => {
+          const msg = `WG sync rollback failed in ${context}: ${syncErr.message}`;
+          debug(msg);
+          rollbackErrors.push(msg);
+        });
+      }
       err.rollbackErrors = rollbackErrors;
       if (rollbackErrors.length) err.data = { rollbackFailed: true };
       throw err;
     }
   }
 
-  async __transactionalDnatChange(mutate, rollback, context = 'dnat-change') {
-    return this.__transactionalConfigChange(mutate, rollback, { applyDnat: true, context });
+  async __transactionalDnatChange(mutate, rollback, context = 'dnat-change', options = {}) {
+    return this.__transactionalConfigChange(mutate, rollback, {
+      applyDnat: true,
+      context,
+      ...options,
+    });
   }
 
   async backupConfiguration() {
@@ -954,9 +1169,10 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   // Shutdown wireguard
   async Shutdown() {
     await this.__bringWireGuardDown();
-    // Eliminar las tablas de DNAT para no dejar reglas huérfanas en el host
+    // Remove owned tables so no host rules survive the service.
     await Util.exec('nft delete table ip wgeasy_dnat').catch(() => {});
     await Util.exec('nft delete table ip6 wgeasy_dnat').catch(() => {});
+    await Util.exec('nft delete table inet wgeasy_filter').catch(() => {});
   }
 
   // ── Server Settings (Global IP Config) ──────────────────────────
@@ -1008,9 +1224,9 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         );
         await this.__bringWireGuardDown();
         await this.__saveConfig(config);
-        await this.__bringWireGuardUp();
         await this.__ensureNftablesSetup();
         await this.__applyAllDnatRules();
+        await this.__bringWireGuardUp();
         await this.__completeSettingsTransaction();
       } catch (err) {
         const rollbackErrors = [];
@@ -1022,14 +1238,14 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         await this.__saveConfig(previousConfig).catch((rollbackErr) => {
           rollbackErrors.push(`Settings config rollback failed: ${rollbackErr.message}`);
         });
-        await this.__bringWireGuardUp().catch((rollbackErr) => {
-          rollbackErrors.push(`WireGuard settings rollback failed: ${rollbackErr.message}`);
-        });
         await this.__ensureNftablesSetup()
           .then(() => this.__applyAllDnatRules())
           .catch((rollbackErr) => {
             rollbackErrors.push(`DNAT settings rollback failed: ${rollbackErr.message}`);
           });
+        await this.__bringWireGuardUp().catch((rollbackErr) => {
+          rollbackErrors.push(`WireGuard settings rollback failed: ${rollbackErr.message}`);
+        });
         await this.__completeSettingsTransaction().catch((rollbackErr) => {
           rollbackErrors.push(`Settings journal rollback failed: ${rollbackErr.message}`);
         });
@@ -1082,6 +1298,18 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         `nft add chain ${family} wgeasy_dnat prerouting '{ type nat hook prerouting priority dstnat; policy accept; }'`,
       );
     }
+    await ensure(
+      'nft list table inet wgeasy_filter',
+      'nft add table inet wgeasy_filter',
+    );
+    await ensure(
+      'nft list chain inet wgeasy_filter input',
+      "nft add chain inet wgeasy_filter input '{ type filter hook input priority filter; policy accept; }'",
+    );
+    await ensure(
+      'nft list chain inet wgeasy_filter forward',
+      "nft add chain inet wgeasy_filter forward '{ type filter hook forward priority filter; policy accept; }'",
+    );
     debug('nftables tables and chains ensured.');
   }
 
@@ -1094,17 +1322,43 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     await Util.exec('nft delete table ip6 wgeasy_dnat');
   }
 
-  async __applyAllDnatRules() {
+  async __applyAllNetworkRules() {
     const config = await this.getConfig();
     this.__validateConfig(config);
     if (!this.__serverSettings.enableIpv6) await this.__removeIpv6DnatTable();
     await this.__ensureNftablesSetup();
     const commands = [
-      'flush chain ip wgeasy_dnat prerouting',
+      'delete table ip wgeasy_dnat',
+      'add table ip wgeasy_dnat',
+      'add chain ip wgeasy_dnat prerouting { type nat hook prerouting priority dstnat; policy accept; }',
     ];
-    if (this.__serverSettings.enableIpv6) commands.push('flush chain ip6 wgeasy_dnat prerouting');
+    if (this.__serverSettings.enableIpv6) {
+      commands.push(
+        'delete table ip6 wgeasy_dnat',
+        'add table ip6 wgeasy_dnat',
+        'add chain ip6 wgeasy_dnat prerouting { type nat hook prerouting priority dstnat; policy accept; }',
+      );
+    }
+    commands.push(
+      'delete table inet wgeasy_filter',
+      'add table inet wgeasy_filter',
+      'add chain inet wgeasy_filter input { type filter hook input priority filter; policy accept; }',
+      'add chain inet wgeasy_filter forward { type filter hook forward priority filter; policy accept; }',
+      'add set inet wgeasy_filter peer_ipv4 { type ipv4_addr; }',
+    );
+    const clients = Object.values(config.clients);
+    if (clients.length) {
+      commands.push(`add element inet wgeasy_filter peer_ipv4 { ${clients.map((client) => client.address).join(', ')} }`);
+    }
+    if (this.__serverSettings.enableIpv6) {
+      commands.push('add set inet wgeasy_filter peer_ipv6 { type ipv6_addr; }');
+      const ipv6Addresses = clients.map((client) => client.addressV6).filter(Boolean);
+      if (ipv6Addresses.length) {
+        commands.push(`add element inet wgeasy_filter peer_ipv6 { ${ipv6Addresses.join(', ')} }`);
+      }
+    }
 
-    for (const client of Object.values(config.clients)) {
+    for (const client of clients) {
       if (!client.enabled || !client.portForwards || !client.portForwards.length) continue;
 
       const peerIP = client.address;
@@ -1121,15 +1375,55 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       }
     }
 
+    const addBlockedRule = (client, family, address, rule) => {
+      const destinationPort = rule.startPort === rule.endPort
+        ? rule.startPort
+        : `${rule.startPort}-${rule.endPort}`;
+      commands.push(`add rule inet wgeasy_filter input iifname "wg0" ${family} saddr ${address} ${rule.proto} dport ${destinationPort} drop`);
+      commands.push(`add rule inet wgeasy_filter forward iifname "wg0" ${family} saddr ${address} ${rule.proto} dport ${destinationPort} drop`);
+    };
+    const enabledClients = clients.filter((client) => client.enabled);
+    for (const client of enabledClients) {
+      const policy = this.__normalizeNetworkPolicy(client.networkPolicy);
+      const presetRules = PROTOCOL_PRESETS
+        .filter((preset) => policy.blockedProtocols.includes(preset.id))
+        .flatMap((preset) => preset.rules);
+      for (const rule of [...presetRules, ...policy.customRules]) {
+        addBlockedRule(client, 'ip', client.address, rule);
+        if (this.__serverSettings.enableIpv6 && client.addressV6) {
+          addBlockedRule(client, 'ip6', client.addressV6, rule);
+        }
+      }
+    }
+
+    for (const client of enabledClients) {
+      for (const allowedId of client.networkPolicy.peerAllowlist) {
+        const peer = config.clients[allowedId];
+        if (!peer.enabled) continue;
+        commands.push(`add rule inet wgeasy_filter forward iifname "wg0" oifname "wg0" ip saddr ${client.address} ip daddr ${peer.address} accept`);
+        if (this.__serverSettings.enableIpv6 && client.addressV6 && peer.addressV6) {
+          commands.push(`add rule inet wgeasy_filter forward iifname "wg0" oifname "wg0" ip6 saddr ${client.addressV6} ip6 daddr ${peer.addressV6} accept`);
+        }
+      }
+      commands.push(`add rule inet wgeasy_filter forward iifname "wg0" oifname "wg0" ip saddr ${client.address} ip daddr @peer_ipv4 drop`);
+      if (this.__serverSettings.enableIpv6 && client.addressV6) {
+        commands.push(`add rule inet wgeasy_filter forward iifname "wg0" oifname "wg0" ip6 saddr ${client.addressV6} ip6 daddr @peer_ipv6 drop`);
+      }
+    }
+
     try {
       await Util.execFile('nft', ['-f', '-'], {
         input: `${commands.join('\n')}\n`,
         log: 'nft -f -',
       });
     } catch (err) {
-      throw new ServerError(`Failed to apply DNAT rules atomically: ${err.message}`, 500);
+      throw new ServerError(`Failed to apply network rules atomically: ${err.message}`, 500);
     }
-    debug('All DNAT rules applied atomically (IPv4 + IPv6).');
+    debug('All DNAT and client policy rules applied atomically.');
+  }
+
+  async __applyAllDnatRules() {
+    return this.__applyAllNetworkRules();
   }
 
   async addPortForward(clientId, proto, extPort, intPort) {

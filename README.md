@@ -30,6 +30,7 @@ Este fork mantiene la simplicidad de la interfaz original de WireGuard e introdu
 *   **Soporte Completo IPv6 (Dual-Stack)**: Conectividad nativa IPv6. El servidor asigna automáticamente direcciones IPv6 a nuevos clientes y migra de forma transparente los clientes existentes.
 *   **Soporte para Protocolo "Ambos" (TCP + UDP)**: Capacidad de abrir puertos tanto en TCP como en UDP con una sola regla, ideal para juegos y servicios complejos.
 *   **Integración Automatizada con `nftables`**: El backend provisiona, sincroniza y limpia automáticamente las reglas DNAT de `nftables` para IPv4 e IPv6 basándose en la configuración de la interfaz.
+*   **Políticas de Red por Cliente**: Aislamiento IPv4/IPv6 por defecto, excepciones simétricas entre peers y bloqueo saliente mediante presets de protocolos o rangos TCP/UDP personalizados.
 *   **Validación en Tiempo Real**: La interfaz te avisa instantáneamente si intentas usar un puerto que ya está ocupado o reservado.
 *   **Estabilidad Mejorada**: Se corrigieron condiciones de carrera (race conditions) durante la inicialización de WireGuard, asegurando un arranque mucho más estable.
 *   **Gestión de Sesiones Robusta**: Se resolvieron problemas de bloqueos silenciosos durante el inicio de sesión y caídas de tokens de autenticación en entornos con proxy inverso o alta latencia.
@@ -98,6 +99,7 @@ This fork maintains the simplicity of the original WireGuard UI while injecting 
 *   **Full IPv6 Support (Dual-Stack)**: Native IPv6 connectivity. The server automatically assigns IPv6 addresses to new peers and transparently migrates existing ones.
 *   **"Both" Protocol Support (TCP + UDP)**: Ability to open both TCP and UDP ports with a single rule, perfect for games and complex services.
 *   **Automated `nftables` Integration**: The backend automatically provisions, syncs, and flushes `nftables` DNAT rules for both IPv4 and IPv6 based on the UI configuration.
+*   **Per-Client Network Policies**: Default IPv4/IPv6 peer isolation, symmetric peer exceptions, and outbound blocking through protocol presets or custom TCP/UDP ranges.
 *   **Real-Time Validation**: The UI instantly warns you if you try to use a port that is already occupied or reserved.
 *   **Enhanced Stability**: Fixed underlying race conditions during WireGuard initialization, ensuring a smoother startup sequence.
 *   **Robust Session Management**: Resolved silent hanging issues during login and authentication token drops in reverse-proxy or high-latency environments.

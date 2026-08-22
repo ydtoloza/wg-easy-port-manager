@@ -80,6 +80,13 @@ new Vue({
     editingPfIndex: null,
     editingPfRule: {},
     expandedPfClients: {},
+    networkPolicyDialog: null,
+    networkPolicyOptions: null,
+    networkPolicySaving: false,
+    networkPolicyError: null,
+    newNetworkPolicyRule: {
+      proto: 'tcp', label: '', startPort: null, endPort: null,
+    },
 
     // Toast notifications
     toasts: [],
@@ -99,6 +106,7 @@ new Vue({
     prefersDarkScheme: window.matchMedia('(prefers-color-scheme: dark)'),
     pollTimer: null,
     polling: false,
+    refreshGeneration: 0,
 
     chartOptions: {
       chart: {
@@ -229,7 +237,9 @@ new Vue({
     } = {}) {
       if (!this.authenticated) return;
 
+      const generation = ++this.refreshGeneration;
       const clients = await this.api.getClients();
+      if (generation !== this.refreshGeneration) return;
       this.clients = clients.map((client) => {
         if (!this.clientsPersist[client.id]) {
           this.clientsPersist[client.id] = {};
@@ -358,6 +368,96 @@ new Vue({
       this.api.updateClientAddress({ clientId: client.id, address, addressV6 })
         .catch((err) => this.notify(err.message || err.toString()))
         .finally(() => this.refresh().catch(console.error));
+    },
+    async openNetworkPolicy(client) {
+      this.networkPolicyError = null;
+      try {
+        if (!this.networkPolicyOptions) {
+          this.networkPolicyOptions = await this.api.getNetworkPolicyOptions();
+        }
+        const policy = client.networkPolicy || {
+          blockedProtocols: [], customRules: [], peerAllowlist: [],
+        };
+        this.networkPolicyDialog = {
+          clientId: client.id,
+          clientName: client.name,
+          expectedUpdatedAt: client.updatedAt.toISOString(),
+          blockedProtocols: [...policy.blockedProtocols],
+          customRules: policy.customRules.map((rule) => ({ ...rule })),
+          peerAllowlist: [...policy.peerAllowlist],
+        };
+        this.newNetworkPolicyRule = {
+          proto: 'tcp', label: '', startPort: null, endPort: null,
+        };
+      } catch (err) {
+        this.notify(err.message || err.toString());
+      }
+    },
+    closeNetworkPolicy() {
+      if (this.networkPolicySaving) return;
+      this.networkPolicyDialog = null;
+      this.networkPolicyError = null;
+    },
+    formatPolicyRule(rule) {
+      const ports = rule.startPort === rule.endPort
+        ? rule.startPort
+        : `${rule.startPort}-${rule.endPort}`;
+      return `${rule.proto.toUpperCase()} ${ports}`;
+    },
+    addNetworkPolicyRule() {
+      if (!this.networkPolicyDialog || !this.networkPolicyOptions) return;
+      const startPort = Number(this.newNetworkPolicyRule.startPort);
+      const endPort = this.newNetworkPolicyRule.endPort !== null && this.newNetworkPolicyRule.endPort !== ''
+        ? Number(this.newNetworkPolicyRule.endPort)
+        : startPort;
+      if (!Number.isInteger(startPort) || !Number.isInteger(endPort)
+        || startPort < 1 || endPort > 65535 || startPort > endPort) {
+        this.networkPolicyError = this.$t('networkPolicy.invalidPortRange');
+        return;
+      }
+      if (this.networkPolicyDialog.customRules.length >= this.networkPolicyOptions.maxCustomRules) {
+        this.networkPolicyError = this.$t('networkPolicy.ruleLimit', {
+          count: this.networkPolicyOptions.maxCustomRules,
+        });
+        return;
+      }
+      this.networkPolicyDialog.customRules.push({
+        proto: this.newNetworkPolicyRule.proto,
+        label: this.newNetworkPolicyRule.label.trim(),
+        startPort,
+        endPort,
+      });
+      this.newNetworkPolicyRule = {
+        proto: 'tcp', label: '', startPort: null, endPort: null,
+      };
+      this.networkPolicyError = null;
+    },
+    removeNetworkPolicyRule(index) {
+      this.networkPolicyDialog.customRules.splice(index, 1);
+    },
+    async saveNetworkPolicy() {
+      if (!this.networkPolicyDialog || this.networkPolicySaving) return;
+      this.networkPolicySaving = true;
+      this.networkPolicyError = null;
+      try {
+        const policy = {
+          blockedProtocols: [...this.networkPolicyDialog.blockedProtocols],
+          customRules: this.networkPolicyDialog.customRules.map((rule) => ({ ...rule })),
+          peerAllowlist: [...this.networkPolicyDialog.peerAllowlist],
+        };
+        await this.api.updateClientNetworkPolicy({
+          clientId: this.networkPolicyDialog.clientId,
+          policy,
+          expectedUpdatedAt: this.networkPolicyDialog.expectedUpdatedAt,
+        });
+        this.networkPolicyDialog = null;
+        this.notify(this.$t('networkPolicy.saved'), 'success');
+        this.refresh().catch((err) => this.notify(err.message || err.toString()));
+      } catch (err) {
+        this.networkPolicyError = err.message || err.toString();
+      } finally {
+        this.networkPolicySaving = false;
+      }
     },
     restoreConfig(e) {
       e.preventDefault();
@@ -635,6 +735,10 @@ new Vue({
     this.prefersDarkScheme.removeListener(this.handlePrefersChange);
   },
   computed: {
+    availablePolicyPeers() {
+      if (!this.networkPolicyDialog || !this.clients) return [];
+      return this.clients.filter((client) => client.id !== this.networkPolicyDialog.clientId);
+    },
     chartTypeConfig() {
       return UI_CHART_TYPES[this.uiChartType] || UI_CHART_TYPES[0];
     },

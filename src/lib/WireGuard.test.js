@@ -12,6 +12,7 @@ const KEYS = {
   clientPrivate: Buffer.alloc(32, 3).toString('base64'),
   clientPublic: Buffer.alloc(32, 4).toString('base64'),
   preShared: Buffer.alloc(32, 5).toString('base64'),
+  client2Public: Buffer.alloc(32, 6).toString('base64'),
 };
 const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
 
@@ -154,7 +155,7 @@ describe('WireGuard', () => {
       await wg.addPortForward('client1', 'tcp', 3000, 3000).catch((err) => {
         caught = err;
       });
-      expect(caught.message).toMatch(/Failed to apply DNAT rules atomically: nft failed/);
+      expect(caught.message).toMatch(/Failed to apply network rules atomically: nft failed/);
       expect(caught.rollbackErrors).toEqual([
         expect.stringContaining('Host rollback failed'),
       ]);
@@ -164,7 +165,7 @@ describe('WireGuard', () => {
       expect(config.clients.client1.portForwards.length).toBe(1);
 
       expect(Util.execFile).toHaveBeenCalledWith('nft', ['-f', '-'], expect.objectContaining({
-        input: expect.stringContaining('flush chain ip wgeasy_dnat prerouting'),
+        input: expect.stringContaining('delete table ip wgeasy_dnat'),
       }));
 
       // ensure we saved back
@@ -196,6 +197,10 @@ describe('WireGuard', () => {
       await wg.disableClient({ clientId: 'client1' });
       const disabledRuleset = Util.execFile.mock.calls.findLast((call) => call[0] === 'nft')[2].input;
       expect(disabledRuleset).not.toContain('dport 2000');
+      const downCall = Util.exec.mock.calls.findIndex((call) => call[0] === 'wg-quick down wg0');
+      const upCall = Util.exec.mock.calls.findIndex((call) => call[0] === 'wg-quick up wg0');
+      expect(Util.exec.mock.invocationCallOrder[downCall]).toBeLessThan(Util.execFile.mock.invocationCallOrder[0]);
+      expect(Util.execFile.mock.invocationCallOrder[0]).toBeLessThan(Util.exec.mock.invocationCallOrder[upCall]);
 
       await wg.enableClient({ clientId: 'client1' });
       const enabledRuleset = Util.execFile.mock.calls.findLast((call) => call[0] === 'nft')[2].input;
@@ -227,8 +232,113 @@ describe('WireGuard', () => {
     it('takes the active interface down before replacing wg0.conf', async () => {
       await wg.init();
       const downCall = Util.exec.mock.calls.findIndex((call) => call[0] === 'wg-quick down wg0');
+      const upCall = Util.exec.mock.calls.findIndex((call) => call[0] === 'wg-quick up wg0');
       expect(downCall).toBeGreaterThanOrEqual(0);
       expect(Util.exec.mock.invocationCallOrder[downCall]).toBeLessThan(fs.open.mock.invocationCallOrder[0]);
+      expect(Util.execFile.mock.invocationCallOrder[0]).toBeLessThan(Util.exec.mock.invocationCallOrder[upCall]);
+    });
+  });
+
+  describe('client network policies', () => {
+    const addSecondClient = async () => {
+      const config = await wg.getConfig();
+      config.clients.client2 = {
+        id: 'client2',
+        name: 'client2',
+        address: '10.8.0.3',
+        addressV6: 'fd42:42:42::3',
+        publicKey: KEYS.client2Public,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        enabled: true,
+        portForwards: [],
+        networkPolicy: { blockedProtocols: [], customRules: [], peerAllowlist: [] },
+      };
+      return config;
+    };
+
+    it('migrates clients to isolated policies by default', async () => {
+      const config = await wg.getConfig();
+      expect(config.clients.client1.networkPolicy).toEqual({
+        blockedProtocols: [],
+        customRules: [],
+        peerAllowlist: [],
+      });
+
+      await wg.__applyAllNetworkRules();
+      const ruleset = Util.execFile.mock.calls.findLast((call) => call[0] === 'nft')[2].input;
+      expect(ruleset).toContain('add element inet wgeasy_filter peer_ipv4 { 10.8.0.2 }');
+      expect(ruleset).toContain('ip saddr 10.8.0.2 ip daddr @peer_ipv4 drop');
+      expect(ruleset).toContain('ip6 saddr fd42:42:42::2 ip6 daddr @peer_ipv6 drop');
+    });
+
+    it('blocks presets and custom ranges while allowing selected peers symmetrically', async () => {
+      const config = await addSecondClient();
+      await wg.updateClientNetworkPolicy({
+        clientId: 'client1',
+        policy: {
+          blockedProtocols: ['https', 'ssh-sftp'],
+          customRules: [{
+            proto: 'udp', startPort: 5000, endPort: 5010, label: 'Media',
+          }],
+          peerAllowlist: ['client2'],
+        },
+      });
+
+      expect(config.clients.client2.networkPolicy.peerAllowlist).toEqual(['client1']);
+      const ruleset = Util.execFile.mock.calls.findLast((call) => call[0] === 'nft')[2].input;
+      expect(ruleset).toContain('ip saddr 10.8.0.2 tcp dport 443 drop');
+      expect(ruleset).toContain('ip6 saddr fd42:42:42::2 udp dport 443 drop');
+      expect(ruleset).toContain('ip saddr 10.8.0.2 tcp dport 22 drop');
+      expect(ruleset).toContain('ip saddr 10.8.0.2 udp dport 5000-5010 drop');
+      expect(ruleset).toContain('ip saddr 10.8.0.2 ip daddr 10.8.0.3 accept');
+      expect(ruleset).toContain('ip saddr 10.8.0.3 ip daddr 10.8.0.2 accept');
+    });
+
+    it('rejects unknown presets, invalid ranges and missing peers', async () => {
+      const base = { blockedProtocols: [], customRules: [], peerAllowlist: [] };
+      await expect(wg.updateClientNetworkPolicy({
+        clientId: 'client1',
+        policy: { ...base, blockedProtocols: ['not-a-protocol'] },
+      })).rejects.toThrow(/Invalid blocked protocol/);
+      await expect(wg.updateClientNetworkPolicy({
+        clientId: 'client1',
+        policy: {
+          ...base,
+          customRules: [{
+            proto: 'tcp', startPort: 200, endPort: 100, label: '',
+          }],
+        },
+      })).rejects.toThrow(/Invalid custom network rule/);
+      await expect(wg.updateClientNetworkPolicy({
+        clientId: 'client1',
+        policy: { ...base, peerAllowlist: ['missing'] },
+      })).rejects.toThrow(/Client Not Found/);
+    });
+
+    it('rolls policies back when nftables rejects an update', async () => {
+      const config = await addSecondClient();
+      Util.execFile.mockRejectedValue(new Error('nft policy failed'));
+
+      await expect(wg.updateClientNetworkPolicy({
+        clientId: 'client1',
+        policy: { blockedProtocols: ['http'], customRules: [], peerAllowlist: ['client2'] },
+      })).rejects.toThrow(/Failed to apply network rules atomically/);
+      expect(config.clients.client1.networkPolicy.peerAllowlist).toEqual([]);
+      expect(config.clients.client2.networkPolicy.peerAllowlist).toEqual([]);
+    });
+
+    it('rejects stale policy updates and inherited client names', async () => {
+      const config = await wg.getConfig();
+      const expectedUpdatedAt = new Date(config.clients.client1.updatedAt).toISOString();
+      config.clients.client1.updatedAt = new Date(Date.parse(expectedUpdatedAt) + 1000);
+
+      await expect(wg.updateClientNetworkPolicy({
+        clientId: 'client1',
+        expectedUpdatedAt,
+        policy: { blockedProtocols: [], customRules: [], peerAllowlist: [] },
+      })).rejects.toMatchObject({ statusCode: 409 });
+      await expect(wg.getClient({ clientId: 'toString' })).rejects.toMatchObject({ statusCode: 404 });
     });
   });
 
@@ -240,18 +350,16 @@ describe('WireGuard', () => {
       backup.clients.client1.portForwards = [{ proto: 'tcp', extPort: 3000, intPort: 3000 }];
       const backupJson = JSON.stringify(backup);
 
-      // Simulate wg syncconf failure in reload
+      let startupAttempts = 0;
       Util.exec.mockImplementation(async (cmd) => {
-        if (cmd.includes('wg syncconf')) throw new Error('sync failed');
+        if (cmd.includes('wg-quick up') && startupAttempts++ === 0) throw new Error('startup failed');
       });
 
       try {
         await wg.restoreConfiguration(backupJson);
       } catch (err) {
-        expect(err.message).toMatch(/sync failed/);
-        // The rollbackErrors should contain the wg sync error during the rollback
-        expect(err.rollbackErrors.length).toBeGreaterThanOrEqual(1);
-        expect(err.rollbackErrors.some((m) => m.includes('sync failed'))).toBe(true);
+        expect(err.message).toMatch(/startup failed/);
+        expect(err.rollbackErrors).toEqual([]);
       }
 
       // Memory must be reverted
@@ -314,6 +422,9 @@ describe('WireGuard', () => {
       backup.clients.client1.address = '192.168.50.2';
       backup.clients.client1.addressV6 = 'fd99:42:42::2';
       await expect(wg.restoreConfiguration(JSON.stringify(backup))).resolves.toBeUndefined();
+      const ruleset = Util.execFile.mock.calls.findLast((call) => call[0] === 'nft')[2].input;
+      expect(ruleset).toContain('peer_ipv4 { 192.168.50.2 }');
+      expect(ruleset).toContain('peer_ipv6 { fd99:42:42::2 }');
       await expect(wg.updateClientAddress({ clientId: 'client1', address: '172.16.0.2' }))
         .rejects.toThrow(/must be a usable host/);
     });

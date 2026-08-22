@@ -405,6 +405,9 @@ module.exports = class Server {
     app.use(router2);
 
     router2
+      .get('/api/wireguard/network-policy-options', defineEventHandler(() => {
+        return WireGuard.getNetworkPolicyOptions();
+      }))
       .get('/api/wireguard/client', defineEventHandler(() => {
         return WireGuard.getClients();
       }))
@@ -487,6 +490,17 @@ module.exports = class Server {
         const { address, addressV6 } = await readBodyLimited(event);
         await WireGuard.updateClientAddress({ clientId, address, addressV6 });
         return { success: true };
+      }))
+      .put('/api/wireguard/client/:clientId/network-policy', defineEventHandler(async (event) => {
+        const clientId = getRouterParam(event, 'clientId');
+        if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+          throw createError({ status: 403 });
+        }
+        const { policy, expectedUpdatedAt } = await readBodyLimited(event);
+        if (typeof expectedUpdatedAt !== 'string') {
+          throw createError({ status: 400, message: 'expectedUpdatedAt is required' });
+        }
+        return WireGuard.updateClientNetworkPolicy({ clientId, policy, expectedUpdatedAt });
       }))
       .post('/api/wireguard/client/:clientId/port-forward', defineEventHandler(async (event) => {
         const clientId = getRouterParam(event, 'clientId');

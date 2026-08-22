@@ -49,19 +49,29 @@ The process does not regenerate keys when `wg0.json` is unreadable or invalid. I
 2. Preserve the invalid `wg0.json` for diagnosis.
 3. Validate `wg0.json.bak` or an external backup as JSON.
 4. Restore it as `wg0.json` with mode `0600`.
-5. Start the service and verify WireGuard and both nftables tables.
+5. Start the service and verify WireGuard and the `wgeasy_dnat` and `wgeasy_filter` nftables tables.
 
 Backups downloaded from the API contain private keys. Store them encrypted and never attach them to issues or logs.
 
 ## Network transactions
 
-All state-changing API operations run through a single in-process mutation queue. Each DNAT update is submitted to `nft -f -` as one atomic ruleset. If persistence or WireGuard synchronization fails, the application restores memory, disk and host rules and reports rollback failures.
+All state-changing API operations run through a single in-process mutation queue. DNAT and client traffic-policy updates are submitted to `nft -f -` as one atomic ruleset. If persistence or WireGuard synchronization fails, the application restores memory, disk and host rules and reports rollback failures.
 
 Changing server settings briefly restarts `wg0` so the listening port and firewall hooks match the persisted settings. Existing forwarding rules must remain inside the configured port policy or the update is rejected.
 
 Server-setting changes use `/etc/wireguard/server-settings.transaction.json` as a recovery journal. Do not delete it manually: startup uses it to complete or roll back an interrupted update before accepting requests.
 
-Only one instance may manage `wg0` and the `wgeasy_dnat` tables on a host. Do not share those resources with another manager.
+Only one instance may manage `wg0`, the `wgeasy_dnat` tables and the `inet wgeasy_filter` table on a host. Do not share those resources with another manager.
+
+## Client traffic policies
+
+Clients are isolated from one another by default on IPv4 and IPv6. Peer exceptions configured in the UI are always stored symmetrically, so selecting an exception permits traffic in both directions. Existing clients receive the isolated default when an older configuration is first loaded.
+
+Outbound protocol blocks apply by client source address in the `input` and `forward` hooks. They therefore cover traffic to the VPN server, other peers and the internet. Protocol blocks take precedence over peer exceptions.
+
+Deleting or disabling a client, changing its address, and restoring a backup briefly restart `wg0`. The service installs the candidate filter rules while the interface is down so an old or newly assigned peer address is never active without its policy.
+
+The protocol presets are port-based, not application-aware. For example, HTTPS blocks TCP and UDP port 443, while SSH/SFTP/SCP blocks TCP port 22. They cannot identify an application using a nonstandard port, traffic inside an encrypted tunnel or a protocol that dynamically negotiates additional ports. Use custom TCP/UDP ports or ranges when the preset does not cover the deployment; each client may have up to 32 custom rules.
 
 ## Deployment hardening
 

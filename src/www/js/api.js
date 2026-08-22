@@ -151,6 +151,22 @@ class API {
     });
   }
 
+  async getNetworkPolicyOptions() {
+    return this.call({
+      method: 'get',
+      path: '/wireguard/network-policy-options',
+    });
+  }
+
+  async updateClientNetworkPolicy({ clientId, policy, expectedUpdatedAt }) {
+    const id = encodeURIComponent(clientId);
+    return this.call({
+      method: 'put',
+      path: `/wireguard/client/${id}/network-policy`,
+      body: { policy, expectedUpdatedAt },
+    });
+  }
+
   async restoreConfiguration(file) {
     return this.call({
       method: 'put',
