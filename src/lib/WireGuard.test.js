@@ -144,6 +144,14 @@ describe('WireGuard', () => {
       await expect(wg.addPortForward('client1', 'tcp', 22, 3000)).rejects.toThrow(ServerError);
     });
 
+    it('rejects port conflicts as 409 state conflicts', async () => {
+      // client1 already forwards tcp/2000 (see mocked wg0.json above).
+      await expect(wg.addPortForward('client1', 'tcp', 2000, 3000))
+        .rejects.toMatchObject({ statusCode: 409 });
+      await expect(wg.addPortForward('client1', 'both', 2000, 3000))
+        .rejects.toMatchObject({ statusCode: 409 });
+    });
+
     it('validates intPort type and range', async () => {
       await expect(wg.addPortForward('client1', 'tcp', 3000, 80.5)).rejects.toThrow(ServerError);
       await expect(wg.addPortForward('client1', 'tcp', 3000, 70000)).rejects.toThrow(ServerError);
@@ -191,6 +199,13 @@ describe('WireGuard', () => {
       await expect(wg.removePortForward('client1', -1)).rejects.toThrow(ServerError);
       await expect(wg.updatePortForward('client1', -1, 'tcp', 3000, 3000)).rejects.toThrow(ServerError);
       await expect(wg.removePortForward('client1', 0.5)).rejects.toThrow(ServerError);
+    });
+
+    it('returns 404 for an out-of-range index instead of a silent no-op', async () => {
+      // client1 has exactly one rule (index 0).
+      await expect(wg.removePortForward('client1', 5)).rejects.toMatchObject({ statusCode: 404 });
+      const config = await wg.getConfig();
+      expect(config.clients.client1.portForwards).toHaveLength(1);
     });
   });
 
@@ -369,6 +384,16 @@ describe('WireGuard', () => {
       expect(config.clients.client1.portForwards[0].extPort).toBe(2000);
     });
 
+    it('bumps client updatedAt on restore instead of rolling it backwards', async () => {
+      await wg.getConfig();
+      const before = Date.now();
+      const backup = makeConfig();
+      backup.clients.client1.updatedAt = '2020-01-01T00:00:00.000Z';
+      await wg.restoreConfiguration(JSON.stringify(backup));
+      const config = await wg.getConfig();
+      expect(Date.parse(config.clients.client1.updatedAt)).toBeGreaterThanOrEqual(before - 1000);
+    });
+
     it('rejects backup with invalid IPs entirely without saving', async () => {
       await wg.getConfig(); // init state
 
@@ -447,6 +472,35 @@ describe('WireGuard', () => {
       expect(JSON.stringify(response)).not.toContain('supersecret-value');
       expect(response.host).toBe('10.0.0.1');
     });
+
+    it('keeps the recovery journal when the disk rollback fails', async () => {
+      await wg.getConfig();
+
+      // Fail the nft apply so the whole settings transaction rolls back.
+      Util.execFile.mockImplementation(async (command) => {
+        if (command === 'nft') throw new Error('nft apply failed');
+        return KEYS.clientPublic;
+      });
+      // Let the candidate's wg0.json write succeed, then fail the rollback's.
+      let wg0JsonRenames = 0;
+      fs.rename.mockImplementation(async (from, to) => {
+        if (String(to).endsWith('wg0.json')) {
+          wg0JsonRenames += 1;
+          if (wg0JsonRenames === 2) throw new Error('ENOSPC: rollback write failed');
+        }
+      });
+
+      let caught;
+      await wg.updateServerConfig({ host: '10.0.0.2' }).catch((err) => {
+        caught = err;
+      });
+      expect(caught.rollbackErrors).toEqual(expect.arrayContaining([
+        expect.stringContaining('Settings config rollback failed'),
+      ]));
+      // The journal must survive so boot recovery can converge the disk;
+      // deleting it would strand the candidate config permanently.
+      expect(fs.unlink.mock.calls.some(([target]) => String(target).endsWith('server-settings.transaction.json'))).toBe(false);
+    });
   });
 
   describe('configuration loading', () => {
@@ -468,6 +522,29 @@ describe('WireGuard', () => {
       const config = await migrated.getConfig();
       expect(config.server.addressV6).toBe('fd42:42:42::1');
       expect(config.clients.client1.addressV6).toBe('fd42:42:42::2');
+    });
+
+    it('heals legacy clients missing name, address and publicKey', async () => {
+      const legacy = makeConfig();
+      delete legacy.clients.client1.name;
+      delete legacy.clients.client1.address;
+      delete legacy.clients.client1.publicKey;
+      fs.readFile.mockImplementation(async (filename) => {
+        if (String(filename).includes('server-settings')) {
+          const err = new Error('not found');
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return JSON.stringify(legacy);
+      });
+      Util.execFile.mockImplementation(async (command) => (command === 'wg' ? KEYS.clientPublic : ''));
+      const WireGuardClass = require('./WireGuard'); // eslint-disable-line global-require
+      const migrated = new WireGuardClass();
+
+      const config = await migrated.getConfig();
+      expect(config.clients.client1.name).toBe('client1');
+      expect(config.clients.client1.address).toBe('10.8.0.2');
+      expect(config.clients.client1.publicKey).toBe(KEYS.clientPublic);
     });
 
     it('rolls back an interrupted server settings transaction on startup', async () => {
@@ -649,6 +726,97 @@ describe('WireGuard', () => {
       expect(clients).toHaveLength(1);
       expect(clients[0].id).toBe('client1');
       expect(clients[0].latestHandshakeAt).toBeNull();
+    });
+  });
+
+  describe('mutation queue consistency', () => {
+    it('builds the config exactly once for concurrent first calls', async () => {
+      fs.readFile.mockImplementation(async () => {
+        const err = new Error('not found');
+        err.code = 'ENOENT';
+        throw err;
+      });
+      let release;
+      const gate = new Promise((resolve) => {
+        release = resolve;
+      });
+      Util.exec.mockImplementation(async (cmd) => {
+        if (cmd === 'wg genkey') {
+          await gate;
+          return KEYS.serverPrivate;
+        }
+        return '';
+      });
+      Util.execFile.mockImplementation(async () => KEYS.serverPublic);
+
+      const builds = [wg.getConfig(), wg.getConfig()];
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      release();
+      const [first, second] = await Promise.all(builds);
+
+      expect(second).toBe(first);
+      expect(Util.exec.mock.calls.filter(([cmd]) => cmd === 'wg genkey')).toHaveLength(1);
+    });
+
+    it('rejects nested mutation wrappers instead of deadlocking', async () => {
+      await expect(wg.__withMutation(() => wg.__withMutation(async () => {})))
+        .rejects.toThrow(ServerError);
+    });
+
+    it('waits for operations enqueued while draining', async () => {
+      let release;
+      const gate = new Promise((resolve) => {
+        release = resolve;
+      });
+      let secondDone = false;
+      const first = wg.__withMutation(async () => {
+        await gate;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+
+      const drain = wg.waitForMutations();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+
+      release();
+      // The slow late operation must also settle before the drain resolves —
+      // otherwise Shutdown() would down the interface mid-mutation.
+      const second = wg.__withMutation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        secondDone = true;
+      });
+      await first;
+
+      await drain;
+      const settledWhenDrainReturned = secondDone;
+      await second;
+      expect(settledWhenDrainReturned).toBe(true);
+    });
+
+    it('serves reads only after in-flight mutations commit or roll back', async () => {
+      await wg.getConfig();
+      let rejectSync;
+      const gate = new Promise((_, reject) => {
+        rejectSync = reject;
+      });
+      Util.exec.mockImplementationOnce(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg syncconf')) return gate;
+        return '';
+      });
+
+      // The rename is applied in memory, then the commit stalls at wg syncconf.
+      const update = wg.updateClientName({ clientId: 'client1', name: 'renamed' });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // A concurrent read must not observe the uncommitted name...
+      const clientsPromise = wg.getClients();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // ...and after the commit fails and rolls back, the read sees the
+      // original name rather than state that never persisted.
+      rejectSync(new Error('sync failed'));
+      await update.catch(() => {});
+      const clients = await clientsPromise;
+      expect(clients.find((client) => client.id === 'client1').name).toBe('client1');
     });
   });
 });

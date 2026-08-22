@@ -4,6 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('path');
 const debug = require('debug')('WireGuard');
 const crypto = require('node:crypto');
+const { AsyncLocalStorage } = require('node:async_hooks');
 const QRCode = require('qrcode');
 
 const Util = require('./Util');
@@ -103,6 +104,11 @@ const DUMMY_CLIENT_PREVIEW = {
   networkPolicy: createDefaultNetworkPolicy(),
 };
 
+// Tracks which WireGuard instance's mutation is currently executing so that
+// re-entrant __withMutation calls (the deadlock pattern) can be told apart
+// from unrelated callers enqueueing work while a mutation runs.
+const mutationContext = new AsyncLocalStorage();
+
 module.exports = class WireGuard {
 
   constructor() {
@@ -124,19 +130,39 @@ module.exports = class WireGuard {
     };
     this.__config = null;
     this.__initPromise = null;
+    this.__buildPromise = null;
     this.__mutationQueue = Promise.resolve();
+    this.__activeMutation = false;
     this.__settingsRecoveryPending = false;
     this.__settingsRecoveryConfig = null;
   }
 
+  // Serializes every state change (and read snapshots, see the public read
+  // methods) behind a single promise chain. A queued operation that re-enters
+  // this method would await its own tail and hang every future mutation, so
+  // re-entrancy from inside a running operation is rejected (external callers
+  // may keep enqueueing while an operation runs).
   __withMutation(operation) {
-    const run = this.__mutationQueue.then(operation, operation);
+    if (mutationContext.getStore() === this) {
+      return Promise.reject(new ServerError(
+        'Concurrent mutation re-entrancy detected: use the internal (__-prefixed) variant inside queued operations',
+        500,
+      ));
+    }
+    const run = this.__mutationQueue.then(async () => mutationContext.run(this, operation));
     this.__mutationQueue = run.catch(() => {});
     return run;
   }
 
   async waitForMutations() {
-    await this.__mutationQueue;
+    // Drain to quiescence: operations enqueued while we are awaiting must also
+    // settle (Shutdown downs the interface right after this resolves).
+    let tail = this.__mutationQueue;
+    for (;;) {
+      await tail;
+      if (this.__mutationQueue === tail) return;
+      tail = this.__mutationQueue;
+    }
   }
 
   __normalizeServerSettings(settings, base = this.__serverSettings, strict = false) {
@@ -380,6 +406,24 @@ module.exports = class WireGuard {
         client.networkPolicy = createDefaultNetworkPolicy();
       }
       client.networkPolicy = this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false });
+
+      if (client.name === undefined || client.name === null) {
+        client.name = clientId;
+      }
+      if (!WIREGUARD_KEY_RE.test(client.publicKey || '') && WIREGUARD_KEY_RE.test(client.privateKey || '')) {
+        // publicKey is deterministically derivable from privateKey.
+        const derived = await Util.execFile('wg', ['pubkey'], { input: `${client.privateKey}\n`, log: 'wg pubkey' });
+        if (WIREGUARD_KEY_RE.test(derived)) client.publicKey = derived;
+      }
+      if (client.address === undefined || client.address === null || !Util.isValidIPv4(client.address)) {
+        const usedAddresses = new Set(Object.values(config.clients)
+          .map((candidate) => candidate.address)
+          .filter(Boolean));
+        const host = Array.from({ length: 253 }, (_, offset) => offset + 2)
+          .find((value) => !usedAddresses.has(this.__serverSettings.defaultAddress.replace('x', value)));
+        if (host === undefined) throw new Error('Maximum number of clients reached.');
+        client.address = this.__serverSettings.defaultAddress.replace('x', host);
+      }
     }
 
     if (this.__serverSettings.enableIpv6 && !config.server.addressV6) {
@@ -498,7 +542,7 @@ module.exports = class WireGuard {
         const protocols = rule.proto === 'both' ? ['tcp', 'udp'] : [rule.proto];
         for (const protocol of protocols) {
           const key = `${protocol}:${rule.extPort}`;
-          if (forwardedPorts.has(key)) throw new ServerError(`Duplicate forwarded port: ${key}`, 400);
+          if (forwardedPorts.has(key)) throw new ServerError(`Duplicate forwarded port: ${key}`, 409);
           forwardedPorts.add(key);
         }
       }
@@ -573,7 +617,14 @@ module.exports = class WireGuard {
 
   async getConfig() {
     if (!this.__config) {
-      await this.__buildConfig();
+      // Memoize the build so concurrent first calls cannot each generate a
+      // (different) server keypair on a fresh install.
+      if (!this.__buildPromise) {
+        this.__buildPromise = this.__buildConfig().finally(() => {
+          this.__buildPromise = null;
+        });
+      }
+      await this.__buildPromise;
     }
     return this.__config;
   }
@@ -739,62 +790,68 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
       return [DUMMY_CLIENT_PREVIEW];
     }
 
-    const config = await this.getConfig();
-    const clients = Object.entries(config.clients).map(([clientId, client]) => ({
-      id: clientId,
-      name: client.name,
-      enabled: client.enabled,
-      address: client.address,
-      publicKey: client.publicKey,
-      createdAt: new Date(client.createdAt),
-      updatedAt: new Date(client.updatedAt),
-      allowedIPs: client.allowedIPs || [`${client.address}/32`, (this.__serverSettings.enableIpv6 && client.addressV6 ? `${client.addressV6}/128` : null)].filter(Boolean),
-      addressV6: client.addressV6,
-      portForwards: Array.isArray(client.portForwards) ? client.portForwards : [],
-      networkPolicy: this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false }),
-      downloadableConfig: 'privateKey' in client && client.privateKey != null,
-      persistentKeepalive: null,
-      latestHandshakeAt: null,
-      transferRx: null,
-      transferTx: null,
-    }));
+    // Serialized behind the mutation queue so clients can never observe
+    // half-applied (or later rolled-back) in-memory state.
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      const clients = Object.entries(config.clients).map(([clientId, client]) => ({
+        id: clientId,
+        name: client.name,
+        enabled: client.enabled,
+        address: client.address,
+        publicKey: client.publicKey,
+        createdAt: new Date(client.createdAt),
+        updatedAt: new Date(client.updatedAt),
+        allowedIPs: client.allowedIPs || [`${client.address}/32`, (this.__serverSettings.enableIpv6 && client.addressV6 ? `${client.addressV6}/128` : null)].filter(Boolean),
+        addressV6: client.addressV6,
+        portForwards: Array.isArray(client.portForwards)
+          ? client.portForwards.map((rule) => ({ ...rule }))
+          : [],
+        networkPolicy: this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false }),
+        downloadableConfig: 'privateKey' in client && client.privateKey != null,
+        persistentKeepalive: null,
+        latestHandshakeAt: null,
+        transferRx: null,
+        transferTx: null,
+      }));
 
-    // Loop WireGuard status
-    try {
-      const dump = await Util.exec('wg show wg0 dump', {
-        log: false,
-      });
-      dump
-        .trim()
-        .split('\n')
-        .slice(1)
-        .forEach((line) => {
-          const [
-            publicKey,
-            preSharedKey, // eslint-disable-line no-unused-vars
-            endpoint, // eslint-disable-line no-unused-vars
-            allowedIps, // eslint-disable-line no-unused-vars
-            latestHandshakeAt,
-            transferRx,
-            transferTx,
-            persistentKeepalive,
-          ] = line.split('\t');
-
-          const client = clients.find((c) => c.publicKey === publicKey);
-          if (!client) return;
-
-          client.latestHandshakeAt = latestHandshakeAt === '0'
-            ? null
-            : new Date(Number(`${latestHandshakeAt}000`));
-          client.transferRx = Number(transferRx);
-          client.transferTx = Number(transferTx);
-          client.persistentKeepalive = persistentKeepalive;
+      // Loop WireGuard status
+      try {
+        const dump = await Util.exec('wg show wg0 dump', {
+          log: false,
         });
-    } catch (err) {
-      debug(`Warning: Could not fetch wireguard dump: ${err.message}`);
-    }
+        dump
+          .trim()
+          .split('\n')
+          .slice(1)
+          .forEach((line) => {
+            const [
+              publicKey,
+              preSharedKey, // eslint-disable-line no-unused-vars
+              endpoint, // eslint-disable-line no-unused-vars
+              allowedIps, // eslint-disable-line no-unused-vars
+              latestHandshakeAt,
+              transferRx,
+              transferTx,
+              persistentKeepalive,
+            ] = line.split('\t');
 
-    return clients;
+            const client = clients.find((c) => c.publicKey === publicKey);
+            if (!client) return;
+
+            client.latestHandshakeAt = latestHandshakeAt === '0'
+              ? null
+              : new Date(Number(`${latestHandshakeAt}000`));
+            client.transferRx = Number(transferRx);
+            client.transferTx = Number(transferTx);
+            client.persistentKeepalive = persistentKeepalive;
+          });
+      } catch (err) {
+        debug(`Warning: Could not fetch wireguard dump: ${err.message}`);
+      }
+
+      return clients;
+    });
   }
 
   async getClient({ clientId }) {
@@ -812,10 +869,13 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
   }
 
   async getClientConfiguration({ clientId }) {
-    const config = await this.getConfig();
-    const client = await this.getClient({ clientId });
+    // Serialized behind the mutation queue: a .conf handed to a device must
+    // reflect fully committed state, never a mid-mutation mix.
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      const client = await this.getClient({ clientId });
 
-    return `
+      return `
 [Interface]
 PrivateKey = ${client.privateKey ? `${client.privateKey}` : 'REPLACE_ME'}
 Address = ${client.address}/24${this.__serverSettings.enableIpv6 && client.addressV6 ? `, ${client.addressV6}/128` : ''}
@@ -828,6 +888,7 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
 }AllowedIPs = ${this.__serverSettings.allowedIps}
 PersistentKeepalive = ${this.__serverSettings.persistentKeepalive}
 Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
+    });
   }
 
   async getClientQRCodeSVG({ clientId }) {
@@ -989,11 +1050,11 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       if (addressV6 && !Util.isValidIPv6(addressV6)) throw new ServerError(`Invalid IPv6 Address: ${addressV6}`, 400);
       if (address && (address === config.server.address
         || Object.values(config.clients).some((candidate) => candidate !== client && candidate.address === address))) {
-        throw new ServerError(`IPv4 address already in use: ${address}`, 400);
+        throw new ServerError(`IPv4 address already in use: ${address}`, 409);
       }
       if (addressV6 && (addressV6 === config.server.addressV6
         || Object.values(config.clients).some((candidate) => candidate !== client && candidate.addressV6 === addressV6))) {
-        throw new ServerError(`IPv6 address already in use: ${addressV6}`, 400);
+        throw new ServerError(`IPv6 address already in use: ${addressV6}`, 409);
       }
       if (addressV6 && config.server.addressV6 && !isSameIPv6Subnet64(config.server.addressV6, addressV6)) {
         throw new ServerError('IPv6 address must be in the server /64', 400);
@@ -1097,13 +1158,6 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     });
   }
 
-  async __reloadConfig() {
-    // Clear cache to force re-read from disk (needed after restoreConfiguration)
-    this.__config = null;
-    await this.__buildConfig();
-    await this.__syncConfig();
-  }
-
   async restoreConfiguration(config) {
     return this.__withMutation(async () => {
       debug('Starting configuration restore process.');
@@ -1125,6 +1179,11 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
             }
             if (client.updatedAt === undefined || client.updatedAt === null || !isValidDate(client.updatedAt)) {
               client.updatedAt = new Date().toISOString();
+            } else {
+              // Restoring is itself a change: bump updatedAt (never roll it
+              // backwards) so open editors' expectedUpdatedAt checks fail
+              // loudly instead of silently diverging from the restored state.
+              client.updatedAt = new Date(Math.max(Date.parse(client.updatedAt), Date.now())).toISOString();
             }
             if (!Array.isArray(client.portForwards)) client.portForwards = [];
             if (client.networkPolicy === undefined || client.networkPolicy === null) {
@@ -1224,8 +1283,12 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
   async backupConfiguration() {
     debug('Starting configuration backup.');
-    const config = await this.getConfig();
-    const backup = JSON.stringify(config, null, 2);
+    // Serialized behind the mutation queue so the backup is a consistent
+    // snapshot of committed state.
+    const backup = await this.__withMutation(async () => {
+      const config = await this.getConfig();
+      return JSON.stringify(config, null, 2);
+    });
     debug('Configuration backup completed.');
     return backup;
   }
@@ -1242,9 +1305,12 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   // ── Server Settings (Global IP Config) ──────────────────────────
 
   async getServerConfig() {
-    // Ensure config is loaded (which also loads settings)
-    await this.getConfig();
-    return serializeServerSettingsPublic(this.__serverSettings);
+    // Serialized behind the mutation queue so settings are read from a fully
+    // committed state (which also loads them from disk on first call).
+    return this.__withMutation(async () => {
+      await this.getConfig();
+      return serializeServerSettingsPublic(this.__serverSettings);
+    });
   }
 
   async updateServerConfig(settings) {
@@ -1299,7 +1365,9 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         });
         this.__serverSettings = previous;
         this.__config = previousConfig;
+        let configRollbackFailed = false;
         await this.__saveConfig(previousConfig).catch((rollbackErr) => {
+          configRollbackFailed = true;
           rollbackErrors.push(`Settings config rollback failed: ${rollbackErr.message}`);
         });
         await this.__ensureNftablesSetup()
@@ -1310,9 +1378,16 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         await this.__bringWireGuardUp().catch((rollbackErr) => {
           rollbackErrors.push(`WireGuard settings rollback failed: ${rollbackErr.message}`);
         });
-        await this.__completeSettingsTransaction().catch((rollbackErr) => {
-          rollbackErrors.push(`Settings journal rollback failed: ${rollbackErr.message}`);
-        });
+        if (configRollbackFailed) {
+          // The disk still holds the candidate config. Keep the journal: boot
+          // recovery rewrites wg0.json from previousConfig, which is the only
+          // remaining way to converge disk, settings and live state.
+          debug('Settings journal kept after a failed config rollback.');
+        } else {
+          await this.__completeSettingsTransaction().catch((rollbackErr) => {
+            rollbackErrors.push(`Settings journal rollback failed: ${rollbackErr.message}`);
+          });
+        }
         err.rollbackErrors = rollbackErrors;
         if (rollbackErrors.length) err.data = { rollbackFailed: true };
         throw err;
@@ -1523,28 +1598,28 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     const port = Number(extPort);
     const internalPort = Number(intPort);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new ServerError('Puerto externo inválido (debe ser 1–65535)', 400);
+      throw new ServerError('Invalid external port (must be 1-65535)', 400);
     }
     if (!Number.isInteger(internalPort) || internalPort < 1 || internalPort > 65535) {
-      throw new ServerError('Puerto interno inválido (debe ser 1–65535)', 400);
+      throw new ServerError('Invalid internal port (must be 1-65535)', 400);
     }
 
     // Block unallowed ports
     if (!this.__isPortAllowed(port)) {
-      throw new ServerError(`El puerto ${port} no está permitido por la política o está reservado`, 400);
+      throw new ServerError(`Port ${port} is not allowed by policy or is reserved`, 400);
     }
 
     // Validate extPort not already used by the same peer
     const selfConflict = client.portForwards.some((r) => (r.proto === proto || r.proto === 'both' || proto === 'both')
       && r.extPort === port);
-    if (selfConflict) throw new ServerError(`El puerto ${proto}/${port} ya está configurado en este peer`, 400);
+    if (selfConflict) throw new ServerError(`Port ${proto}/${port} is already configured on this peer`, 409);
 
     // Validate extPort not already used by another peer
     const crossConflict = Object.values(config.clients).some((c) => c.id !== clientId
       && Array.isArray(c.portForwards)
       && c.portForwards.some((r) => (r.proto === proto || r.proto === 'both' || proto === 'both')
         && r.extPort === port));
-    if (crossConflict) throw new ServerError(`El puerto ${proto}/${port} ya está asignado a otro peer`, 400);
+    if (crossConflict) throw new ServerError(`Port ${proto}/${port} is already assigned to another peer`, 409);
 
     await this.__transactionalDnatChange(
       () => {
@@ -1562,7 +1637,13 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   }
 
   async __removePortForward(clientId, index) {
+    if (!Number.isInteger(index) || index < 0) {
+      throw new ServerError('Invalid index', 400);
+    }
     if (process.platform !== 'linux') {
+      if (!Array.isArray(DUMMY_CLIENT_PREVIEW.portForwards) || DUMMY_CLIENT_PREVIEW.portForwards.length <= index) {
+        throw new ServerError('Port forward rule not found', 404);
+      }
       debug('Preview: Simulated removing port forward');
       DUMMY_CLIENT_PREVIEW.portForwards.splice(index, 1);
       return;
@@ -1571,22 +1652,21 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     const client = config.clients[clientId];
     if (!client) throw new ServerError(`Client not found: ${clientId}`, 404);
 
-    if (!Number.isInteger(index) || index < 0) {
-      throw new ServerError('Invalid index', 400);
+    // An out-of-range index must fail like updatePortForward does: returning
+    // success for a no-op masks drift and breaks retry/idempotency assumptions.
+    if (!Array.isArray(client.portForwards) || client.portForwards.length <= index) {
+      throw new ServerError('Port forward rule not found', 404);
     }
-
-    if (Array.isArray(client.portForwards) && client.portForwards.length > index) {
-      const ruleToRemove = client.portForwards[index];
-      await this.__transactionalDnatChange(
-        () => {
-          client.portForwards.splice(index, 1);
-        },
-        () => {
-          client.portForwards.splice(index, 0, ruleToRemove);
-        },
-        'remove-port-forward',
-      );
-    }
+    const ruleToRemove = client.portForwards[index];
+    await this.__transactionalDnatChange(
+      () => {
+        client.portForwards.splice(index, 1);
+      },
+      () => {
+        client.portForwards.splice(index, 0, ruleToRemove);
+      },
+      'remove-port-forward',
+    );
   }
 
   async updatePortForward(clientId, index, proto, extPort, intPort) {
@@ -1614,22 +1694,22 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     const port = Number(extPort);
     const internalPort = Number(intPort);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new ServerError('Puerto externo inválido (debe ser 1–65535)', 400);
+      throw new ServerError('Invalid external port (must be 1-65535)', 400);
     }
     if (!Number.isInteger(internalPort) || internalPort < 1 || internalPort > 65535) {
-      throw new ServerError('Puerto interno inválido (debe ser 1–65535)', 400);
+      throw new ServerError('Invalid internal port (must be 1-65535)', 400);
     }
 
     // Block unallowed ports
     if (!this.__isPortAllowed(port)) {
-      throw new ServerError(`El puerto ${port} no está permitido por la política o está reservado`, 400);
+      throw new ServerError(`Port ${port} is not allowed by policy or is reserved`, 400);
     }
 
     // Validate extPort not already used by the same peer (excluding the rule being updated)
     const selfConflict = client.portForwards.some((r, i) => i !== idx
       && (r.proto === proto || r.proto === 'both' || proto === 'both')
       && r.extPort === port);
-    if (selfConflict) throw new ServerError(`El puerto ${proto}/${port} ya está configurado en este peer`, 400);
+    if (selfConflict) throw new ServerError(`Port ${proto}/${port} is already configured on this peer`, 409);
 
     // Validate extPort not already used by another peer, ignoring current rule
     const crossConflict = Object.values(config.clients).some((c) => {
@@ -1639,7 +1719,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         return (r.proto === proto || r.proto === 'both' || proto === 'both') && r.extPort === port;
       });
     });
-    if (crossConflict) throw new ServerError(`El puerto ${proto}/${port} ya está asignado a otro peer`, 400);
+    if (crossConflict) throw new ServerError(`Port ${proto}/${port} is already assigned to another peer`, 409);
 
     const oldRule = client.portForwards[idx];
     await this.__transactionalDnatChange(

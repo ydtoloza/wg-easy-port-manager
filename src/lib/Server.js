@@ -19,6 +19,7 @@ const {
   getRouterParam,
   toNodeListener,
   setHeader,
+  setResponseStatus,
   send,
   serveStatic,
 } = require('h3');
@@ -201,12 +202,38 @@ const isPasswordValid = async (password) => {
   return false;
 };
 
+/**
+ * Terminal error handler for every unhandled route error.
+ *
+ * Contract: every sub-500 error thrown by this server is a validation or auth
+ * message that is safe to show to the client verbatim. Anything else (plain
+ * internal errors, and the 500s that embed command output) is replaced with a
+ * generic message and only logged server-side. `err.data` is never serialized.
+ */
+const handleRequestError = (error, event) => {
+  if (event.handled) return;
+  const status = error.statusCode || 500;
+  const message = status < 500 && error.message ? error.message : 'Internal server error';
+  if (status >= 500) {
+    if (Array.isArray(error.rollbackErrors) && error.rollbackErrors.length) {
+      debug(`Rollback errors: ${error.rollbackErrors.join(' | ')}`);
+    }
+    // eslint-disable-next-line no-console
+    console.error(error);
+  }
+  setResponseStatus(event, status);
+  event.node.res.setHeader('Content-Type', 'application/json');
+  // Ending the response marks the event as handled (h3 derives `handled` from
+  // the node response state), which skips h3's default error body — the one
+  // that drops the message and serializes err.data.
+  event.node.res.end(JSON.stringify({ statusCode: status, error: message }));
+};
 module.exports = class Server {
 
   constructor({ port = PORT, host = WEBUI_HOST } = {}) {
     validateEnvironment();
 
-    const app = createApp();
+    const app = createApp({ onError: handleRequestError });
     this.app = app;
 
     app.use(fromNodeMiddleware(expressSession({
@@ -517,12 +544,12 @@ module.exports = class Server {
         }
         const { proto, extPort, intPort } = await readBodyLimited(event);
         if (!['tcp', 'udp', 'both'].includes(proto)) {
-          throw createError({ status: 400, message: 'proto debe ser tcp, udp o both' });
+          throw createError({ status: 400, message: 'proto must be tcp, udp or both' });
         }
         const p = Number(extPort);
         const ip = Number(intPort);
         if (!Number.isInteger(p) || !Number.isInteger(ip) || p < 1 || p > 65535 || ip < 1 || ip > 65535) {
-          throw createError({ status: 400, message: 'Puertos inválidos' });
+          throw createError({ status: 400, message: 'Invalid ports' });
         }
         await WireGuard.addPortForward(clientId, proto, p, ip);
         return { success: true };
@@ -552,12 +579,12 @@ module.exports = class Server {
         }
         const { proto, extPort, intPort } = await readBodyLimited(event);
         if (!['tcp', 'udp', 'both'].includes(proto)) {
-          throw createError({ status: 400, message: 'proto debe ser tcp, udp o both' });
+          throw createError({ status: 400, message: 'proto must be tcp, udp or both' });
         }
         const p = Number(extPort);
         const ip = Number(intPort);
         if (!Number.isInteger(p) || !Number.isInteger(ip) || p < 1 || p > 65535 || ip < 1 || ip > 65535) {
-          throw createError({ status: 400, message: 'Puertos inválidos' });
+          throw createError({ status: 400, message: 'Invalid ports' });
         }
         await WireGuard.updatePortForward(clientId, numIndex, proto, p, ip);
         return { success: true };
