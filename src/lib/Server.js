@@ -167,7 +167,11 @@ const isSameOrigin = (req) => {
   }
   try {
     const { host } = new URL(origin);
-    return host === req.headers.host;
+    const forwardedHost = req.headers['x-forwarded-host'];
+    const candidateHost = typeof forwardedHost === 'string'
+      ? forwardedHost.split(',').at(-1).trim()
+      : null;
+    return host === req.headers.host || (Boolean(TRUSTED_PROXY_IP) && Boolean(candidateHost) && host === candidateHost);
   } catch {
     return false;
   }

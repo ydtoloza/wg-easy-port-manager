@@ -596,4 +596,47 @@ describe('WireGuard', () => {
       await expect(wg.updateClientName({ clientId: 'client1', name: 'ok-name' })).resolves.toBeUndefined();
     });
   });
+
+  describe('legacy client migration and fault tolerance', () => {
+    it('migrates legacy clients with empty preSharedKey, empty privateKey, and missing networkPolicy', async () => {
+      const legacy = makeConfig();
+      legacy.clients.client1.preSharedKey = '';
+      legacy.clients.client1.privateKey = '';
+      delete legacy.clients.client1.id;
+      delete legacy.clients.client1.networkPolicy;
+      delete legacy.clients.client1.createdAt;
+
+      fs.readFile.mockImplementation(async (filename) => {
+        if (String(filename).includes('server-settings')) {
+          const err = new Error('not found');
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return JSON.stringify(legacy);
+      });
+      const WireGuardClass = require('./WireGuard'); // eslint-disable-line global-require
+      const migrated = new WireGuardClass();
+
+      const config = await migrated.getConfig();
+      expect(config.clients.client1.id).toBe('client1');
+      expect(config.clients.client1.preSharedKey).toBeNull();
+      expect(config.clients.client1.privateKey).toBeUndefined();
+      expect(config.clients.client1.networkPolicy).toBeDefined();
+      expect(config.clients.client1.networkPolicy.blockedProtocols).toEqual([]);
+    });
+
+    it('returns clients even if wg show wg0 dump fails in getClients', async () => {
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
+          throw new Error('interface down');
+        }
+        return '';
+      });
+
+      const clients = await wg.getClients();
+      expect(clients).toHaveLength(1);
+      expect(clients[0].id).toBe('client1');
+      expect(clients[0].latestHandshakeAt).toBeNull();
+    });
+  });
 });

@@ -309,8 +309,15 @@ module.exports = class WireGuard {
 
     let config;
     if (raw === undefined) {
-      const privateKey = await Util.exec('wg genkey');
-      const publicKey = await Util.execFile('wg', ['pubkey'], { input: `${privateKey}\n`, log: 'wg pubkey' });
+      let privateKey;
+      let publicKey;
+      if (process.platform !== 'linux') {
+        privateKey = crypto.randomBytes(32).toString('base64');
+        publicKey = crypto.randomBytes(32).toString('base64');
+      } else {
+        privateKey = await Util.exec('wg genkey');
+        publicKey = await Util.execFile('wg', ['pubkey'], { input: `${privateKey}\n`, log: 'wg pubkey' });
+      }
       const address = this.__serverSettings.defaultAddress.replace('x', '1');
       const addressV6 = this.__serverSettings.enableIpv6 ? this.__serverSettings.defaultAddressV6.replace('x', '1') : null;
 
@@ -344,12 +351,20 @@ module.exports = class WireGuard {
     // Migrate fields introduced after the initial configuration format.
     for (const [clientId, client] of Object.entries(config.clients)) {
       if (!isPlainObject(client)) throw new Error(`Invalid client entry: ${clientId}`);
-      if (client.id === undefined) client.id = clientId;
-      if (client.enabled === undefined) client.enabled = true;
+      if (client.id === undefined || client.id === null) client.id = clientId;
+      if (client.enabled === undefined || client.enabled === null) client.enabled = true;
+      if (client.preSharedKey === '' || client.preSharedKey === undefined) client.preSharedKey = null;
+      if (client.privateKey === '' || client.privateKey === undefined) delete client.privateKey;
+      if (client.createdAt === undefined || client.createdAt === null || !isValidDate(client.createdAt)) {
+        client.createdAt = new Date().toISOString();
+      }
+      if (client.updatedAt === undefined || client.updatedAt === null || !isValidDate(client.updatedAt)) {
+        client.updatedAt = new Date().toISOString();
+      }
       if (!Array.isArray(client.portForwards)) {
         client.portForwards = [];
       }
-      if (client.networkPolicy === undefined) {
+      if (client.networkPolicy === undefined || client.networkPolicy === null) {
         client.networkPolicy = createDefaultNetworkPolicy();
       }
       client.networkPolicy = this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false });
@@ -705,8 +720,8 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
       allowedIPs: client.allowedIPs || [`${client.address}/32`, (this.__serverSettings.enableIpv6 && client.addressV6 ? `${client.addressV6}/128` : null)].filter(Boolean),
       addressV6: client.addressV6,
       portForwards: Array.isArray(client.portForwards) ? client.portForwards : [],
-      networkPolicy: this.__normalizeNetworkPolicy(client.networkPolicy),
-      downloadableConfig: 'privateKey' in client,
+      networkPolicy: this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false }),
+      downloadableConfig: 'privateKey' in client && client.privateKey != null,
       persistentKeepalive: null,
       latestHandshakeAt: null,
       transferRx: null,
@@ -714,35 +729,39 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
     }));
 
     // Loop WireGuard status
-    const dump = await Util.exec('wg show wg0 dump', {
-      log: false,
-    });
-    dump
-      .trim()
-      .split('\n')
-      .slice(1)
-      .forEach((line) => {
-        const [
-          publicKey,
-          preSharedKey, // eslint-disable-line no-unused-vars
-          endpoint, // eslint-disable-line no-unused-vars
-          allowedIps, // eslint-disable-line no-unused-vars
-          latestHandshakeAt,
-          transferRx,
-          transferTx,
-          persistentKeepalive,
-        ] = line.split('\t');
-
-        const client = clients.find((client) => client.publicKey === publicKey);
-        if (!client) return;
-
-        client.latestHandshakeAt = latestHandshakeAt === '0'
-          ? null
-          : new Date(Number(`${latestHandshakeAt}000`));
-        client.transferRx = Number(transferRx);
-        client.transferTx = Number(transferTx);
-        client.persistentKeepalive = persistentKeepalive;
+    try {
+      const dump = await Util.exec('wg show wg0 dump', {
+        log: false,
       });
+      dump
+        .trim()
+        .split('\n')
+        .slice(1)
+        .forEach((line) => {
+          const [
+            publicKey,
+            preSharedKey, // eslint-disable-line no-unused-vars
+            endpoint, // eslint-disable-line no-unused-vars
+            allowedIps, // eslint-disable-line no-unused-vars
+            latestHandshakeAt,
+            transferRx,
+            transferTx,
+            persistentKeepalive,
+          ] = line.split('\t');
+
+          const client = clients.find((c) => c.publicKey === publicKey);
+          if (!client) return;
+
+          client.latestHandshakeAt = latestHandshakeAt === '0'
+            ? null
+            : new Date(Number(`${latestHandshakeAt}000`));
+          client.transferRx = Number(transferRx);
+          client.transferTx = Number(transferTx);
+          client.persistentKeepalive = persistentKeepalive;
+        });
+    } catch (err) {
+      debug(`Warning: Could not fetch wireguard dump: ${err.message}`);
+    }
 
     return clients;
   }
@@ -1064,9 +1083,23 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         throw new ServerError('Invalid backup: not valid JSON', 400);
       }
       if (isPlainObject(restored) && isPlainObject(restored.clients)) {
-        for (const client of Object.values(restored.clients)) {
-          if (isPlainObject(client) && client.networkPolicy === undefined) {
-            client.networkPolicy = createDefaultNetworkPolicy();
+        for (const [clientId, client] of Object.entries(restored.clients)) {
+          if (isPlainObject(client)) {
+            if (client.id === undefined || client.id === null) client.id = clientId;
+            if (client.enabled === undefined || client.enabled === null) client.enabled = true;
+            if (client.preSharedKey === '' || client.preSharedKey === undefined) client.preSharedKey = null;
+            if (client.privateKey === '' || client.privateKey === undefined) delete client.privateKey;
+            if (client.createdAt === undefined || client.createdAt === null || !isValidDate(client.createdAt)) {
+              client.createdAt = new Date().toISOString();
+            }
+            if (client.updatedAt === undefined || client.updatedAt === null || !isValidDate(client.updatedAt)) {
+              client.updatedAt = new Date().toISOString();
+            }
+            if (!Array.isArray(client.portForwards)) client.portForwards = [];
+            if (client.networkPolicy === undefined || client.networkPolicy === null) {
+              client.networkPolicy = createDefaultNetworkPolicy();
+            }
+            client.networkPolicy = this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false });
           }
         }
       }
