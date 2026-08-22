@@ -200,6 +200,13 @@ describe('WireGuard', () => {
       await expect(wg.updatePortForward('client1', -1, 'tcp', 3000, 3000)).rejects.toThrow(ServerError);
       await expect(wg.removePortForward('client1', 0.5)).rejects.toThrow(ServerError);
     });
+
+    it('returns 404 for an out-of-range index instead of a silent no-op', async () => {
+      // client1 has exactly one rule (index 0).
+      await expect(wg.removePortForward('client1', 5)).rejects.toMatchObject({ statusCode: 404 });
+      const config = await wg.getConfig();
+      expect(config.clients.client1.portForwards).toHaveLength(1);
+    });
   });
 
   describe('client activation', () => {
@@ -377,6 +384,16 @@ describe('WireGuard', () => {
       expect(config.clients.client1.portForwards[0].extPort).toBe(2000);
     });
 
+    it('bumps client updatedAt on restore instead of rolling it backwards', async () => {
+      await wg.getConfig();
+      const before = Date.now();
+      const backup = makeConfig();
+      backup.clients.client1.updatedAt = '2020-01-01T00:00:00.000Z';
+      await wg.restoreConfiguration(JSON.stringify(backup));
+      const config = await wg.getConfig();
+      expect(Date.parse(config.clients.client1.updatedAt)).toBeGreaterThanOrEqual(before - 1000);
+    });
+
     it('rejects backup with invalid IPs entirely without saving', async () => {
       await wg.getConfig(); // init state
 
@@ -445,6 +462,35 @@ describe('WireGuard', () => {
       await expect(wg.updateServerConfig({ defaultAddressV6: 'fd42:x::' }))
         .rejects.toThrow(/Invalid value for defaultAddressV6/);
     });
+
+    it('keeps the recovery journal when the disk rollback fails', async () => {
+      await wg.getConfig();
+
+      // Fail the nft apply so the whole settings transaction rolls back.
+      Util.execFile.mockImplementation(async (command) => {
+        if (command === 'nft') throw new Error('nft apply failed');
+        return KEYS.clientPublic;
+      });
+      // Let the candidate's wg0.json write succeed, then fail the rollback's.
+      let wg0JsonRenames = 0;
+      fs.rename.mockImplementation(async (from, to) => {
+        if (String(to).endsWith('wg0.json')) {
+          wg0JsonRenames += 1;
+          if (wg0JsonRenames === 2) throw new Error('ENOSPC: rollback write failed');
+        }
+      });
+
+      let caught;
+      await wg.updateServerConfig({ host: '10.0.0.2' }).catch((err) => {
+        caught = err;
+      });
+      expect(caught.rollbackErrors).toEqual(expect.arrayContaining([
+        expect.stringContaining('Settings config rollback failed'),
+      ]));
+      // The journal must survive so boot recovery can converge the disk;
+      // deleting it would strand the candidate config permanently.
+      expect(fs.unlink.mock.calls.some(([target]) => String(target).endsWith('server-settings.transaction.json'))).toBe(false);
+    });
   });
 
   describe('configuration loading', () => {
@@ -466,6 +512,29 @@ describe('WireGuard', () => {
       const config = await migrated.getConfig();
       expect(config.server.addressV6).toBe('fd42:42:42::1');
       expect(config.clients.client1.addressV6).toBe('fd42:42:42::2');
+    });
+
+    it('heals legacy clients missing name, address and publicKey', async () => {
+      const legacy = makeConfig();
+      delete legacy.clients.client1.name;
+      delete legacy.clients.client1.address;
+      delete legacy.clients.client1.publicKey;
+      fs.readFile.mockImplementation(async (filename) => {
+        if (String(filename).includes('server-settings')) {
+          const err = new Error('not found');
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return JSON.stringify(legacy);
+      });
+      Util.execFile.mockImplementation(async (command) => (command === 'wg' ? KEYS.clientPublic : ''));
+      const WireGuardClass = require('./WireGuard'); // eslint-disable-line global-require
+      const migrated = new WireGuardClass();
+
+      const config = await migrated.getConfig();
+      expect(config.clients.client1.name).toBe('client1');
+      expect(config.clients.client1.address).toBe('10.8.0.2');
+      expect(config.clients.client1.publicKey).toBe(KEYS.clientPublic);
     });
 
     it('rolls back an interrupted server settings transaction on startup', async () => {

@@ -396,6 +396,24 @@ module.exports = class WireGuard {
         client.networkPolicy = createDefaultNetworkPolicy();
       }
       client.networkPolicy = this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false });
+
+      if (client.name === undefined || client.name === null) {
+        client.name = clientId;
+      }
+      if (!WIREGUARD_KEY_RE.test(client.publicKey || '') && WIREGUARD_KEY_RE.test(client.privateKey || '')) {
+        // publicKey is deterministically derivable from privateKey.
+        const derived = await Util.execFile('wg', ['pubkey'], { input: `${client.privateKey}\n`, log: 'wg pubkey' });
+        if (WIREGUARD_KEY_RE.test(derived)) client.publicKey = derived;
+      }
+      if (client.address === undefined || client.address === null || !Util.isValidIPv4(client.address)) {
+        const usedAddresses = new Set(Object.values(config.clients)
+          .map((candidate) => candidate.address)
+          .filter(Boolean));
+        const host = Array.from({ length: 253 }, (_, offset) => offset + 2)
+          .find((value) => !usedAddresses.has(this.__serverSettings.defaultAddress.replace('x', value)));
+        if (host === undefined) throw new Error('Maximum number of clients reached.');
+        client.address = this.__serverSettings.defaultAddress.replace('x', host);
+      }
     }
 
     if (this.__serverSettings.enableIpv6 && !config.server.addressV6) {
@@ -1151,6 +1169,11 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
             }
             if (client.updatedAt === undefined || client.updatedAt === null || !isValidDate(client.updatedAt)) {
               client.updatedAt = new Date().toISOString();
+            } else {
+              // Restoring is itself a change: bump updatedAt (never roll it
+              // backwards) so open editors' expectedUpdatedAt checks fail
+              // loudly instead of silently diverging from the restored state.
+              client.updatedAt = new Date(Math.max(Date.parse(client.updatedAt), Date.now())).toISOString();
             }
             if (!Array.isArray(client.portForwards)) client.portForwards = [];
             if (client.networkPolicy === undefined || client.networkPolicy === null) {
@@ -1332,7 +1355,9 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         });
         this.__serverSettings = previous;
         this.__config = previousConfig;
+        let configRollbackFailed = false;
         await this.__saveConfig(previousConfig).catch((rollbackErr) => {
+          configRollbackFailed = true;
           rollbackErrors.push(`Settings config rollback failed: ${rollbackErr.message}`);
         });
         await this.__ensureNftablesSetup()
@@ -1343,9 +1368,16 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         await this.__bringWireGuardUp().catch((rollbackErr) => {
           rollbackErrors.push(`WireGuard settings rollback failed: ${rollbackErr.message}`);
         });
-        await this.__completeSettingsTransaction().catch((rollbackErr) => {
-          rollbackErrors.push(`Settings journal rollback failed: ${rollbackErr.message}`);
-        });
+        if (configRollbackFailed) {
+          // The disk still holds the candidate config. Keep the journal: boot
+          // recovery rewrites wg0.json from previousConfig, which is the only
+          // remaining way to converge disk, settings and live state.
+          debug('Settings journal kept after a failed config rollback.');
+        } else {
+          await this.__completeSettingsTransaction().catch((rollbackErr) => {
+            rollbackErrors.push(`Settings journal rollback failed: ${rollbackErr.message}`);
+          });
+        }
         err.rollbackErrors = rollbackErrors;
         if (rollbackErrors.length) err.data = { rollbackFailed: true };
         throw err;
@@ -1595,7 +1627,13 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   }
 
   async __removePortForward(clientId, index) {
+    if (!Number.isInteger(index) || index < 0) {
+      throw new ServerError('Invalid index', 400);
+    }
     if (process.platform !== 'linux') {
+      if (!Array.isArray(DUMMY_CLIENT_PREVIEW.portForwards) || DUMMY_CLIENT_PREVIEW.portForwards.length <= index) {
+        throw new ServerError('Port forward rule not found', 404);
+      }
       debug('Preview: Simulated removing port forward');
       DUMMY_CLIENT_PREVIEW.portForwards.splice(index, 1);
       return;
@@ -1604,22 +1642,21 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     const client = config.clients[clientId];
     if (!client) throw new ServerError(`Client not found: ${clientId}`, 404);
 
-    if (!Number.isInteger(index) || index < 0) {
-      throw new ServerError('Invalid index', 400);
+    // An out-of-range index must fail like updatePortForward does: returning
+    // success for a no-op masks drift and breaks retry/idempotency assumptions.
+    if (!Array.isArray(client.portForwards) || client.portForwards.length <= index) {
+      throw new ServerError('Port forward rule not found', 404);
     }
-
-    if (Array.isArray(client.portForwards) && client.portForwards.length > index) {
-      const ruleToRemove = client.portForwards[index];
-      await this.__transactionalDnatChange(
-        () => {
-          client.portForwards.splice(index, 1);
-        },
-        () => {
-          client.portForwards.splice(index, 0, ruleToRemove);
-        },
-        'remove-port-forward',
-      );
-    }
+    const ruleToRemove = client.portForwards[index];
+    await this.__transactionalDnatChange(
+      () => {
+        client.portForwards.splice(index, 1);
+      },
+      () => {
+        client.portForwards.splice(index, 0, ruleToRemove);
+      },
+      'remove-port-forward',
+    );
   }
 
   async updatePortForward(clientId, index, proto, extPort, intPort) {
