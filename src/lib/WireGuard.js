@@ -45,6 +45,16 @@ const RESERVED_CLIENT_IDS = new Set(['__proto__', 'constructor', 'prototype']);
 const SERVER_SETTING_KEYS = ['host', 'port', 'configPort', 'device', 'defaultDns',
   'defaultAddress', 'defaultAddressV6', 'enableIpv6', 'mtu', 'allowedIps',
   'persistentKeepalive', 'portFwdMin', 'portFwdMax'];
+// Settings that must never be echoed by the server-config API. None of the
+// current settings are secret, but when new secret-bearing settings are added
+// to SERVER_SETTING_KEYS (e.g. v2.1 webhook/Bearer secrets) they MUST be
+// listed here so GET/PUT responses cannot leak them.
+const HIDDEN_SERVER_SETTING_KEYS = new Set(['webhookSecret', 'webhookUrl', 'tokenHash', 'tokenCreatedAt']);
+
+const serializeServerSettingsPublic = (settings) => Object.fromEntries(
+  Object.entries(settings).filter(([key]) => SERVER_SETTING_KEYS.includes(key)
+    && !HIDDEN_SERVER_SETTING_KEYS.has(key)),
+);
 
 const isPlainObject = (value) => value !== null
   && typeof value === 'object'
@@ -1299,7 +1309,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     // committed state (which also loads them from disk on first call).
     return this.__withMutation(async () => {
       await this.getConfig();
-      return { ...this.__serverSettings };
+      return serializeServerSettingsPublic(this.__serverSettings);
     });
   }
 
@@ -1384,7 +1394,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       }
 
       debug('Server settings updated, applied and persisted.');
-      return { ...this.__serverSettings };
+      return serializeServerSettingsPublic(this.__serverSettings);
     });
   }
 

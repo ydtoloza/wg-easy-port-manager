@@ -40,7 +40,11 @@ RUN apk add --no-cache \
     conntrack-tools
 
 # Set Environment
-ENV DEBUG=Server,WireGuard
+# Debug logging is opt-in (docker run -e DEBUG=Server,WireGuard ...). It is
+# deliberately not baked into production images: debug output is not audited
+# as secret-free, and future settings (e.g. webhook secrets) must never risk
+# being logged by default.
+ENV DEBUG=
 
 # Run Web UI
 WORKDIR /app
