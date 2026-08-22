@@ -4,6 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('path');
 const debug = require('debug')('WireGuard');
 const crypto = require('node:crypto');
+const { AsyncLocalStorage } = require('node:async_hooks');
 const QRCode = require('qrcode');
 
 const Util = require('./Util');
@@ -93,6 +94,11 @@ const DUMMY_CLIENT_PREVIEW = {
   networkPolicy: createDefaultNetworkPolicy(),
 };
 
+// Tracks which WireGuard instance's mutation is currently executing so that
+// re-entrant __withMutation calls (the deadlock pattern) can be told apart
+// from unrelated callers enqueueing work while a mutation runs.
+const mutationContext = new AsyncLocalStorage();
+
 module.exports = class WireGuard {
 
   constructor() {
@@ -114,19 +120,39 @@ module.exports = class WireGuard {
     };
     this.__config = null;
     this.__initPromise = null;
+    this.__buildPromise = null;
     this.__mutationQueue = Promise.resolve();
+    this.__activeMutation = false;
     this.__settingsRecoveryPending = false;
     this.__settingsRecoveryConfig = null;
   }
 
+  // Serializes every state change (and read snapshots, see the public read
+  // methods) behind a single promise chain. A queued operation that re-enters
+  // this method would await its own tail and hang every future mutation, so
+  // re-entrancy from inside a running operation is rejected (external callers
+  // may keep enqueueing while an operation runs).
   __withMutation(operation) {
-    const run = this.__mutationQueue.then(operation, operation);
+    if (mutationContext.getStore() === this) {
+      return Promise.reject(new ServerError(
+        'Concurrent mutation re-entrancy detected: use the internal (__-prefixed) variant inside queued operations',
+        500,
+      ));
+    }
+    const run = this.__mutationQueue.then(async () => mutationContext.run(this, operation));
     this.__mutationQueue = run.catch(() => {});
     return run;
   }
 
   async waitForMutations() {
-    await this.__mutationQueue;
+    // Drain to quiescence: operations enqueued while we are awaiting must also
+    // settle (Shutdown downs the interface right after this resolves).
+    let tail = this.__mutationQueue;
+    for (;;) {
+      await tail;
+      if (this.__mutationQueue === tail) return;
+      tail = this.__mutationQueue;
+    }
   }
 
   __normalizeServerSettings(settings, base = this.__serverSettings, strict = false) {
@@ -563,7 +589,14 @@ module.exports = class WireGuard {
 
   async getConfig() {
     if (!this.__config) {
-      await this.__buildConfig();
+      // Memoize the build so concurrent first calls cannot each generate a
+      // (different) server keypair on a fresh install.
+      if (!this.__buildPromise) {
+        this.__buildPromise = this.__buildConfig().finally(() => {
+          this.__buildPromise = null;
+        });
+      }
+      await this.__buildPromise;
     }
     return this.__config;
   }
@@ -729,62 +762,68 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
       return [DUMMY_CLIENT_PREVIEW];
     }
 
-    const config = await this.getConfig();
-    const clients = Object.entries(config.clients).map(([clientId, client]) => ({
-      id: clientId,
-      name: client.name,
-      enabled: client.enabled,
-      address: client.address,
-      publicKey: client.publicKey,
-      createdAt: new Date(client.createdAt),
-      updatedAt: new Date(client.updatedAt),
-      allowedIPs: client.allowedIPs || [`${client.address}/32`, (this.__serverSettings.enableIpv6 && client.addressV6 ? `${client.addressV6}/128` : null)].filter(Boolean),
-      addressV6: client.addressV6,
-      portForwards: Array.isArray(client.portForwards) ? client.portForwards : [],
-      networkPolicy: this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false }),
-      downloadableConfig: 'privateKey' in client && client.privateKey != null,
-      persistentKeepalive: null,
-      latestHandshakeAt: null,
-      transferRx: null,
-      transferTx: null,
-    }));
+    // Serialized behind the mutation queue so clients can never observe
+    // half-applied (or later rolled-back) in-memory state.
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      const clients = Object.entries(config.clients).map(([clientId, client]) => ({
+        id: clientId,
+        name: client.name,
+        enabled: client.enabled,
+        address: client.address,
+        publicKey: client.publicKey,
+        createdAt: new Date(client.createdAt),
+        updatedAt: new Date(client.updatedAt),
+        allowedIPs: client.allowedIPs || [`${client.address}/32`, (this.__serverSettings.enableIpv6 && client.addressV6 ? `${client.addressV6}/128` : null)].filter(Boolean),
+        addressV6: client.addressV6,
+        portForwards: Array.isArray(client.portForwards)
+          ? client.portForwards.map((rule) => ({ ...rule }))
+          : [],
+        networkPolicy: this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false }),
+        downloadableConfig: 'privateKey' in client && client.privateKey != null,
+        persistentKeepalive: null,
+        latestHandshakeAt: null,
+        transferRx: null,
+        transferTx: null,
+      }));
 
-    // Loop WireGuard status
-    try {
-      const dump = await Util.exec('wg show wg0 dump', {
-        log: false,
-      });
-      dump
-        .trim()
-        .split('\n')
-        .slice(1)
-        .forEach((line) => {
-          const [
-            publicKey,
-            preSharedKey, // eslint-disable-line no-unused-vars
-            endpoint, // eslint-disable-line no-unused-vars
-            allowedIps, // eslint-disable-line no-unused-vars
-            latestHandshakeAt,
-            transferRx,
-            transferTx,
-            persistentKeepalive,
-          ] = line.split('\t');
-
-          const client = clients.find((c) => c.publicKey === publicKey);
-          if (!client) return;
-
-          client.latestHandshakeAt = latestHandshakeAt === '0'
-            ? null
-            : new Date(Number(`${latestHandshakeAt}000`));
-          client.transferRx = Number(transferRx);
-          client.transferTx = Number(transferTx);
-          client.persistentKeepalive = persistentKeepalive;
+      // Loop WireGuard status
+      try {
+        const dump = await Util.exec('wg show wg0 dump', {
+          log: false,
         });
-    } catch (err) {
-      debug(`Warning: Could not fetch wireguard dump: ${err.message}`);
-    }
+        dump
+          .trim()
+          .split('\n')
+          .slice(1)
+          .forEach((line) => {
+            const [
+              publicKey,
+              preSharedKey, // eslint-disable-line no-unused-vars
+              endpoint, // eslint-disable-line no-unused-vars
+              allowedIps, // eslint-disable-line no-unused-vars
+              latestHandshakeAt,
+              transferRx,
+              transferTx,
+              persistentKeepalive,
+            ] = line.split('\t');
 
-    return clients;
+            const client = clients.find((c) => c.publicKey === publicKey);
+            if (!client) return;
+
+            client.latestHandshakeAt = latestHandshakeAt === '0'
+              ? null
+              : new Date(Number(`${latestHandshakeAt}000`));
+            client.transferRx = Number(transferRx);
+            client.transferTx = Number(transferTx);
+            client.persistentKeepalive = persistentKeepalive;
+          });
+      } catch (err) {
+        debug(`Warning: Could not fetch wireguard dump: ${err.message}`);
+      }
+
+      return clients;
+    });
   }
 
   async getClient({ clientId }) {
@@ -802,10 +841,13 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
   }
 
   async getClientConfiguration({ clientId }) {
-    const config = await this.getConfig();
-    const client = await this.getClient({ clientId });
+    // Serialized behind the mutation queue: a .conf handed to a device must
+    // reflect fully committed state, never a mid-mutation mix.
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      const client = await this.getClient({ clientId });
 
-    return `
+      return `
 [Interface]
 PrivateKey = ${client.privateKey ? `${client.privateKey}` : 'REPLACE_ME'}
 Address = ${client.address}/24${this.__serverSettings.enableIpv6 && client.addressV6 ? `, ${client.addressV6}/128` : ''}
@@ -818,6 +860,7 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
 }AllowedIPs = ${this.__serverSettings.allowedIps}
 PersistentKeepalive = ${this.__serverSettings.persistentKeepalive}
 Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
+    });
   }
 
   async getClientQRCodeSVG({ clientId }) {
@@ -1087,13 +1130,6 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     });
   }
 
-  async __reloadConfig() {
-    // Clear cache to force re-read from disk (needed after restoreConfiguration)
-    this.__config = null;
-    await this.__buildConfig();
-    await this.__syncConfig();
-  }
-
   async restoreConfiguration(config) {
     return this.__withMutation(async () => {
       debug('Starting configuration restore process.');
@@ -1214,8 +1250,12 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
   async backupConfiguration() {
     debug('Starting configuration backup.');
-    const config = await this.getConfig();
-    const backup = JSON.stringify(config, null, 2);
+    // Serialized behind the mutation queue so the backup is a consistent
+    // snapshot of committed state.
+    const backup = await this.__withMutation(async () => {
+      const config = await this.getConfig();
+      return JSON.stringify(config, null, 2);
+    });
     debug('Configuration backup completed.');
     return backup;
   }
@@ -1232,9 +1272,12 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   // ── Server Settings (Global IP Config) ──────────────────────────
 
   async getServerConfig() {
-    // Ensure config is loaded (which also loads settings)
-    await this.getConfig();
-    return { ...this.__serverSettings };
+    // Serialized behind the mutation queue so settings are read from a fully
+    // committed state (which also loads them from disk on first call).
+    return this.__withMutation(async () => {
+      await this.getConfig();
+      return { ...this.__serverSettings };
+    });
   }
 
   async updateServerConfig(settings) {

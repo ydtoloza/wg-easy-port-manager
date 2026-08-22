@@ -641,4 +641,95 @@ describe('WireGuard', () => {
       expect(clients[0].latestHandshakeAt).toBeNull();
     });
   });
+
+  describe('mutation queue consistency', () => {
+    it('builds the config exactly once for concurrent first calls', async () => {
+      fs.readFile.mockImplementation(async () => {
+        const err = new Error('not found');
+        err.code = 'ENOENT';
+        throw err;
+      });
+      let release;
+      const gate = new Promise((resolve) => {
+        release = resolve;
+      });
+      Util.exec.mockImplementation(async (cmd) => {
+        if (cmd === 'wg genkey') {
+          await gate;
+          return KEYS.serverPrivate;
+        }
+        return '';
+      });
+      Util.execFile.mockImplementation(async () => KEYS.serverPublic);
+
+      const builds = [wg.getConfig(), wg.getConfig()];
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      release();
+      const [first, second] = await Promise.all(builds);
+
+      expect(second).toBe(first);
+      expect(Util.exec.mock.calls.filter(([cmd]) => cmd === 'wg genkey')).toHaveLength(1);
+    });
+
+    it('rejects nested mutation wrappers instead of deadlocking', async () => {
+      await expect(wg.__withMutation(() => wg.__withMutation(async () => {})))
+        .rejects.toThrow(ServerError);
+    });
+
+    it('waits for operations enqueued while draining', async () => {
+      let release;
+      const gate = new Promise((resolve) => {
+        release = resolve;
+      });
+      let secondDone = false;
+      const first = wg.__withMutation(async () => {
+        await gate;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+
+      const drain = wg.waitForMutations();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+
+      release();
+      // The slow late operation must also settle before the drain resolves —
+      // otherwise Shutdown() would down the interface mid-mutation.
+      const second = wg.__withMutation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        secondDone = true;
+      });
+      await first;
+
+      await drain;
+      const settledWhenDrainReturned = secondDone;
+      await second;
+      expect(settledWhenDrainReturned).toBe(true);
+    });
+
+    it('serves reads only after in-flight mutations commit or roll back', async () => {
+      await wg.getConfig();
+      let rejectSync;
+      const gate = new Promise((_, reject) => {
+        rejectSync = reject;
+      });
+      Util.exec.mockImplementationOnce(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg syncconf')) return gate;
+        return '';
+      });
+
+      // The rename is applied in memory, then the commit stalls at wg syncconf.
+      const update = wg.updateClientName({ clientId: 'client1', name: 'renamed' });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // A concurrent read must not observe the uncommitted name...
+      const clientsPromise = wg.getClients();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // ...and after the commit fails and rolls back, the read sees the
+      // original name rather than state that never persisted.
+      rejectSync(new Error('sync failed'));
+      await update.catch(() => {});
+      const clients = await clientsPromise;
+      expect(clients.find((client) => client.id === 'client1').name).toBe('client1');
+    });
+  });
 });
