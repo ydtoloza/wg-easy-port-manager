@@ -31,7 +31,12 @@ class API {
     }
 
     if (!res.ok) {
-      throw new Error((json && (json.error || json.message)) || res.statusText);
+      // Error bodies may be `{ error: 'message' }`, an envelope
+      // `{ error: { code, message } }`, `{ message }` or plain text.
+      const envelope = json && typeof json.error === 'object' && json.error !== null
+        ? (json.error.message || json.error.code)
+        : (json && (json.error || json.message));
+      throw new Error(envelope || res.statusText);
     }
 
     return json;
