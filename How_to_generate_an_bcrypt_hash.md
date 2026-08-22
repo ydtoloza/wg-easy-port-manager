@@ -3,7 +3,7 @@
 The panel requires a bcrypt password hash with cost 10 to 15. Generate one with the image helper:
 
 ```sh
-docker run --rm ghcr.io/ydtoloza/wg-easy-port-manager wgpw 'YOUR_PASSWORD'
+docker run --rm ghcr.io/ydtoloza/wg-easy-port-manager:2.0.0 wgpw 'YOUR_PASSWORD'
 ```
 
 The command prints a value similar to:

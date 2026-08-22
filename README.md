@@ -1,6 +1,6 @@
 # WG-Easy Port Manager (Advanced Fork)
 
-[![Build & Publish Latest](https://github.com/ydtoloza/wg-easy-port-manager/actions/workflows/deploy.yml/badge.svg)](https://github.com/ydtoloza/wg-easy-port-manager/actions/workflows/deploy.yml)
+[![Build and publish image](https://github.com/ydtoloza/wg-easy-port-manager/actions/workflows/deploy.yml/badge.svg)](https://github.com/ydtoloza/wg-easy-port-manager/actions/workflows/deploy.yml)
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 ![GitHub repo size](https://img.shields.io/github/repo-size/ydtoloza/wg-easy-port-manager)
 ![GitHub last commit](https://img.shields.io/github/last-commit/ydtoloza/wg-easy-port-manager)
@@ -19,6 +19,8 @@
 
 <a name="español"></a>
 ## 🇪🇸 Español
+
+Versión estable actual: `2.0.0`. Consulta [Despliegue en VPS](docs/vps-deployment.md) y [CI y releases](docs/ci-and-releases.md).
 
 > **Aviso**: Este proyecto es un fork especializado del [wg-easy](https://github.com/wg-easy/wg-easy) original de Weejewel. Este fork introduce características avanzadas de red y mejoras en la interfaz que no están presentes en el repositorio original, diseñadas específicamente para usuarios avanzados que requieren una gestión profesional de redireccionamiento de puertos.
 
@@ -56,7 +58,7 @@ volumes:
 
 services:
   wg-easy-port-manager:
-    image: ghcr.io/ydtoloza/wg-easy-port-manager:latest
+    image: ghcr.io/ydtoloza/wg-easy-port-manager:${IMAGE_TAG:-2.0.0}
     container_name: wg-easy-port-manager
     env_file: .env
     environment:
@@ -82,12 +84,14 @@ services:
 
 > **Configuración obligatoria**: No uses contraseñas en texto plano y **nunca subas tu hash real al repositorio**. Copia `.env.example` a `.env`, genera `PASSWORD_HASH` con `wgpw` y `SESSION_SECRET` con `openssl rand -hex 32`. Escribe el hash entre comillas simples en `.env` para que Compose no interprete sus símbolos `$`.
 
-Consulta [Security and Operations](docs/security-and-operations.md) para TLS, proxy inverso, backups, recuperación y limitaciones operativas.
+Consulta [Despliegue en VPS](docs/vps-deployment.md) para instalación, actualización y rollback, y [Security and Operations](docs/security-and-operations.md) para TLS, backups y limitaciones operativas.
 
 ---
 
 <a name="english"></a>
 ## 🇺🇸 English
+
+Current stable version: `2.0.0`. See [VPS deployment](docs/vps-deployment.md) and [CI and releases](docs/ci-and-releases.md).
 
 > **Disclaimer**: This project is a specialized fork of the original [wg-easy](https://github.com/wg-easy/wg-easy) by Weejewel. This fork introduces advanced networking features and interface enhancements not present in the upstream repository, specifically tailored for power users requiring advanced port forwarding management.
 
@@ -125,7 +129,7 @@ volumes:
 
 services:
   wg-easy-port-manager:
-    image: ghcr.io/ydtoloza/wg-easy-port-manager:latest
+    image: ghcr.io/ydtoloza/wg-easy-port-manager:${IMAGE_TAG:-2.0.0}
     container_name: wg-easy-port-manager
     env_file: .env
     environment:
@@ -151,7 +155,7 @@ services:
 
 > **Required configuration**: Never use plain-text passwords and **never commit your real hash**. Copy `.env.example` to `.env`, generate `PASSWORD_HASH` with `wgpw`, and generate `SESSION_SECRET` with `openssl rand -hex 32`. Put the hash in single quotes in `.env` so Compose does not interpret its `$` characters.
 
-See [Security and Operations](docs/security-and-operations.md) for TLS, reverse proxy, backup, recovery and operational limitations.
+See [VPS deployment](docs/vps-deployment.md) for installation, upgrades and rollback, and [Security and Operations](docs/security-and-operations.md) for TLS, backups and operational limitations.
 
 ---
 

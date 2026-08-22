@@ -13,7 +13,7 @@ The process validates security settings before starting WireGuard. Startup fails
 Generate values with:
 
 ```sh
-docker run --rm ghcr.io/ydtoloza/wg-easy-port-manager wgpw 'YOUR_PASSWORD'
+docker run --rm ghcr.io/ydtoloza/wg-easy-port-manager:2.0.0 wgpw 'YOUR_PASSWORD'
 openssl rand -hex 32
 ```
 
@@ -97,3 +97,5 @@ npm audit --omit=dev
 ```
 
 Test actual WireGuard and nftables behavior only in a disposable Linux host or network namespace. The integration changes host routing and firewall state.
+
+For production installation, upgrades and rollback, follow [VPS deployment](vps-deployment.md). The image publication and release lifecycle is documented in [CI and releases](ci-and-releases.md).

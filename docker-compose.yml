@@ -3,16 +3,16 @@ volumes:
 
 services:
   wg-easy-port-manager:
-    image: ghcr.io/ydtoloza/wg-easy-port-manager:latest
+    image: ghcr.io/ydtoloza/wg-easy-port-manager:${IMAGE_TAG:-2.0.0}
     container_name: wg-easy-port-manager
     env_file: .env
     environment:
-      - LANG=es
-      - WG_HOST=${WG_HOST}
-      - PASSWORD_HASH=${PASSWORD_HASH:?Set PASSWORD_HASH en .env (genera uno con: docker run --rm ghcr.io/ydtoloza/wg-easy-port-manager wgpw TU_PASSWORD)}
-      - SESSION_SECRET=${SESSION_SECRET:?Set SESSION_SECRET en .env con al menos 32 bytes aleatorios}
-      - WG_PERSISTENT_KEEPALIVE=25
-      - WG_DEVICE=eth0
+      LANG: ${WG_EASY_LANG:-es}
+      WG_HOST: ${WG_HOST:?Set WG_HOST in .env}
+      PASSWORD_HASH: ${PASSWORD_HASH:?Set PASSWORD_HASH in .env}
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in .env}
+      WG_PERSISTENT_KEEPALIVE: ${WG_PERSISTENT_KEEPALIVE:-25}
+      WG_DEVICE: ${WG_DEVICE:-eth0}
 
     volumes:
       - etc_wireguard:/etc/wireguard
