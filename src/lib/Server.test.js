@@ -3,6 +3,19 @@
 'use strict';
 
 const { once } = require('node:events');
+const http = require('node:http');
+
+jest.mock('bcryptjs', () => {
+  const actual = jest.requireActual('bcryptjs');
+  return {
+    hashSync: actual.hashSync,
+    compare: (password, hash) => {
+      // Tests can freeze password checks to hold concurrency slots open.
+      if (!globalThis.__deferPasswordCompares) return actual.compare(password, hash);
+      return new Promise((resolve) => globalThis.__pendingPasswordCompares.push(resolve));
+    },
+  };
+});
 
 jest.mock('../config', () => ({
   PORT: 0,
@@ -11,7 +24,7 @@ jest.mock('../config', () => ({
   PASSWORD_HASH: require('bcryptjs').hashSync('correct-password', 10), // eslint-disable-line global-require
   SESSION_SECRET: '0123456789abcdef0123456789abcdef',
   SESSION_COOKIE_SECURE: false,
-  TRUSTED_PROXY_IP: undefined,
+  TRUSTED_PROXY_IP: '127.0.0.1',
   LANG: 'es',
   UI_TRAFFIC_STATS: false,
   UI_CHART_TYPE: 0,
@@ -29,6 +42,21 @@ jest.mock('../services/WireGuard', () => ({
 
 const WireGuard = require('../services/WireGuard');
 const Server = require('./Server');
+
+const postSession = (baseUrl, forwardedFor) => new Promise((resolve, reject) => {
+  const request = http.request(`${baseUrl}/api/session`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(forwardedFor ? { 'X-Forwarded-For': forwardedFor } : {}),
+    },
+  }, (response) => {
+    response.resume();
+    resolve(response.statusCode);
+  });
+  request.on('error', reject);
+  request.end(JSON.stringify({ password: 'wrong-password' }));
+});
 
 describe('HTTP server security', () => {
   let instance;
@@ -132,6 +160,36 @@ describe('HTTP server security', () => {
       expect(JSON.stringify(body)).not.toContain('internal rollback details');
     } finally {
       consoleError.mockRestore();
+    }
+  });
+
+  it('does not let one IP lock out logins from another IP', async () => {
+    // Hold every concurrent password-check slot the attacker IP can get by
+    // freezing its bcrypt comparisons mid-flight.
+    globalThis.__deferPasswordCompares = true;
+    globalThis.__pendingPasswordCompares = [];
+    const attackers = Array.from({ length: 8 }, () => postSession(baseUrl, '203.0.113.2'));
+    const waitFor = async (predicate, what) => {
+      for (let i = 0; i < 400 && !predicate(); i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      if (!predicate()) throw new Error(`timed out waiting for ${what}`);
+    };
+
+    try {
+      await waitFor(() => globalThis.__pendingPasswordCompares.length === 8, 'attacker slots to be held');
+
+      // A different IP must still be able to start a password check: its
+      // comparison gets a slot instead of a global 429.
+      const honest = postSession(baseUrl, '203.0.113.9');
+      await waitFor(() => globalThis.__pendingPasswordCompares.length === 9, 'honest password check to start');
+      globalThis.__pendingPasswordCompares[8](false);
+      expect(await honest).toBe(401);
+    } finally {
+      for (const resolve of globalThis.__pendingPasswordCompares.splice(0)) resolve(false);
+      await Promise.all(attackers);
+      globalThis.__deferPasswordCompares = false;
     }
   });
 
