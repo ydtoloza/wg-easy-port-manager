@@ -62,6 +62,8 @@ jest.mock('../config', () => ({
   WG_POST_DOWN: '',
   WG_PORT_FWD_MIN: '1024',
   WG_PORT_FWD_MAX: '65535',
+  WG_NFT_MASQUERADE: true,
+  WG_SEED_TUNING: true,
 }));
 
 describe('WireGuard', () => {

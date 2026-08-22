@@ -25,6 +25,8 @@ module.exports.WG_MTU = process.env.WG_MTU || null;
 module.exports.WG_PORT_FWD_MIN = process.env.WG_PORT_FWD_MIN || '1024';
 module.exports.WG_PORT_FWD_MAX = process.env.WG_PORT_FWD_MAX || '65535';
 module.exports.WG_PERSISTENT_KEEPALIVE = process.env.WG_PERSISTENT_KEEPALIVE || '0';
+module.exports.WG_NFT_MASQUERADE = process.env.WG_NFT_MASQUERADE ? isTrue(process.env.WG_NFT_MASQUERADE) : true;
+module.exports.WG_SEED_TUNING = process.env.WG_SEED_TUNING ? isTrue(process.env.WG_SEED_TUNING) : true;
 module.exports.WG_DEFAULT_ADDRESS = process.env.WG_DEFAULT_ADDRESS || '10.8.0.x';
 module.exports.WG_DEFAULT_ADDRESS_V6 = process.env.WG_DEFAULT_ADDRESS_V6 || 'fd42:42:42::x';
 module.exports.WG_DEFAULT_DNS = typeof process.env.WG_DEFAULT_DNS === 'string'

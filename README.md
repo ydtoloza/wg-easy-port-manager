@@ -37,6 +37,7 @@ Este fork mantiene la simplicidad de la interfaz original de WireGuard e introdu
 *   **Estabilidad Mejorada**: Se corrigieron condiciones de carrera (race conditions) durante la inicialización de WireGuard, asegurando un arranque mucho más estable.
 *   **Gestión de Sesiones Robusta**: Se resolvieron problemas de bloqueos silenciosos durante el inicio de sesión y caídas de tokens de autenticación en entornos con proxy inverso o alta latencia.
 *   **Soporte para Modo de Red Host**: Optimizado para ejecutarse con `network_mode: "host"` para obtener el máximo rendimiento.
+*   **Optimizado para Seeding qBittorrent**: `WG_MTU` ahora se aplica al servidor `wg0` (`MTU=`), `txqueuelen 5000`, `masquerade` atómico via `nft` (`WG_NFT_MASQUERADE`), `BBR/fq` y buffers `16M` + `conntrack_max 262144` via `scripts/host-tune.sh`. Ver `docs/qbittorrent-seed.md`.
 
 ### 🛠 Instalación y Despliegue
 
@@ -108,6 +109,7 @@ This fork maintains the simplicity of the original WireGuard UI while injecting 
 *   **Enhanced Stability**: Fixed underlying race conditions during WireGuard initialization, ensuring a smoother startup sequence.
 *   **Robust Session Management**: Resolved silent hanging issues during login and authentication token drops in reverse-proxy or high-latency environments.
 *   **Host Network Mode Support**: Optimized to run with `network_mode: "host"` for maximum performance and reduced overhead.
+*   **Optimized for qBittorrent Seeding**: Server `MTU` applied to `wg0`, `txqueuelen 5000`, atomic `nft` masquerade (`WG_NFT_MASQUERADE`), `BBR/fq` and `16M` buffers + `conntrack_max 262144` via `scripts/host-tune.sh`. See `docs/qbittorrent-seed.md`.
 
 ### 🛠 Installation & Deployment
 

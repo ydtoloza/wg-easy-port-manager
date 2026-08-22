@@ -92,8 +92,19 @@ WG_DEFAULT_ADDRESS=10.8.0.x
 WG_DEFAULT_ADDRESS_V6=fd42:42:42::x
 WG_DEFAULT_DNS=1.1.1.1
 WG_ALLOWED_IPS=0.0.0.0/0, ::/0
-WG_MTU=1420
+WG_MTU=1420   # ahora se aplica al servidor wg0 (MTU=) y al peer; usa 1280 si hay PPPoE
+WG_NFT_MASQUERADE=true
+WG_SEED_TUNING=true
 ```
+
+For seeding on private trackers with qBittorrent, apply host tuning once:
+
+```sh
+WG_DEVICE=eth0 sudo bash scripts/host-tune.sh --apply
+sudo bash scripts/host-tune.sh --check
+```
+
+See `docs/qbittorrent-seed.md` for the full qBittorrent preset (port forwarding Both, interface wg0, conntrack/BBR checks).
 
 ## Firewall and HTTPS
 

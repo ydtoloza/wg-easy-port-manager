@@ -20,3 +20,6 @@ services:
       - PASSWORD_HASH=${PASSWORD_HASH:?Set PASSWORD_HASH in .env}
       - SESSION_SECRET=${SESSION_SECRET:?Set SESSION_SECRET in .env}
       - WG_HOST=192.168.1.233
+      - WG_MTU=1420
+      - WG_NFT_MASQUERADE=true
+      - WG_SEED_TUNING=true

@@ -34,7 +34,10 @@ RUN apk add --no-cache \
     dumb-init \
     iptables \
     nftables \
-    wireguard-tools
+    wireguard-tools \
+    iproute2 \
+    procps \
+    conntrack-tools
 
 # Set Environment
 ENV DEBUG=Server,WireGuard

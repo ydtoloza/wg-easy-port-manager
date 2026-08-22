@@ -16,6 +16,8 @@ EnvironmentFile=/etc/wg-easy/wg-easy.env
 #Environment="WG_ALLOWED_IPS=0.0.0.0/0,::/0"
 #Environment="WG_MTU=1420"
 #Environment="WG_PERSISTENT_KEEPALIVE=25"
+#Environment="WG_NFT_MASQUERADE=true"
+#Environment="WG_SEED_TUNING=true"
 
 Type=simple
 RemainAfterExit=no
