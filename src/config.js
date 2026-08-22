@@ -1,6 +1,10 @@
 'use strict';
 
+const { isIP } = require('node:net');
+
 const { release: { version } } = require('./package.json');
+
+const isTrue = (value) => value === 'true' || value === '1';
 
 module.exports.RELEASE = version;
 module.exports.PORT = process.env.PORT || '51821';
@@ -9,6 +13,9 @@ module.exports.WEBUI_HOST = process.env.WEBUI_HOST || '0.0.0.0';
 module.exports.PASSWORD = process.env.PASSWORD;
 module.exports.PASSWORD_HASH = process.env.PASSWORD_HASH;
 module.exports.SESSION_SECRET = process.env.SESSION_SECRET;
+module.exports.SESSION_COOKIE_SECURE = isTrue(process.env.SESSION_COOKIE_SECURE);
+module.exports.TRUSTED_PROXY_IP = process.env.TRUSTED_PROXY_IP;
+module.exports.ALLOW_INSECURE_NO_AUTH = isTrue(process.env.ALLOW_INSECURE_NO_AUTH);
 module.exports.WG_PATH = process.env.WG_PATH || '/etc/wireguard/';
 module.exports.WG_DEVICE = process.env.WG_DEVICE || 'eth0';
 module.exports.WG_HOST = process.env.WG_HOST;
@@ -47,5 +54,35 @@ ip6tables -D FORWARD -i wg0 -j ACCEPT;
 ip6tables -D FORWARD -o wg0 -j ACCEPT;
 `.split('\n').join(' ');
 module.exports.LANG = process.env.LANG || 'en';
-module.exports.UI_TRAFFIC_STATS = process.env.UI_TRAFFIC_STATS || 'false';
-module.exports.UI_CHART_TYPE = process.env.UI_CHART_TYPE || 0;
+module.exports.UI_TRAFFIC_STATS = isTrue(process.env.UI_TRAFFIC_STATS);
+module.exports.UI_CHART_TYPE = [0, 1, 2, 3].includes(Number(process.env.UI_CHART_TYPE))
+  ? Number(process.env.UI_CHART_TYPE)
+  : 0;
+
+module.exports.validateEnvironment = () => {
+  if (module.exports.PASSWORD) {
+    throw new Error('PASSWORD is not supported. Use PASSWORD_HASH instead.');
+  }
+
+  if (!module.exports.PASSWORD_HASH) {
+    const loopbackHosts = new Set(['127.0.0.1', '::1', 'localhost']);
+    if (!module.exports.ALLOW_INSECURE_NO_AUTH || !loopbackHosts.has(module.exports.WEBUI_HOST)) {
+      throw new Error('PASSWORD_HASH is required. Passwordless mode requires ALLOW_INSECURE_NO_AUTH=true and a loopback WEBUI_HOST.');
+    }
+  } else {
+    const bcryptMatch = /^\$2[aby]\$(\d{2})\$[./A-Za-z0-9]{53}$/.exec(module.exports.PASSWORD_HASH);
+    const cost = bcryptMatch ? Number(bcryptMatch[1]) : 0;
+    if (!bcryptMatch || cost < 10 || cost > 15) {
+      throw new Error('PASSWORD_HASH must be a valid bcrypt hash with cost 10-15.');
+    }
+  }
+
+  if (typeof module.exports.SESSION_SECRET !== 'string'
+    || Buffer.byteLength(module.exports.SESSION_SECRET, 'utf8') < 32) {
+    throw new Error('SESSION_SECRET must contain at least 32 bytes.');
+  }
+
+  if (module.exports.TRUSTED_PROXY_IP && !isIP(module.exports.TRUSTED_PROXY_IP)) {
+    throw new Error('TRUSTED_PROXY_IP must be a valid IP address.');
+  }
+};

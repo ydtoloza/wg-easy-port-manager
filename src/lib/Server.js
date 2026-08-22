@@ -1,9 +1,9 @@
 'use strict';
 
 const bcrypt = require('bcryptjs');
-const crypto = require('node:crypto');
 const { createServer } = require('node:http');
 const { stat, readFile } = require('node:fs/promises');
+const { isIP } = require('node:net');
 const { resolve, sep } = require('node:path');
 
 const expressSession = require('express-session');
@@ -13,12 +13,11 @@ const {
   createApp,
   createError,
   createRouter,
+  deleteCookie,
   defineEventHandler,
   fromNodeMiddleware,
   getRouterParam,
   toNodeListener,
-  readBody,
-  readRawBody,
   setHeader,
   send,
   serveStatic,
@@ -30,33 +29,64 @@ const {
   PORT,
   WEBUI_HOST,
   RELEASE,
-  PASSWORD,
   PASSWORD_HASH,
   SESSION_SECRET,
+  SESSION_COOKIE_SECURE,
+  TRUSTED_PROXY_IP,
   LANG,
   UI_TRAFFIC_STATS,
   UI_CHART_TYPE,
+  validateEnvironment,
 } = require('../config');
 
 const requiresPassword = !!PASSWORD_HASH;
 
-const SESSION_COOKIE_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
+const SESSION_COOKIE_MAX_AGE = 12 * 60 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS = 20; // per IP per window
 const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
 const MAX_BODY_SIZE = 1024 * 1024; // 1 MB
+const MAX_LOGIN_BUCKETS = 10000;
+const MAX_ACTIVE_PASSWORD_CHECKS = 8;
+const SESSION_COOKIE_NAME = 'connect.sid';
 
 // In-memory login rate limiter (key: client IP)
 const loginAttempts = new Map();
+let activePasswordChecks = 0;
 
-const isLoginRateLimited = (key) => {
+const getLoginAttempt = (key) => {
   const now = Date.now();
-  let entry = loginAttempts.get(key);
-  if (!entry || entry.resetAt <= now) {
-    entry = { count: 0, resetAt: now + LOGIN_WINDOW_MS };
+  const entry = loginAttempts.get(key);
+  if (entry && entry.resetAt <= now) {
+    loginAttempts.delete(key);
+    return null;
+  }
+  return entry || null;
+};
+
+const beginPasswordCheck = (key) => {
+  if (activePasswordChecks >= MAX_ACTIVE_PASSWORD_CHECKS) return false;
+  let entry = getLoginAttempt(key);
+  if (!entry) {
+    if (loginAttempts.size >= MAX_LOGIN_BUCKETS) {
+      loginAttempts.delete(loginAttempts.keys().next().value);
+    }
+    entry = { failures: 0, pending: 0, resetAt: Date.now() + LOGIN_WINDOW_MS };
     loginAttempts.set(key, entry);
   }
-  entry.count += 1;
-  return entry.count > LOGIN_MAX_ATTEMPTS;
+  if (entry.failures + entry.pending >= LOGIN_MAX_ATTEMPTS) return false;
+  entry.pending += 1;
+  activePasswordChecks += 1;
+  return true;
+};
+
+const completePasswordCheck = (key, valid) => {
+  activePasswordChecks = Math.max(0, activePasswordChecks - 1);
+  const entry = loginAttempts.get(key);
+  if (!entry) return;
+  entry.pending = Math.max(0, entry.pending - 1);
+  if (valid) entry.failures = 0;
+  else entry.failures += 1;
+  if (entry.pending === 0 && entry.failures === 0) loginAttempts.delete(key);
 };
 
 setInterval(() => {
@@ -69,20 +99,63 @@ setInterval(() => {
 }, LOGIN_WINDOW_MS).unref();
 
 const getClientIp = (req) => {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string') {
-    return forwarded.split(',')[0].trim() || req.socket.remoteAddress;
+  const peer = req.socket.remoteAddress || 'unknown';
+  if (TRUSTED_PROXY_IP && peer === TRUSTED_PROXY_IP) {
+    const forwarded = req.headers['x-forwarded-for'];
+    const candidate = typeof forwarded === 'string'
+      ? forwarded.split(',').at(-1).trim()
+      : '';
+    if (isIP(candidate)) return candidate;
   }
-  return req.socket.remoteAddress;
+  return peer;
 };
 
-// Read a JSON body with a hard size limit (prevents memory exhaustion).
+// Count bytes while streaming so oversized bodies are never fully buffered.
 const readBodyLimited = async (event) => {
-  const raw = await readRawBody(event);
-  if (raw && raw.length > MAX_BODY_SIZE) {
-    throw createError({ status: 413, message: 'Payload too large' });
+  const { req } = event.node;
+  const declaredLength = Number(req.headers['content-length']);
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_SIZE) {
+    req.resume();
+    throw createError({ statusCode: 413, message: 'Payload too large' });
   }
-  return readBody(event);
+
+  const raw = await new Promise((resolveBody, rejectBody) => {
+    let chunks = [];
+    let size = 0;
+    let settled = false;
+
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      rejectBody(err);
+    };
+
+    req.on('data', (chunk) => {
+      if (chunks === null) return;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buffer.length;
+      if (size > MAX_BODY_SIZE) {
+        chunks = null;
+        fail(createError({ statusCode: 413, message: 'Payload too large' }));
+        return;
+      }
+      chunks.push(buffer);
+    });
+    req.once('end', () => {
+      if (!settled && chunks !== null) {
+        settled = true;
+        resolveBody(Buffer.concat(chunks, size).toString('utf8'));
+      }
+    });
+    req.once('aborted', () => fail(createError({ statusCode: 400, message: 'Request aborted' })));
+    req.once('error', fail);
+  });
+
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    throw createError({ statusCode: 400, message: 'Invalid JSON', cause: err });
+  }
 };
 
 // Validate that cross-site requests cannot use the session cookie.
@@ -106,15 +179,15 @@ const isSameOrigin = (req) => {
  * If environment variable is not set, the password is always invalid.
  *
  * @param {string} password String to test
- * @returns {boolean} true if matching environment, otherwise false
+ * @returns {Promise<boolean>} true if matching environment, otherwise false
  */
-const isPasswordValid = (password) => {
-  if (typeof password !== 'string') {
+const isPasswordValid = async (password) => {
+  if (typeof password !== 'string' || Buffer.byteLength(password, 'utf8') > 72) {
     return false;
   }
 
   if (PASSWORD_HASH) {
-    return bcrypt.compareSync(password, PASSWORD_HASH);
+    return bcrypt.compare(password, PASSWORD_HASH);
   }
 
   return false;
@@ -122,18 +195,23 @@ const isPasswordValid = (password) => {
 
 module.exports = class Server {
 
-  constructor() {
+  constructor({ port = PORT, host = WEBUI_HOST } = {}) {
+    validateEnvironment();
+
     const app = createApp();
     this.app = app;
 
     app.use(fromNodeMiddleware(expressSession({
-      secret: SESSION_SECRET || crypto.randomBytes(256).toString('hex'),
-      resave: true,
+      name: SESSION_COOKIE_NAME,
+      secret: SESSION_SECRET,
+      proxy: !!TRUSTED_PROXY_IP,
+      resave: false,
       rolling: true,
       saveUninitialized: false,
       cookie: {
         httpOnly: true,
-        sameSite: 'lax',
+        sameSite: 'strict',
+        secure: SESSION_COOKIE_SECURE,
         maxAge: SESSION_COOKIE_MAX_AGE,
       },
     })));
@@ -143,12 +221,16 @@ module.exports = class Server {
       res.setHeader('X-Content-Type-Options', 'nosniff');
       res.setHeader('X-Frame-Options', 'DENY');
       res.setHeader('Referrer-Policy', 'same-origin');
+      if (req.url.startsWith('/api/')) {
+        res.setHeader('Cache-Control', 'no-store');
+      }
       res.setHeader('Content-Security-Policy', [
         "default-src 'self'",
         "script-src 'self'",
+        "script-src-attr 'none'",
         "style-src 'self' 'unsafe-inline'",
-        "img-src 'self' data: https://gravatar.com",
-        "connect-src 'self' https://wg-easy.github.io",
+        "img-src 'self' data:",
+        "connect-src 'self'",
         "font-src 'self' data:",
         "frame-ancestors 'none'",
         "base-uri 'self'",
@@ -176,7 +258,7 @@ module.exports = class Server {
     router
       .get('/api/release', defineEventHandler((event) => {
         setHeader(event, 'Content-Type', 'application/json');
-        return RELEASE;
+        return JSON.stringify(RELEASE);
       }))
 
       .get('/api/lang', defineEventHandler((event) => {
@@ -186,12 +268,12 @@ module.exports = class Server {
 
       .get('/api/ui-traffic-stats', defineEventHandler((event) => {
         setHeader(event, 'Content-Type', 'application/json');
-        return `"${UI_TRAFFIC_STATS}"`;
+        return JSON.stringify(UI_TRAFFIC_STATS);
       }))
 
       .get('/api/ui-chart-type', defineEventHandler((event) => {
         setHeader(event, 'Content-Type', 'application/json');
-        return `"${UI_CHART_TYPE}"`;
+        return JSON.stringify(UI_CHART_TYPE);
       }))
 
       // Authentication
@@ -207,13 +289,6 @@ module.exports = class Server {
       }))
       .post('/api/session', defineEventHandler(async (event) => {
         const ip = getClientIp(event.node.req);
-        if (isLoginRateLimited(ip)) {
-          throw createError({
-            status: 429,
-            message: 'Too many attempts, try again later',
-          });
-        }
-
         const { password } = await readBodyLimited(event);
 
         if (!requiresPassword) {
@@ -225,7 +300,16 @@ module.exports = class Server {
           });
         }
 
-        if (!isPasswordValid(password)) {
+        if (!beginPasswordCheck(ip)) {
+          throw createError({ statusCode: 429, message: 'Too many attempts, try again later' });
+        }
+        let passwordValid = false;
+        try {
+          passwordValid = await isPasswordValid(password);
+        } finally {
+          completePasswordCheck(ip, passwordValid);
+        }
+        if (!passwordValid) {
           throw createError({
             status: 401,
             message: 'Incorrect Password',
@@ -252,8 +336,25 @@ module.exports = class Server {
           });
         });
 
-        debug(`New Session: ${event.node.req.session.id}`);
+        debug('New authenticated session');
 
+        return { success: true };
+      }))
+      .delete('/api/session', defineEventHandler(async (event) => {
+        const { session } = event.node.req;
+        try {
+          if (session) {
+            await new Promise((resolveDestroy, rejectDestroy) => {
+              session.destroy((err) => {
+                if (err) rejectDestroy(createError({ statusCode: 500, message: 'Failed to destroy session' }));
+                else resolveDestroy();
+              });
+            });
+          }
+        } finally {
+          deleteCookie(event, SESSION_COOKIE_NAME, { path: '/' });
+        }
+        debug('Session deleted');
         return { success: true };
       }));
 
@@ -265,28 +366,32 @@ module.exports = class Server {
         }
 
         if (req.session && req.session.authenticated) {
-          debug(`Authenticated session: ${req.session.id}`);
           return next();
         }
 
-        debug(`Unauthenticated request to ${req.url} (Session: ${req.session ? req.session.id : 'none'})`);
-
         if (req.url.startsWith('/api/') && req.headers['authorization']) {
-          if (isLoginRateLimited(getClientIp(req))) {
+          const ip = getClientIp(req);
+          if (!beginPasswordCheck(ip)) {
             res.statusCode = 429;
             res.setHeader('Content-Type', 'application/json');
             res.end(JSON.stringify({ error: 'Too many attempts, try again later' }));
             return;
           }
 
-          if (isPasswordValid(req.headers['authorization'])) {
-            debug('Authenticated via authorization header');
-            return next();
-          }
-          debug('Invalid authorization header');
-          res.statusCode = 401;
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ error: 'Incorrect Password' }));
+          isPasswordValid(req.headers['authorization'])
+            .then((valid) => {
+              completePasswordCheck(ip, valid);
+              if (valid) {
+                next();
+                return;
+              }
+              res.statusCode = 401;
+              res.setHeader('Content-Type', 'application/json');
+              res.end(JSON.stringify({ error: 'Incorrect Password' }));
+            }, (err) => {
+              completePasswordCheck(ip, false);
+              next(err);
+            });
           return;
         }
 
@@ -300,14 +405,6 @@ module.exports = class Server {
     app.use(router2);
 
     router2
-      .delete('/api/session', defineEventHandler((event) => {
-        const sessionId = event.node.req.session.id;
-
-        event.node.req.session.destroy();
-
-        debug(`Deleted Session: ${sessionId}`);
-        return { success: true };
-      }))
       .get('/api/wireguard/client', defineEventHandler(() => {
         return WireGuard.getClients();
       }))
@@ -483,7 +580,7 @@ module.exports = class Server {
       .get('/api/wireguard/backup', defineEventHandler(async (event) => {
         const config = await WireGuard.backupConfiguration();
         setHeader(event, 'Content-Disposition', 'attachment; filename="wg0.json"');
-        setHeader(event, 'Content-Type', 'text/json');
+        setHeader(event, 'Content-Type', 'application/json');
         return config;
       }))
       .put('/api/wireguard/restore', defineEventHandler(async (event) => {
@@ -523,12 +620,9 @@ module.exports = class Server {
       }),
     );
 
-    if (PASSWORD) {
-      throw new Error('DO NOT USE PASSWORD ENVIRONMENT VARIABLE. USE PASSWORD_HASH INSTEAD.\nSee https://github.com/wg-easy/wg-easy/blob/v14/How_to_generate_an_bcrypt_hash.md');
-    }
-
-    createServer(toNodeListener(app)).listen(PORT, WEBUI_HOST);
-    debug(`Listening on http://${WEBUI_HOST}:${PORT}`);
+    this.server = createServer(toNodeListener(app));
+    this.server.listen(port, host);
+    debug(`Listening on http://${host}:${port}`);
   }
 
 };

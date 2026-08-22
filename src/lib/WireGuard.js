@@ -14,6 +14,7 @@ const {
   WG_HOST,
   WG_PORT,
   WG_CONFIG_PORT,
+  WG_DEVICE,
   WG_MTU,
   WG_DEFAULT_DNS,
   WG_DEFAULT_ADDRESS,
@@ -27,6 +28,38 @@ const {
   WG_PORT_FWD_MIN,
   WG_PORT_FWD_MAX,
 } = require('../config');
+
+const WIREGUARD_KEY_RE = /^[A-Za-z0-9+/]{43}=$/;
+const CLIENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+const SERVER_SETTING_KEYS = ['host', 'port', 'configPort', 'device', 'defaultDns',
+  'defaultAddress', 'defaultAddressV6', 'enableIpv6', 'mtu', 'allowedIps',
+  'persistentKeepalive', 'portFwdMin', 'portFwdMax'];
+
+const isPlainObject = (value) => value !== null
+  && typeof value === 'object'
+  && !Array.isArray(value);
+
+const isValidDate = (value) => (value instanceof Date && !Number.isNaN(value.getTime()))
+  || (typeof value === 'string' && !Number.isNaN(Date.parse(value)));
+
+const expandIPv6 = (address) => {
+  if (typeof address !== 'string' || address.includes('.')) return null;
+  const halves = address.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - left.length - right.length;
+  if ((halves.length === 1 && missing !== 0) || missing < 0) return null;
+  const expanded = [...left, ...Array(missing).fill('0'), ...right];
+  return expanded.length === 8 ? expanded.map((part) => part.padStart(4, '0').toLowerCase()) : null;
+};
+
+const isSameIPv6Subnet64 = (first, second) => {
+  const firstParts = expandIPv6(first);
+  const secondParts = expandIPv6(second);
+  return !!firstParts && !!secondParts
+    && firstParts.slice(0, 4).join(':') === secondParts.slice(0, 4).join(':');
+};
 
 const DUMMY_CLIENT_PREVIEW = {
   id: 'dummy-client-preview',
@@ -55,41 +88,220 @@ module.exports = class WireGuard {
     // Runtime-mutable server settings (seeded from env vars)
     this.__serverSettings = {
       host: WG_HOST,
-      port: WG_PORT,
-      configPort: WG_CONFIG_PORT,
-      device: process.env.WG_DEVICE || 'eth0',
+      port: Number(WG_PORT),
+      configPort: Number(WG_CONFIG_PORT),
+      device: WG_DEVICE,
       defaultDns: WG_DEFAULT_DNS,
       defaultAddress: WG_DEFAULT_ADDRESS,
       defaultAddressV6: WG_DEFAULT_ADDRESS_V6,
       enableIpv6: true,
       mtu: WG_MTU,
       allowedIps: WG_ALLOWED_IPS,
-      persistentKeepalive: WG_PERSISTENT_KEEPALIVE,
+      persistentKeepalive: Number(WG_PERSISTENT_KEEPALIVE),
       portFwdMin: Number(WG_PORT_FWD_MIN),
       portFwdMax: Number(WG_PORT_FWD_MAX),
     };
     this.__config = null;
     this.__initPromise = null;
+    this.__mutationQueue = Promise.resolve();
+    this.__settingsRecoveryPending = false;
+    this.__settingsRecoveryConfig = null;
+  }
+
+  __withMutation(operation) {
+    const run = this.__mutationQueue.then(operation, operation);
+    this.__mutationQueue = run.catch(() => {});
+    return run;
+  }
+
+  async waitForMutations() {
+    await this.__mutationQueue;
+  }
+
+  __normalizeServerSettings(settings, base = this.__serverSettings, strict = false) {
+    if (!isPlainObject(settings)) {
+      throw new ServerError('Invalid server settings: expected an object', 400);
+    }
+    if (strict) {
+      const unknown = Object.keys(settings).filter((key) => !SERVER_SETTING_KEYS.includes(key));
+      if (unknown.length) throw new ServerError(`Invalid server settings: unknown field ${unknown[0]}`, 400);
+    }
+
+    const isPort = (value) => Number.isInteger(Number(value)) && Number(value) >= 1 && Number(value) <= 65535;
+    const isPlainString = (value) => typeof value === 'string' && !/[\r\n]/.test(value);
+    const isIPv4Template = (value) => typeof value === 'string'
+      && value.split('.').length === 4
+      && value.split('.')[3] === 'x'
+      && Util.isValidIPv4(value.replace('x', '1'));
+    const isIPv6Template = (value) => typeof value === 'string'
+      && (value.match(/x/g) || []).length === 1
+      && Util.isValidIPv6(value.replace('x', '1'))
+      && Util.isValidIPv6(value.replace('x', '2'))
+      && isSameIPv6Subnet64(value.replace('x', '1'), value.replace('x', '2'));
+    const validators = {
+      host: (value) => isPlainString(value) && value.length > 0 && value.length <= 255,
+      port: isPort,
+      configPort: isPort,
+      device: (value) => typeof value === 'string' && /^[A-Za-z0-9_.-]+$/.test(value),
+      defaultDns: (value) => isPlainString(value) && value.length <= 255,
+      defaultAddress: isIPv4Template,
+      defaultAddressV6: isIPv6Template,
+      enableIpv6: (value) => typeof value === 'boolean',
+      mtu: (value) => value === null || (Number.isInteger(Number(value)) && Number(value) >= 576 && Number(value) <= 65535),
+      allowedIps: (value) => isPlainString(value) && value.length > 0 && value.length <= 255,
+      persistentKeepalive: (value) => value === null
+        || (Number.isInteger(Number(value)) && Number(value) >= 0 && Number(value) <= 65535),
+      portFwdMin: isPort,
+      portFwdMax: isPort,
+    };
+    const normalized = { ...base };
+
+    for (const key of SERVER_SETTING_KEYS) {
+      if (settings[key] === undefined) continue;
+      if (!validators[key](settings[key])) {
+        throw new ServerError(`Invalid value for ${key}`, 400);
+      }
+      normalized[key] = settings[key];
+    }
+    for (const key of ['port', 'configPort', 'mtu', 'persistentKeepalive', 'portFwdMin', 'portFwdMax']) {
+      if (normalized[key] !== null && normalized[key] !== undefined) {
+        normalized[key] = Number(normalized[key]);
+      }
+    }
+    if (normalized.portFwdMin > normalized.portFwdMax) {
+      throw new ServerError('portFwdMin cannot be greater than portFwdMax', 400);
+    }
+    return normalized;
+  }
+
+  async __loadServerSettings() {
+    let raw;
+    try {
+      raw = await fs.readFile(path.join(WG_PATH, 'server-settings.json'), 'utf8');
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        throw new Error(`Failed to read server-settings.json: ${err.message}`);
+      }
+    }
+
+    let saved = null;
+    if (raw !== undefined) {
+      try {
+        saved = JSON.parse(raw);
+      } catch (err) {
+        throw new Error(`server-settings.json is invalid JSON: ${err.message}`);
+      }
+      this.__serverSettings = this.__normalizeServerSettings(saved, this.__serverSettings, true);
+      saved = this.__serverSettings;
+      debug('Server settings loaded from disk.');
+    }
+
+    let transactionRaw;
+    try {
+      transactionRaw = await fs.readFile(path.join(WG_PATH, 'server-settings.transaction.json'), 'utf8');
+    } catch (err) {
+      if (err.code === 'ENOENT') return;
+      throw new Error(`Failed to read server settings transaction: ${err.message}`);
+    }
+    let transaction;
+    try {
+      transaction = JSON.parse(transactionRaw);
+    } catch (err) {
+      throw new Error(`server settings transaction is invalid JSON: ${err.message}`);
+    }
+    if (!isPlainObject(transaction)
+      || Object.keys(transaction).some((key) => !['previous', 'candidate', 'previousConfig', 'candidateConfig'].includes(key))
+      || !isPlainObject(transaction.previousConfig)
+      || !isPlainObject(transaction.candidateConfig)) {
+      throw new Error('server settings transaction has an invalid structure');
+    }
+    const previous = this.__normalizeServerSettings(transaction.previous, this.__serverSettings, true);
+    const candidate = this.__normalizeServerSettings(transaction.candidate, this.__serverSettings, true);
+    const candidateWasCommitted = saved && SERVER_SETTING_KEYS
+      .every((key) => saved[key] === candidate[key]);
+    this.__serverSettings = candidateWasCommitted ? candidate : previous;
+    this.__settingsRecoveryConfig = candidateWasCommitted
+      ? transaction.candidateConfig
+      : transaction.previousConfig;
+    this.__settingsRecoveryPending = true;
+    debug(`Recovering ${candidateWasCommitted ? 'committed' : 'rolled back'} server settings transaction.`);
+  }
+
+  async __syncDirectory() {
+    const directory = await fs.open(WG_PATH, 'r');
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+  }
+
+  async __writeAtomic(filename, contents, mode) {
+    const target = path.join(WG_PATH, filename);
+    const temporary = `${target}.${crypto.randomUUID()}.tmp`;
+    let handle;
+    try {
+      handle = await fs.open(temporary, 'w', mode);
+      await handle.writeFile(contents);
+      await handle.sync();
+      await handle.close();
+      handle = null;
+      await fs.rename(temporary, target);
+      await this.__syncDirectory();
+    } catch (err) {
+      if (handle) await handle.close().catch(() => {});
+      await fs.unlink(temporary).catch(() => {});
+      throw err;
+    }
+  }
+
+  async __saveServerSettings(settings = this.__serverSettings) {
+    await this.__writeAtomic('server-settings.json', JSON.stringify(settings, null, 2), 0o600);
+  }
+
+  async __saveSettingsTransaction(previous, candidate, previousConfig, candidateConfig) {
+    await this.__writeAtomic(
+      'server-settings.transaction.json',
+      JSON.stringify({
+        previous, candidate, previousConfig, candidateConfig,
+      }, null, 2),
+      0o600,
+    );
+  }
+
+  async __completeSettingsTransaction() {
+    await this.__saveServerSettings();
+    await fs.unlink(path.join(WG_PATH, 'server-settings.transaction.json')).catch((err) => {
+      if (err.code !== 'ENOENT') throw err;
+    });
+    await this.__syncDirectory();
+    this.__settingsRecoveryPending = false;
+    this.__settingsRecoveryConfig = null;
   }
 
   async __buildConfig() {
     if (this.__config) return this.__config;
+
+    await this.__loadServerSettings();
 
     if (!this.__serverSettings.host) {
       throw new Error('WG_HOST Environment Variable Not Set!');
     }
 
     debug('Loading configuration...');
-    let config;
+    let raw;
     try {
-      config = await fs.readFile(path.join(WG_PATH, 'wg0.json'), 'utf8');
-      config = JSON.parse(config);
-      debug('Configuration loaded.');
+      raw = await fs.readFile(path.join(WG_PATH, 'wg0.json'), 'utf8');
     } catch (err) {
+      if (err.code !== 'ENOENT') {
+        throw new Error(`Failed to read wg0.json: ${err.message}`);
+      }
+    }
+
+    let config;
+    if (raw === undefined) {
       const privateKey = await Util.exec('wg genkey');
-      const publicKey = await Util.exec(`echo ${privateKey} | wg pubkey`, {
-        log: 'echo ***hidden*** | wg pubkey',
-      });
+      const publicKey = await Util.execFile('wg', ['pubkey'], { input: `${privateKey}\n`, log: 'wg pubkey' });
       const address = this.__serverSettings.defaultAddress.replace('x', '1');
       const addressV6 = this.__serverSettings.enableIpv6 ? this.__serverSettings.defaultAddressV6.replace('x', '1') : null;
 
@@ -103,56 +315,152 @@ module.exports = class WireGuard {
         clients: {},
       };
       debug('Configuration generated.');
+    } else {
+      try {
+        config = JSON.parse(raw);
+      } catch (err) {
+        throw new Error(`wg0.json is invalid JSON and was not overwritten: ${err.message}`);
+      }
+      debug('Configuration loaded.');
+    }
+
+    if (this.__settingsRecoveryConfig) {
+      config = this.__settingsRecoveryConfig;
+    }
+
+    if (!isPlainObject(config) || !isPlainObject(config.server) || !isPlainObject(config.clients)) {
+      throw new Error('wg0.json has an invalid structure and was not overwritten.');
     }
 
     // Ensure all clients have portForwards array
-    for (const client of Object.values(config.clients)) {
+    for (const [clientId, client] of Object.entries(config.clients)) {
+      if (!isPlainObject(client)) throw new Error(`Invalid client entry: ${clientId}`);
+      if (client.id === undefined) client.id = clientId;
+      if (client.enabled === undefined) client.enabled = true;
       if (!Array.isArray(client.portForwards)) {
         client.portForwards = [];
       }
     }
 
-    // Migrate legacy server config: ensure server has addressV6
-    if (!config.server.addressV6 && this.__serverSettings.enableIpv6) {
+    if (this.__serverSettings.enableIpv6 && !config.server.addressV6) {
       config.server.addressV6 = this.__serverSettings.defaultAddressV6.replace('x', '1');
-      debug('Migrated server to include addressV6.');
     }
-
-    // Migrate legacy clients: assign addressV6 to any client missing it
     if (this.__serverSettings.enableIpv6) {
-      const usedV6 = new Set(
-        Object.values(config.clients)
-          .filter((c) => c.addressV6)
-          .map((c) => c.addressV6),
-      );
+      const usedV6 = new Set([
+        config.server.addressV6,
+        ...Object.values(config.clients).map((client) => client.addressV6),
+      ].filter(Boolean));
       for (const client of Object.values(config.clients)) {
-        if (!client.addressV6) {
-          for (let i = 2; i < 255; i++) {
-            const candidate = this.__serverSettings.defaultAddressV6.replace('x', i);
-            if (!usedV6.has(candidate)) {
-              client.addressV6 = candidate;
-              usedV6.add(candidate);
-              debug(`Migrated client ${client.name} → addressV6: ${candidate}`);
-              break;
-            }
-          }
-        }
+        if (client.addressV6) continue;
+        const ipv4Host = Util.isValidIPv4(client.address) ? Number(client.address.split('.')[3]) : null;
+        const candidates = ipv4Host >= 2 && ipv4Host <= 254
+          ? [ipv4Host, ...Array.from({ length: 253 }, (_, index) => index + 2)]
+          : Array.from({ length: 253 }, (_, index) => index + 2);
+        const host = candidates.find((value) => !usedV6.has(this.__serverSettings.defaultAddressV6.replace('x', value)));
+        if (host === undefined) throw new Error('Maximum number of IPv6 clients reached.');
+        client.addressV6 = this.__serverSettings.defaultAddressV6.replace('x', host);
+        usedV6.add(client.addressV6);
       }
     }
 
-    // Load persisted server settings if available
-    try {
-      const settingsRaw = await fs.readFile(path.join(WG_PATH, 'server-settings.json'), 'utf8');
-      const saved = JSON.parse(settingsRaw);
-      // Merge saved settings over env defaults
-      Object.assign(this.__serverSettings, saved);
-      debug('Server settings loaded from disk.');
-    } catch {
-      // No saved settings, use env defaults
-    }
-
+    this.__validateConfig(config);
     this.__config = config;
     return config;
+  }
+
+  __validateConfig(config, { strict = false } = {}) {
+    if (!isPlainObject(config) || !isPlainObject(config.server) || !isPlainObject(config.clients)) {
+      throw new ServerError('Invalid configuration structure', 400);
+    }
+    if (strict) {
+      const rootUnknown = Object.keys(config).filter((key) => !['server', 'clients'].includes(key));
+      const serverUnknown = Object.keys(config.server)
+        .filter((key) => !['privateKey', 'publicKey', 'address', 'addressV6'].includes(key));
+      if (rootUnknown.length) throw new ServerError(`Invalid configuration field: ${rootUnknown[0]}`, 400);
+      if (serverUnknown.length) throw new ServerError(`Invalid server field: ${serverUnknown[0]}`, 400);
+    }
+
+    for (const key of ['privateKey', 'publicKey']) {
+      if (typeof config.server[key] !== 'string' || !WIREGUARD_KEY_RE.test(config.server[key])) {
+        throw new ServerError(`Invalid server.${key}`, 400);
+      }
+    }
+    if (!Util.isValidIPv4(config.server.address)) {
+      throw new ServerError(`Invalid server.address: ${config.server.address}`, 400);
+    }
+    if (config.server.addressV6 != null && !Util.isValidIPv6(config.server.addressV6)) {
+      throw new ServerError(`Invalid server.addressV6: ${config.server.addressV6}`, 400);
+    }
+
+    const addresses = new Set([config.server.address]);
+    const addressesV6 = new Set(config.server.addressV6 ? [config.server.addressV6] : []);
+    const publicKeys = new Set([config.server.publicKey]);
+    const forwardedPorts = new Set();
+    const allowedClientKeys = ['id', 'name', 'address', 'addressV6', 'privateKey', 'publicKey',
+      'preSharedKey', 'createdAt', 'updatedAt', 'enabled', 'portForwards', 'allowedIPs'];
+
+    for (const [clientId, client] of Object.entries(config.clients)) {
+      if (!CLIENT_ID_RE.test(clientId) || !isPlainObject(client)) {
+        throw new ServerError(`Invalid client entry: ${clientId}`, 400);
+      }
+      if (strict) {
+        const unknown = Object.keys(client).filter((key) => !allowedClientKeys.includes(key));
+        if (unknown.length) throw new ServerError(`Invalid client field: ${unknown[0]}`, 400);
+      }
+      if (client.id !== clientId) throw new ServerError(`Invalid client id: ${clientId}`, 400);
+      if (!Util.isValidName(client.name)) throw new ServerError(`Invalid client name: ${client.name}`, 400);
+      if (typeof client.enabled !== 'boolean') throw new ServerError(`Invalid client.enabled: ${clientId}`, 400);
+      if (!Util.isValidIPv4(client.address) || addresses.has(client.address)) {
+        throw new ServerError(`Invalid or duplicate IPv4 address: ${client.address}`, 400);
+      }
+      addresses.add(client.address);
+      if (client.addressV6 != null) {
+        if (!Util.isValidIPv6(client.addressV6) || addressesV6.has(client.addressV6)) {
+          throw new ServerError(`Invalid or duplicate IPv6 address: ${client.addressV6}`, 400);
+        }
+        addressesV6.add(client.addressV6);
+      }
+      if (typeof client.publicKey !== 'string' || !WIREGUARD_KEY_RE.test(client.publicKey)
+        || publicKeys.has(client.publicKey)) {
+        throw new ServerError(`Invalid or duplicate client.publicKey: ${clientId}`, 400);
+      }
+      publicKeys.add(client.publicKey);
+      for (const key of ['privateKey', 'preSharedKey']) {
+        if (client[key] != null && (typeof client[key] !== 'string' || !WIREGUARD_KEY_RE.test(client[key]))) {
+          throw new ServerError(`Invalid client.${key}: ${clientId}`, 400);
+        }
+      }
+      if (strict && (!isValidDate(client.createdAt) || !isValidDate(client.updatedAt))) {
+        throw new ServerError(`Invalid client timestamps: ${clientId}`, 400);
+      }
+      if (client.allowedIPs !== undefined
+        && (!Array.isArray(client.allowedIPs) || client.allowedIPs.some((value) => typeof value !== 'string' || /[\r\n]/.test(value)))) {
+        throw new ServerError(`Invalid client.allowedIPs: ${clientId}`, 400);
+      }
+      if (!Array.isArray(client.portForwards)) {
+        throw new ServerError(`Invalid client.portForwards: ${clientId}`, 400);
+      }
+
+      for (const rule of client.portForwards) {
+        if (!isPlainObject(rule)) throw new ServerError(`Invalid port forward for ${clientId}`, 400);
+        if (strict && Object.keys(rule).some((key) => !['proto', 'extPort', 'intPort'].includes(key))) {
+          throw new ServerError(`Invalid port forward field for ${clientId}`, 400);
+        }
+        if (!['tcp', 'udp', 'both'].includes(rule.proto)
+          || !Number.isInteger(rule.extPort) || !Number.isInteger(rule.intPort)
+          || rule.extPort < 1 || rule.extPort > 65535
+          || rule.intPort < 1 || rule.intPort > 65535
+          || !this.__isPortAllowed(rule.extPort)) {
+          throw new ServerError(`Invalid port forward for ${clientId}`, 400);
+        }
+        const protocols = rule.proto === 'both' ? ['tcp', 'udp'] : [rule.proto];
+        for (const protocol of protocols) {
+          const key = `${protocol}:${rule.extPort}`;
+          if (forwardedPorts.has(key)) throw new ServerError(`Duplicate forwarded port: ${key}`, 400);
+          forwardedPorts.add(key);
+        }
+      }
+    }
   }
 
   async getConfig() {
@@ -168,23 +476,38 @@ module.exports = class WireGuard {
     this.__initPromise = (async () => {
       const config = await this.getConfig();
 
+      // Down reads the currently active wg0.conf. Replace it only afterwards.
+      await this.__bringWireGuardDown();
       await this.__saveConfig(config);
-      await Util.exec('wg-quick down wg0').catch(() => {});
-      await Util.exec('wg-quick up wg0').catch((err) => {
-        if (err && err.message && err.message.includes('Cannot find device "wg0"')) {
-          throw new Error('WireGuard exited with the error: Cannot find device "wg0"\nThis usually means that your host\'s kernel does not support WireGuard!');
-        }
-        throw err;
-      });
+      await this.__bringWireGuardUp();
 
       await this.__syncConfig();
       await this.__ensureNftablesSetup();
       await this.__applyAllDnatRules();
+      if (this.__settingsRecoveryPending) await this.__completeSettingsTransaction();
 
       debug('WireGuard initialization completed.');
     })();
 
     return this.__initPromise;
+  }
+
+  async __bringWireGuardDown() {
+    try {
+      await Util.exec('wg-quick down wg0');
+    } catch (err) {
+      if (/not a WireGuard interface|Cannot find device|does not exist/i.test(err.message || '')) return;
+      throw err;
+    }
+  }
+
+  async __bringWireGuardUp() {
+    await Util.exec('wg-quick up wg0').catch((err) => {
+      if (err && err.message && err.message.includes('Cannot find device "wg0"')) {
+        throw new Error('WireGuard exited with the error: Cannot find device "wg0"\nThis usually means that your host\'s kernel does not support WireGuard!');
+      }
+      throw err;
+    });
   }
 
   async saveConfig() {
@@ -193,7 +516,44 @@ module.exports = class WireGuard {
     await this.__syncConfig();
   }
 
+  __getPostUp() {
+    if (process.env.WG_POST_UP) return WG_POST_UP;
+    const commands = [
+      `iptables -t nat -I POSTROUTING 1 -s ${this.__serverSettings.defaultAddress.replace('x', '0')}/24 -o ${this.__serverSettings.device} -j MASQUERADE;`,
+      `iptables -I INPUT 1 -p udp -m udp --dport ${this.__serverSettings.port} -j ACCEPT;`,
+      'iptables -I FORWARD 1 -i wg0 -j ACCEPT;',
+      'iptables -I FORWARD 1 -o wg0 -j ACCEPT;',
+    ];
+    if (this.__serverSettings.enableIpv6) {
+      commands.push(
+        `ip6tables -t nat -I POSTROUTING 1 -s ${this.__serverSettings.defaultAddressV6.replace('x', '0')}/64 -o ${this.__serverSettings.device} -j MASQUERADE;`,
+        'ip6tables -I FORWARD 1 -i wg0 -j ACCEPT;',
+        'ip6tables -I FORWARD 1 -o wg0 -j ACCEPT;',
+      );
+    }
+    return commands.join(' ');
+  }
+
+  __getPostDown() {
+    if (process.env.WG_POST_DOWN) return WG_POST_DOWN;
+    const commands = [
+      `iptables -t nat -D POSTROUTING -s ${this.__serverSettings.defaultAddress.replace('x', '0')}/24 -o ${this.__serverSettings.device} -j MASQUERADE;`,
+      `iptables -D INPUT -p udp -m udp --dport ${this.__serverSettings.port} -j ACCEPT;`,
+      'iptables -D FORWARD -i wg0 -j ACCEPT;',
+      'iptables -D FORWARD -o wg0 -j ACCEPT;',
+    ];
+    if (this.__serverSettings.enableIpv6) {
+      commands.push(
+        `ip6tables -t nat -D POSTROUTING -s ${this.__serverSettings.defaultAddressV6.replace('x', '0')}/64 -o ${this.__serverSettings.device} -j MASQUERADE;`,
+        'ip6tables -D FORWARD -i wg0 -j ACCEPT;',
+        'ip6tables -D FORWARD -o wg0 -j ACCEPT;',
+      );
+    }
+    return commands.join(' ');
+  }
+
   async __saveConfig(config) {
+    this.__validateConfig(config);
     let result = `
 # Note: Do not edit this file directly.
 # Your changes will be overwritten!
@@ -204,9 +564,9 @@ PrivateKey = ${config.server.privateKey}
 Address = ${config.server.address}/24${this.__serverSettings.enableIpv6 && config.server.addressV6 ? `, ${config.server.addressV6}/64` : ''}
 ListenPort = ${this.__serverSettings.port}
 PreUp = ${WG_PRE_UP}
-PostUp = ${WG_POST_UP}
+PostUp = ${this.__getPostUp()}
 PreDown = ${WG_PRE_DOWN}
-PostDown = ${WG_POST_DOWN}
+PostDown = ${this.__getPostDown()}
 `;
 
     for (const [clientId, client] of Object.entries(config.clients)) {
@@ -222,23 +582,22 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
     }
 
     debug('Config saving...');
-    const jsonTmp = path.join(WG_PATH, 'wg0.json.tmp');
-    const confTmp = path.join(WG_PATH, 'wg0.conf.tmp');
     const jsonFile = path.join(WG_PATH, 'wg0.json');
-    const confFile = path.join(WG_PATH, 'wg0.conf');
 
     try {
-      await fs.writeFile(jsonTmp, JSON.stringify(config, false, 2), { mode: 0o660 });
-      await fs.writeFile(confTmp, result, { mode: 0o600 });
-
-      await fs.rename(jsonTmp, jsonFile);
-      await fs.rename(confTmp, confFile);
+      try {
+        const previousJson = await fs.readFile(jsonFile, 'utf8');
+        await this.__writeAtomic('wg0.json.bak', previousJson, 0o600);
+      } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+      }
+      // wg0.json is canonical, so publish it only after the generated config.
+      await this.__writeAtomic('wg0.conf', result, 0o600);
+      await this.__writeAtomic('wg0.json', JSON.stringify(config, false, 2), 0o600);
 
       debug('Config saved.');
     } catch (err) {
       debug(`Error saving config: ${err.message}`);
-      await fs.unlink(jsonTmp).catch(() => {});
-      await fs.unlink(confTmp).catch(() => {});
       throw err;
     }
   }
@@ -349,143 +708,169 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   }
 
   async createClient({ name }) {
-    if (!Util.isValidName(name)) {
-      throw new ServerError('Invalid name: 1-64 chars, no control characters', 400);
-    }
-
-    const config = await this.getConfig();
-
-    const privateKey = await Util.exec('wg genkey');
-    const publicKey = await Util.exec(`echo ${privateKey} | wg pubkey`, {
-      log: 'echo ***hidden*** | wg pubkey',
-    });
-    const preSharedKey = await Util.exec('wg genpsk');
-
-    // Calculate next IP
-    let address;
-    let addressV6;
-    for (let i = 2; i < 255; i++) {
-      const client = Object.values(config.clients).find((client) => {
-        return client.address === this.__serverSettings.defaultAddress.replace('x', i)
-               || (this.__serverSettings.enableIpv6 && client.addressV6 === this.__serverSettings.defaultAddressV6.replace('x', i));
-      });
-
-      if (!client) {
-        address = this.__serverSettings.defaultAddress.replace('x', i);
-        addressV6 = this.__serverSettings.enableIpv6 ? this.__serverSettings.defaultAddressV6.replace('x', i) : null;
-        break;
+    return this.__withMutation(async () => {
+      if (!Util.isValidName(name)) {
+        throw new ServerError('Invalid name: 1-128 chars, no control characters', 400);
       }
-    }
 
-    if (!address) {
-      throw new Error('Maximum number of clients reached.');
-    }
+      const config = await this.getConfig();
+      const privateKey = await Util.exec('wg genkey');
+      const publicKey = await Util.execFile('wg', ['pubkey'], { input: `${privateKey}\n`, log: 'wg pubkey' });
+      const preSharedKey = await Util.exec('wg genpsk');
 
-    // Create Client
-    const id = crypto.randomUUID();
-    const client = {
-      id,
-      name,
-      address,
-      addressV6,
-      privateKey,
-      publicKey,
-      preSharedKey,
+      let address;
+      let addressV6;
+      for (let i = 2; i < 255; i++) {
+        const existingClient = Object.values(config.clients).find((candidate) => {
+          return candidate.address === this.__serverSettings.defaultAddress.replace('x', i)
+            || (this.__serverSettings.enableIpv6 && candidate.addressV6 === this.__serverSettings.defaultAddressV6.replace('x', i));
+        });
+        if (!existingClient) {
+          address = this.__serverSettings.defaultAddress.replace('x', i);
+          addressV6 = this.__serverSettings.enableIpv6 ? this.__serverSettings.defaultAddressV6.replace('x', i) : null;
+          break;
+        }
+      }
+      if (!address) throw new Error('Maximum number of clients reached.');
 
-      createdAt: new Date(),
-      updatedAt: new Date(),
-
-      enabled: true,
-      portForwards: [],
-    };
-
-    config.clients[id] = client;
-
-    await this.saveConfig();
-
-    return client;
+      const id = crypto.randomUUID();
+      const client = {
+        id,
+        name,
+        address,
+        addressV6,
+        privateKey,
+        publicKey,
+        preSharedKey,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        enabled: true,
+        portForwards: [],
+      };
+      await this.__transactionalConfigChange(
+        () => {
+          config.clients[id] = client;
+        },
+        () => {
+          delete config.clients[id];
+        },
+        { context: 'create-client' },
+      );
+      return client;
+    });
   }
 
   async deleteClient({ clientId }) {
-    const config = await this.getConfig();
-
-    if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
-      throw new ServerError(`Client Not Found: ${clientId}`, 404);
-    }
-
-    if (config.clients[clientId]) {
-      const removedClient = config.clients[clientId];
-      await this.__transactionalDnatChange(
-        () => {
-          delete config.clients[clientId];
-        },
-        () => {
-          config.clients[clientId] = removedClient;
-        },
-        'delete-client',
-      );
-    }
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+        throw new ServerError(`Client Not Found: ${clientId}`, 404);
+      }
+      if (config.clients[clientId]) {
+        const removedClient = config.clients[clientId];
+        await this.__transactionalDnatChange(
+          () => {
+            delete config.clients[clientId];
+          },
+          () => {
+            config.clients[clientId] = removedClient;
+          },
+          'delete-client',
+        );
+      }
+    });
   }
 
   async enableClient({ clientId }) {
-    const client = await this.getClient({ clientId });
-
-    client.enabled = true;
-    client.updatedAt = new Date();
-
-    await this.saveConfig();
+    return this.__withMutation(async () => {
+      const client = await this.getClient({ clientId });
+      const previous = { enabled: client.enabled, updatedAt: client.updatedAt };
+      await this.__transactionalDnatChange(
+        () => {
+          client.enabled = true; client.updatedAt = new Date();
+        },
+        () => {
+          Object.assign(client, previous);
+        },
+        'enable-client',
+      );
+    });
   }
 
   async disableClient({ clientId }) {
-    const client = await this.getClient({ clientId });
-
-    client.enabled = false;
-    client.updatedAt = new Date();
-
-    await this.saveConfig();
+    return this.__withMutation(async () => {
+      const client = await this.getClient({ clientId });
+      const previous = { enabled: client.enabled, updatedAt: client.updatedAt };
+      await this.__transactionalDnatChange(
+        () => {
+          client.enabled = false; client.updatedAt = new Date();
+        },
+        () => {
+          Object.assign(client, previous);
+        },
+        'disable-client',
+      );
+    });
   }
 
   async updateClientName({ clientId, name }) {
-    const client = await this.getClient({ clientId });
-
-    if (!Util.isValidName(name)) {
-      throw new ServerError('Invalid name: 1-64 chars, no control characters', 400);
-    }
-
-    client.name = name;
-    client.updatedAt = new Date();
-
-    await this.saveConfig();
+    return this.__withMutation(async () => {
+      const client = await this.getClient({ clientId });
+      if (!Util.isValidName(name)) {
+        throw new ServerError('Invalid name: 1-128 chars, no control characters', 400);
+      }
+      const previous = { name: client.name, updatedAt: client.updatedAt };
+      await this.__transactionalConfigChange(
+        () => {
+          client.name = name; client.updatedAt = new Date();
+        },
+        () => {
+          Object.assign(client, previous);
+        },
+        { context: 'update-client-name' },
+      );
+    });
   }
 
   async updateClientAddress({ clientId, address, addressV6 }) {
-    const client = await this.getClient({ clientId });
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      const client = await this.getClient({ clientId });
+      if (address && !Util.isValidIPv4(address)) throw new ServerError(`Invalid IPv4 Address: ${address}`, 400);
+      if (addressV6 && !Util.isValidIPv6(addressV6)) throw new ServerError(`Invalid IPv6 Address: ${addressV6}`, 400);
+      if (address && (address === config.server.address
+        || Object.values(config.clients).some((candidate) => candidate !== client && candidate.address === address))) {
+        throw new ServerError(`IPv4 address already in use: ${address}`, 400);
+      }
+      if (addressV6 && (addressV6 === config.server.addressV6
+        || Object.values(config.clients).some((candidate) => candidate !== client && candidate.addressV6 === addressV6))) {
+        throw new ServerError(`IPv6 address already in use: ${addressV6}`, 400);
+      }
+      if (addressV6 && config.server.addressV6 && !isSameIPv6Subnet64(config.server.addressV6, addressV6)) {
+        throw new ServerError('IPv6 address must be in the server /64', 400);
+      }
+      if (address) {
+        const serverPrefix = config.server.address.split('.').slice(0, 3).join('.');
+        const parts = address.split('.');
+        const host = Number(parts[3]);
+        if (parts.slice(0, 3).join('.') !== serverPrefix || host < 2 || host > 254) {
+          throw new ServerError(`IPv4 address must be a usable host in ${serverPrefix}.0/24`, 400);
+        }
+      }
 
-    if (address && !Util.isValidIPv4(address)) {
-      throw new ServerError(`Invalid IPv4 Address: ${address}`, 400);
-    }
-
-    if (addressV6 && !Util.isValidIPv6(addressV6)) {
-      throw new ServerError(`Invalid IPv6 Address: ${addressV6}`, 400);
-    }
-
-    const oldAddress = client.address;
-    const oldAddressV6 = client.addressV6;
-    const oldUpdatedAt = client.updatedAt;
-
-    await this.__transactionalDnatChange(
-      () => {
-        if (address) client.address = address;
-        if (addressV6) client.addressV6 = addressV6;
-        client.updatedAt = new Date();
-      },
-      () => {
-        client.address = oldAddress;
-        client.addressV6 = oldAddressV6;
-        client.updatedAt = oldUpdatedAt;
-      },
-      'update-client-address',
-    );
+      const previous = { address: client.address, addressV6: client.addressV6, updatedAt: client.updatedAt };
+      await this.__transactionalDnatChange(
+        () => {
+          if (address) client.address = address;
+          if (addressV6) client.addressV6 = addressV6;
+          client.updatedAt = new Date();
+        },
+        () => {
+          Object.assign(client, previous);
+        },
+        'update-client-address',
+      );
+    });
   }
 
   async __reloadConfig() {
@@ -496,101 +881,48 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   }
 
   async restoreConfiguration(config) {
-    debug('Starting configuration restore process.');
-
-    let _config;
-    try {
-      _config = JSON.parse(config);
-    } catch {
-      throw new ServerError('Invalid backup: not valid JSON', 400);
-    }
-
-    if (!_config || typeof _config !== 'object') {
-      throw new ServerError('Invalid backup: expected an object', 400);
-    }
-
-    // Validate server settings (prevents injection of [Interface] directives).
-    const server = _config.server || {};
-    for (const key of ['privateKey', 'publicKey']) {
-      const value = server[key];
-      if (typeof value !== 'string' || !/^[A-Za-z0-9+/=_-]+$/.test(value)) {
-        throw new ServerError(`Invalid backup: invalid server.${key}`, 400);
+    return this.__withMutation(async () => {
+      debug('Starting configuration restore process.');
+      let restored;
+      try {
+        restored = JSON.parse(config);
+      } catch {
+        throw new ServerError('Invalid backup: not valid JSON', 400);
       }
-    }
-    if (typeof server.address !== 'string' || !Util.isValidIPv4(server.address)) {
-      throw new ServerError(`Invalid backup: invalid server.address: ${server.address}`, 400);
-    }
-    if (server.addressV6 != null && (typeof server.addressV6 !== 'string' || !Util.isValidIPv6(server.addressV6))) {
-      throw new ServerError(`Invalid backup: invalid server.addressV6: ${server.addressV6}`, 400);
-    }
+      this.__validateConfig(restored, { strict: true });
 
-    // Validate clients (names, addresses) and sanitize port forward rules.
-    for (const client of Object.values(_config.clients || {})) {
-      if (!client || typeof client !== 'object') {
-        throw new ServerError('Invalid backup: invalid client entry', 400);
-      }
-      if (client.name !== undefined && !Util.isValidName(client.name)) {
-        throw new ServerError(`Invalid backup: invalid client name: ${client.name}`, 400);
-      }
-      if (typeof client.address !== 'string' || !Util.isValidIPv4(client.address)) {
-        throw new ServerError(`Invalid IPv4 address: ${client.address}`, 400);
-      }
-      if (client.addressV6 != null && (typeof client.addressV6 !== 'string' || !Util.isValidIPv6(client.addressV6))) {
-        throw new ServerError(`Invalid IPv6 address: ${client.addressV6}`, 400);
-      }
-
-      if (!Array.isArray(client.portForwards)) {
-        client.portForwards = [];
-        continue;
-      }
-      client.portForwards = client.portForwards
-        .filter((rule) => {
-          const ep = Number(rule.extPort);
-          const ip = Number(rule.intPort);
-          if (!['tcp', 'udp', 'both'].includes(rule.proto)) return false;
-          if (!Number.isInteger(ep) || ep < 1 || ep > 65535) return false;
-          if (!Number.isInteger(ip) || ip < 1 || ip > 65535) return false;
-          if (!this.__isPortAllowed(ep)) {
-            debug(`restoreConfiguration: dropping unallowed port ${ep} for client ${client.name}`);
-            return false;
-          }
-          return true;
-        })
-        .map((rule) => ({
-          proto: rule.proto,
-          extPort: Number(rule.extPort),
-          intPort: Number(rule.intPort),
-        }));
-    }
-
-    const oldConfig = this.__config;
-    await this.__transactionalDnatChange(
-      () => {
-        this.__config = _config;
-      },
-      () => {
-        this.__config = oldConfig;
-      },
-      'restore',
-    );
-    // restoreConfiguration forces a reload after a successful save so wg0 interface syncs properly.
-    await this.__reloadConfig();
-    debug('Configuration restore process completed.');
+      const oldConfig = this.__config;
+      await this.__transactionalDnatChange(
+        () => {
+          this.__config = restored;
+        },
+        () => {
+          this.__config = oldConfig;
+        },
+        'restore',
+      );
+      debug('Configuration restore process completed.');
+    });
   }
 
-  async __transactionalDnatChange(mutate, rollback, context = 'dnat-change') {
-    mutate();
+  async __transactionalConfigChange(mutate, rollback, {
+    applyDnat = false,
+    context = 'config-change',
+  } = {}) {
+    await mutate();
     try {
-      await this.__applyAllDnatRules(true);
+      if (applyDnat) await this.__applyAllDnatRules();
       await this.saveConfig();
     } catch (err) {
-      rollback();
+      await rollback();
       const rollbackErrors = [];
-      await this.__applyAllDnatRules(false).catch((rollbackErr) => {
-        const msg = `Host rollback failed in ${context}: ${rollbackErr.message}`;
-        debug(msg);
-        rollbackErrors.push(msg);
-      });
+      if (applyDnat) {
+        await this.__applyAllDnatRules().catch((rollbackErr) => {
+          const msg = `Host rollback failed in ${context}: ${rollbackErr.message}`;
+          debug(msg);
+          rollbackErrors.push(msg);
+        });
+      }
       await this.__saveConfig(this.__config).catch((diskErr) => {
         const msg = `Disk rollback failed in ${context}: ${diskErr.message}`;
         debug(msg);
@@ -602,8 +934,13 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         rollbackErrors.push(msg);
       });
       err.rollbackErrors = rollbackErrors;
+      if (rollbackErrors.length) err.data = { rollbackFailed: true };
       throw err;
     }
+  }
+
+  async __transactionalDnatChange(mutate, rollback, context = 'dnat-change') {
+    return this.__transactionalConfigChange(mutate, rollback, { applyDnat: true, context });
   }
 
   async backupConfiguration() {
@@ -616,7 +953,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
   // Shutdown wireguard
   async Shutdown() {
-    await Util.exec('wg-quick down wg0').catch(() => {});
+    await this.__bringWireGuardDown();
     // Eliminar las tablas de DNAT para no dejar reglas huérfanas en el host
     await Util.exec('nft delete table ip wgeasy_dnat').catch(() => {});
     await Util.exec('nft delete table ip6 wgeasy_dnat').catch(() => {});
@@ -631,67 +968,79 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   }
 
   async updateServerConfig(settings) {
-    await this.getConfig();
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      const previousConfig = JSON.parse(JSON.stringify(config));
+      const previous = { ...this.__serverSettings };
+      const candidate = this.__normalizeServerSettings(settings, previous, true);
+      this.__serverSettings = candidate;
 
-    if (!settings || typeof settings !== 'object') {
-      throw new ServerError('Invalid body: expected an object', 400);
-    }
-
-    const isPort = (v) => Number.isInteger(Number(v)) && Number(v) >= 1 && Number(v) <= 65535;
-    const isPlainString = (v) => typeof v === 'string' && !/[\r\n]/.test(v);
-
-    const validators = {
-      host: (v) => typeof v === 'string' && v.length > 0 && v.length <= 255 && isPlainString(v),
-      port: (v) => isPort(v),
-      configPort: (v) => isPort(v),
-      device: (v) => typeof v === 'string' && /^[A-Za-z0-9_.-]+$/.test(v),
-      defaultDns: (v) => typeof v === 'string' && v.length <= 255 && isPlainString(v),
-      defaultAddress: (v) => typeof v === 'string' && v.length <= 255 && isPlainString(v)
-        && /^[0-9A-Fa-f.:/x]+$/.test(v) && v.includes('x'),
-      defaultAddressV6: (v) => typeof v === 'string' && v.length <= 255 && isPlainString(v)
-        && /^[0-9A-Fa-f:x]+$/.test(v) && v.includes('x'),
-      enableIpv6: (v) => typeof v === 'boolean',
-      mtu: (v) => v === null || (Number.isInteger(Number(v)) && Number(v) >= 576 && Number(v) <= 65535),
-      allowedIps: (v) => typeof v === 'string' && v.length <= 255 && isPlainString(v),
-      persistentKeepalive: (v) => v === null || (Number.isInteger(Number(v)) && Number(v) >= 0 && Number(v) <= 65535),
-      portFwdMin: (v) => isPort(v),
-      portFwdMax: (v) => isPort(v),
-    };
-
-    const allowed = ['host', 'port', 'configPort', 'device', 'defaultDns',
-      'defaultAddress', 'defaultAddressV6', 'enableIpv6', 'mtu', 'allowedIps',
-      'persistentKeepalive', 'portFwdMin', 'portFwdMax'];
-
-    for (const key of allowed) {
-      if (settings[key] === undefined) continue;
-
-      if (!validators[key](settings[key])) {
-        throw new ServerError(`Invalid value for ${key}`, 400);
+      if (candidate.defaultAddress !== previous.defaultAddress) {
+        config.server.address = candidate.defaultAddress.replace('x', '1');
+        for (const client of Object.values(config.clients)) {
+          const host = client.address.split('.')[3];
+          client.address = candidate.defaultAddress.replace('x', host);
+        }
       }
-      this.__serverSettings[key] = settings[key];
-    }
-
-    // Normalize numeric settings
-    for (const key of ['port', 'configPort', 'mtu', 'persistentKeepalive', 'portFwdMin', 'portFwdMax']) {
-      const value = this.__serverSettings[key];
-      if (value !== null && value !== undefined) {
-        this.__serverSettings[key] = Number(value);
+      if (candidate.enableIpv6
+        && (candidate.defaultAddressV6 !== previous.defaultAddressV6 || !previous.enableIpv6)) {
+        config.server.addressV6 = candidate.defaultAddressV6.replace('x', '1');
+        for (const client of Object.values(config.clients)) {
+          const host = client.address.split('.')[3];
+          client.addressV6 = candidate.defaultAddressV6.replace('x', host);
+        }
       }
-    }
 
-    if (this.__serverSettings.portFwdMin > this.__serverSettings.portFwdMax) {
-      throw new ServerError('portFwdMin cannot be greater than portFwdMax', 400);
-    }
+      try {
+        this.__validateConfig(config);
+      } catch (err) {
+        this.__serverSettings = previous;
+        this.__config = previousConfig;
+        throw err;
+      }
 
-    // Persist to disk
-    await fs.writeFile(
-      path.join(WG_PATH, 'server-settings.json'),
-      JSON.stringify(this.__serverSettings, null, 2),
-      { mode: 0o660 },
-    );
+      try {
+        await this.__saveSettingsTransaction(
+          previous,
+          candidate,
+          previousConfig,
+          JSON.parse(JSON.stringify(config)),
+        );
+        await this.__bringWireGuardDown();
+        await this.__saveConfig(config);
+        await this.__bringWireGuardUp();
+        await this.__ensureNftablesSetup();
+        await this.__applyAllDnatRules();
+        await this.__completeSettingsTransaction();
+      } catch (err) {
+        const rollbackErrors = [];
+        await this.__bringWireGuardDown().catch((rollbackErr) => {
+          rollbackErrors.push(`WireGuard shutdown rollback failed: ${rollbackErr.message}`);
+        });
+        this.__serverSettings = previous;
+        this.__config = previousConfig;
+        await this.__saveConfig(previousConfig).catch((rollbackErr) => {
+          rollbackErrors.push(`Settings config rollback failed: ${rollbackErr.message}`);
+        });
+        await this.__bringWireGuardUp().catch((rollbackErr) => {
+          rollbackErrors.push(`WireGuard settings rollback failed: ${rollbackErr.message}`);
+        });
+        await this.__ensureNftablesSetup()
+          .then(() => this.__applyAllDnatRules())
+          .catch((rollbackErr) => {
+            rollbackErrors.push(`DNAT settings rollback failed: ${rollbackErr.message}`);
+          });
+        await this.__completeSettingsTransaction().catch((rollbackErr) => {
+          rollbackErrors.push(`Settings journal rollback failed: ${rollbackErr.message}`);
+        });
+        err.rollbackErrors = rollbackErrors;
+        if (rollbackErrors.length) err.data = { rollbackFailed: true };
+        throw err;
+      }
 
-    debug('Server settings updated and persisted.');
-    return { ...this.__serverSettings };
+      debug('Server settings updated, applied and persisted.');
+      return { ...this.__serverSettings };
+    });
   }
 
   // ── NFTables / DNAT ─────────────────────────────────────────────
@@ -707,100 +1056,87 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   }
 
   async __ensureNftablesSetup() {
-    try {
-      await Util.exec('nft add table ip wgeasy_dnat');
-      await Util.exec("nft add chain ip wgeasy_dnat prerouting '{ type nat hook prerouting priority dstnat; policy accept; }'");
-      debug('nftables IPv4 table/chain ensured.');
-    } catch (err) {
-      // It might already exist, which is fine
+    const ensure = async (listCommand, addCommand) => {
+      try {
+        await Util.exec(listCommand, { log: false });
+      } catch {
+        try {
+          await Util.exec(addCommand);
+        } catch (err) {
+          // A concurrent creator may have won the race; verify the resource.
+          await Util.exec(listCommand, { log: false }).catch(() => {
+            throw err;
+          });
+        }
+      }
+    };
+
+    const families = this.__serverSettings.enableIpv6 ? ['ip', 'ip6'] : ['ip'];
+    for (const family of families) {
+      await ensure(
+        `nft list table ${family} wgeasy_dnat`,
+        `nft add table ${family} wgeasy_dnat`,
+      );
+      await ensure(
+        `nft list chain ${family} wgeasy_dnat prerouting`,
+        `nft add chain ${family} wgeasy_dnat prerouting '{ type nat hook prerouting priority dstnat; policy accept; }'`,
+      );
     }
-    try {
-      await Util.exec('nft add table ip6 wgeasy_dnat');
-      await Util.exec("nft add chain ip6 wgeasy_dnat prerouting '{ type nat hook prerouting priority dstnat; policy accept; }'");
-      debug('nftables IPv6 table/chain ensured.');
-    } catch (err) {
-      // It might already exist, which is fine
-    }
+    debug('nftables tables and chains ensured.');
   }
 
-  async __applyAllDnatRules(throwOnError = false) {
+  async __removeIpv6DnatTable() {
     try {
-      await Util.exec('nft flush chain ip wgeasy_dnat prerouting');
-      await Util.exec('nft flush chain ip6 wgeasy_dnat prerouting');
-    } catch (err) {
-      if (throwOnError) {
-        throw new ServerError(`Failed to flush DNAT chains: ${err.message}`, 500);
-      }
-      debug(`Failed to flush DNAT chains: ${err.message}`);
+      await Util.exec('nft list table ip6 wgeasy_dnat', { log: false });
+    } catch {
+      return;
     }
+    await Util.exec('nft delete table ip6 wgeasy_dnat');
+  }
 
-    // Use config directly
+  async __applyAllDnatRules() {
     const config = await this.getConfig();
-    const errors = [];
+    this.__validateConfig(config);
+    if (!this.__serverSettings.enableIpv6) await this.__removeIpv6DnatTable();
+    await this.__ensureNftablesSetup();
+    const commands = [
+      'flush chain ip wgeasy_dnat prerouting',
+    ];
+    if (this.__serverSettings.enableIpv6) commands.push('flush chain ip6 wgeasy_dnat prerouting');
+
     for (const client of Object.values(config.clients)) {
       if (!client.enabled || !client.portForwards || !client.portForwards.length) continue;
 
-      const peerIP = client.address.split('/')[0];
-      const peerIPv6 = (this.__serverSettings.enableIpv6 && client.addressV6) ? client.addressV6.split('/')[0] : null;
-
-      // Prevención de inyección: validar IPs antes de usarlas en comandos shell
-      if (!Util.isValidIPv4(peerIP)) {
-        if (throwOnError) errors.push(new Error(`Invalid IPv4 address: ${peerIP}`));
-        debug(`Skipping client with invalid IPv4: ${peerIP}`);
-        continue;
-      }
-      if (peerIPv6 && !Util.isValidIPv6(peerIPv6)) {
-        if (throwOnError) errors.push(new Error(`Invalid IPv6 address: ${peerIPv6}`));
-        debug(`Skipping client with invalid IPv6: ${peerIPv6}`);
-        continue;
-      }
+      const peerIP = client.address;
+      const peerIPv6 = this.__serverSettings.enableIpv6 ? client.addressV6 : null;
 
       for (const rule of client.portForwards) {
-        const { proto } = rule;
-        let { extPort, intPort } = rule;
-
-        // Prevención de inyección: forzar tipos y validar estrictamente
-        extPort = Number(extPort);
-        intPort = Number(intPort);
-        if (!Number.isInteger(extPort) || !Number.isInteger(intPort) || extPort < 1 || extPort > 65535 || intPort < 1 || intPort > 65535) {
-          if (throwOnError) errors.push(new Error(`Invalid port: extPort=${extPort}, intPort=${intPort}`));
-          debug(`Skipping rule with invalid ports: extPort=${extPort}, intPort=${intPort}`);
-          continue;
-        }
-        if (!['tcp', 'udp', 'both'].includes(proto)) {
-          if (throwOnError) errors.push(new Error(`Invalid proto: ${proto}`));
-          debug(`Skipping rule with invalid proto: ${proto}`);
-          continue;
-        }
-
-        const protocols = proto === 'both' ? ['tcp', 'udp'] : [proto];
-
-        for (const p of protocols) {
-          // IPv4 DNAT rule
-          const cmd4 = `nft add rule ip wgeasy_dnat prerouting ${p} dport ${extPort} dnat to ${peerIP}:${intPort}`;
-          await Util.exec(cmd4).catch((err) => {
-            debug(`Error applying IPv4 DNAT rule: ${err.message}`);
-            errors.push(err);
-          });
-
-          // IPv6 DNAT rule (only if client has an IPv6 address)
+        const protocols = rule.proto === 'both' ? ['tcp', 'udp'] : [rule.proto];
+        for (const protocol of protocols) {
+          commands.push(`add rule ip wgeasy_dnat prerouting ${protocol} dport ${rule.extPort} dnat to ${peerIP}:${rule.intPort}`);
           if (peerIPv6) {
-            const cmd6 = `nft add rule ip6 wgeasy_dnat prerouting ${p} dport ${extPort} dnat to [${peerIPv6}]:${intPort}`;
-            await Util.exec(cmd6).catch((err) => {
-              debug(`Error applying IPv6 DNAT rule: ${err.message}`);
-              errors.push(err);
-            });
+            commands.push(`add rule ip6 wgeasy_dnat prerouting ${protocol} dport ${rule.extPort} dnat to [${peerIPv6}]:${rule.intPort}`);
           }
         }
       }
     }
-    debug('All DNAT rules applied (IPv4 + IPv6).');
-    if (throwOnError && errors.length > 0) {
-      throw new ServerError(`Failed to apply DNAT rules: ${errors.map((e) => e.message).join(', ')}`, 500);
+
+    try {
+      await Util.execFile('nft', ['-f', '-'], {
+        input: `${commands.join('\n')}\n`,
+        log: 'nft -f -',
+      });
+    } catch (err) {
+      throw new ServerError(`Failed to apply DNAT rules atomically: ${err.message}`, 500);
     }
+    debug('All DNAT rules applied atomically (IPv4 + IPv6).');
   }
 
   async addPortForward(clientId, proto, extPort, intPort) {
+    return this.__withMutation(() => this.__addPortForward(clientId, proto, extPort, intPort));
+  }
+
+  async __addPortForward(clientId, proto, extPort, intPort) {
     if (process.platform !== 'linux') {
       debug('Preview: Simulated adding port forward');
       DUMMY_CLIENT_PREVIEW.portForwards.push({ proto, extPort: Number(extPort), intPort: Number(intPort) });
@@ -850,6 +1186,10 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   }
 
   async removePortForward(clientId, index) {
+    return this.__withMutation(() => this.__removePortForward(clientId, index));
+  }
+
+  async __removePortForward(clientId, index) {
     if (process.platform !== 'linux') {
       debug('Preview: Simulated removing port forward');
       DUMMY_CLIENT_PREVIEW.portForwards.splice(index, 1);
@@ -878,6 +1218,10 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
   }
 
   async updatePortForward(clientId, index, proto, extPort, intPort) {
+    return this.__withMutation(() => this.__updatePortForward(clientId, index, proto, extPort, intPort));
+  }
+
+  async __updatePortForward(clientId, index, proto, extPort, intPort) {
     if (process.platform !== 'linux') {
       debug('Preview: Simulated updating port forward');
       DUMMY_CLIENT_PREVIEW.portForwards[index] = { proto, extPort: Number(extPort), intPort: Number(intPort) };

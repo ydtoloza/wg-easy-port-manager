@@ -11,7 +11,12 @@ services:
       - "51821:51821/tcp"
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
+      - NET_RAW
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
-      # - PASSWORD_HASH=your_hash_here
+      - PASSWORD_HASH=${PASSWORD_HASH:?Set PASSWORD_HASH in .env}
+      - SESSION_SECRET=${SESSION_SECRET:?Set SESSION_SECRET in .env}
       - WG_HOST=192.168.1.233

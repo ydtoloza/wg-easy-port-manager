@@ -3,12 +3,9 @@ Description=WireGuard Easy Port Manager
 After=network-online.target nss-lookup.target
 
 [Service]
-# Change WG_HOST to your server's public IP or domain
-Environment="WG_HOST=your.server.ip"
-
-# Use PASSWORD_HASH instead of plain text password.
-# Generate with: docker run --rm ghcr.io/ydtoloza/wg-easy-port-manager wgpw YOUR_PASSWORD
-Environment="PASSWORD_HASH=REPLACEME"
+# Create this root-owned file with mode 0600. It must define WG_HOST,
+# PASSWORD_HASH and SESSION_SECRET. See docs/security-and-operations.md.
+EnvironmentFile=/etc/wg-easy/wg-easy.env
 
 # Optional settings (uncomment to use):
 #Environment="WG_DEVICE=eth0"

@@ -1,4 +1,4 @@
-name: Lint
+name: Quality
 
 on:
   push:
@@ -7,8 +7,8 @@ on:
   pull_request:
 
 jobs:
-  lint:
-    name: Lint
+  quality:
+    name: Lint and test
     runs-on: ubuntu-latest
     if: github.repository_owner == 'ydtoloza'
     steps:
@@ -22,8 +22,10 @@ jobs:
           cache: 'npm'
           cache-dependency-path: 'src/package-lock.json'
 
-      - name: npm run lint
+      - name: Validate source and generated UI
         run: |
           cd src
           npm ci
           npm run lint
+          npm run check:www-template
+          npm run test:ci

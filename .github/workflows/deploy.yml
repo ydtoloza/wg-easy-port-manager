@@ -6,8 +6,27 @@ on:
       - main
 
 jobs:
+  quality:
+    name: Validate release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: 'src/package-lock.json'
+      - name: Lint and test
+        working-directory: src
+        run: |
+          npm ci
+          npm run lint
+          npm run check:www-template
+          npm run test:ci
+
   deploy:
     name: Build & Deploy
+    needs: quality
     runs-on: ubuntu-latest
     if: |
       !contains(github.event.head_commit.message, '!skipci')
@@ -45,7 +64,6 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ steps.package_version.outputs.version }}
-            ghcr.io/${{ github.repository }}:v14-custom
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

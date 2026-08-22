@@ -1,34 +1,54 @@
 'use strict';
 
+const Config = require('./config');
+
+Config.validateEnvironment();
+
 const WireGuard = require('./services/WireGuard');
 
-WireGuard.init()
+let Server;
+let shuttingDown = false;
+
+const initialization = WireGuard.init();
+
+initialization
   .then(() => {
+    if (shuttingDown) return;
     // eslint-disable-next-line global-require
-    require('./services/Server');
+    Server = require('./services/Server');
   })
-  .catch((err) => {
+  .catch(async (err) => {
     // eslint-disable-next-line no-console
     console.error(err);
-
+    await WireGuard.Shutdown().catch(() => {});
+    if (shuttingDown) return;
     // eslint-disable-next-line no-process-exit
     process.exit(1);
   });
 
-// Handle terminate signal
-process.on('SIGTERM', async () => {
+const shutdown = async (signal) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
   // eslint-disable-next-line no-console
-  console.log('SIGTERM signal received.');
-  await WireGuard.Shutdown();
-  // eslint-disable-next-line no-process-exit
-  process.exit(0);
-});
+  console.log(`${signal} signal received.`);
+  try {
+    if (Server && Server.server) {
+      await new Promise((resolve, reject) => {
+        Server.server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+    await initialization.catch(() => {});
+    await WireGuard.waitForMutations();
+    await WireGuard.Shutdown();
+    // eslint-disable-next-line no-process-exit
+    process.exit(0);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(err);
+    // eslint-disable-next-line no-process-exit
+    process.exit(1);
+  }
+};
 
-// Handle interrupt signal
-process.on('SIGINT', async () => {
-  // eslint-disable-next-line no-console
-  console.log('SIGINT signal received.');
-  await WireGuard.Shutdown();
-  // eslint-disable-next-line no-process-exit
-  process.exit(0);
-});
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));

@@ -42,8 +42,13 @@ const CHART_COLORS = {
   gradient: { light: ['rgba(0,0,0,1.0)', 'rgba(0,0,0,1.0)'], dark: ['rgba(128,128,128,0)', 'rgba(128,128,128,0)'] },
 };
 
+const appTemplate = window.WgEasyAppTemplate;
+if (!appTemplate) throw new Error('Precompiled application template was not loaded.');
+
 new Vue({
   el: '#app',
+  render: appTemplate.render,
+  staticRenderFns: appTemplate.staticRenderFns,
   components: {
     apexchart: VueApexCharts,
   },
@@ -78,7 +83,7 @@ new Vue({
 
     // Toast notifications
     toasts: [],
-    _toastId: 0,
+    toastId: 0,
 
     // Server config (global IP settings)
     showServerConfig: false,
@@ -86,15 +91,14 @@ new Vue({
     serverConfigEdit: null,
     serverConfigSaving: false,
 
-    currentRelease: null,
-    latestRelease: null,
-
     uiTrafficStats: false,
 
     uiChartType: 0,
     uiShowCharts: localStorage.getItem('uiShowCharts') === '1',
     uiTheme: localStorage.theme || 'auto',
     prefersDarkScheme: window.matchMedia('(prefers-color-scheme: dark)'),
+    pollTimer: null,
+    polling: false,
 
     chartOptions: {
       chart: {
@@ -180,7 +184,7 @@ new Vue({
   methods: {
     // ── Toast notification system ─────────────────────────────────────────
     notify(msg, type = 'error', duration = 5000) {
-      const id = ++this._toastId;
+      const id = ++this.toastId;
       this.toasts.push({ id, msg, type });
       setTimeout(() => this.dismissToast(id), duration);
     },
@@ -227,10 +231,6 @@ new Vue({
 
       const clients = await this.api.getClients();
       this.clients = clients.map((client) => {
-        if (client.name.includes('@') && client.name.includes('.')) {
-          client.avatar = `https://gravatar.com/avatar/${sha256(client.name.toLowerCase().trim())}.jpg`;
-        }
-
         if (!this.clientsPersist[client.id]) {
           this.clientsPersist[client.id] = {};
           this.clientsPersist[client.id].transferRxHistory = Array(50).fill(0);
@@ -302,7 +302,8 @@ new Vue({
           const session = await this.api.getSession();
           this.authenticated = session.authenticated;
           this.requiresPassword = session.requiresPassword;
-          return this.refresh();
+          await this.refresh({ updateCharts: this.chartsEnabled });
+          this.schedulePoll();
         })
         .catch((err) => {
           this.notify(err.message || err.toString());
@@ -319,6 +320,7 @@ new Vue({
         .then(() => {
           this.authenticated = false;
           this.clients = null;
+          clearTimeout(this.pollTimer);
         })
         .catch((err) => {
           this.notify(err.message || err.toString());
@@ -375,7 +377,7 @@ new Vue({
     },
     viewConfiguration(client) {
       if (!client.downloadableConfig) return;
-      fetch(`./api/wireguard/client/${client.id}/configuration/raw`, { credentials: 'include' })
+      fetch(`./api/wireguard/client/${encodeURIComponent(client.id)}/configuration/raw`, { credentials: 'include' })
         .then((res) => {
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           return res.text();
@@ -385,6 +387,9 @@ new Vue({
           this.copyConfigSuccess = false;
         })
         .catch((err) => this.notify(`Error al obtener la configuración: ${err.message}`));
+    },
+    preventUnavailableDownload(event, client) {
+      if (!client.downloadableConfig) event.preventDefault();
     },
     copyConfigToClipboard() {
       if (!this.configDialog || !this.configDialog.text) return;
@@ -562,6 +567,53 @@ new Vue({
     },
     toggleCharts() {
       localStorage.setItem('uiShowCharts', this.uiShowCharts ? 1 : 0);
+      if (this.uiShowCharts) this.schedulePoll(0);
+    },
+    clientPathId(clientId) {
+      return encodeURIComponent(clientId);
+    },
+    schedulePoll(delay = 1000) {
+      clearTimeout(this.pollTimer);
+      if (!document.hidden && this.authenticated) {
+        this.pollTimer = setTimeout(() => this.poll(), delay);
+      }
+    },
+    async poll() {
+      if (this.polling || document.hidden || !this.authenticated) return;
+      this.polling = true;
+      try {
+        await this.refresh({ updateCharts: this.chartsEnabled });
+      } catch (err) {
+        console.error(err);
+      } finally {
+        this.polling = false;
+        this.schedulePoll();
+      }
+    },
+    handleVisibilityChange() {
+      if (document.hidden) clearTimeout(this.pollTimer);
+      else this.schedulePoll(0);
+    },
+    async initialize() {
+      const [session, trafficStats, chartTypeRaw, lang] = await Promise.all([
+        this.api.getSession(),
+        this.api.getUiTrafficStats().catch(() => false),
+        this.api.getChartType().catch(() => 0),
+        this.api.getLang().catch(() => null),
+      ]);
+      this.uiTrafficStats = trafficStats === true || trafficStats === 1 || trafficStats === '1' || trafficStats === 'true';
+      const chartType = Number.parseInt(chartTypeRaw, 10);
+      this.uiChartType = Number.isInteger(chartType) && UI_CHART_TYPES[chartType] ? chartType : 0;
+      if (lang && lang !== localStorage.getItem('lang') && i18n.availableLocales.includes(lang)) {
+        localStorage.setItem('lang', lang);
+        i18n.locale = lang;
+      }
+      this.authenticated = session.authenticated;
+      this.requiresPassword = session.requiresPassword;
+      if (this.authenticated) {
+        await this.refresh({ updateCharts: this.chartsEnabled });
+        this.schedulePoll();
+      }
     },
   },
   filters: {
@@ -573,93 +625,46 @@ new Vue({
   mounted() {
     this.prefersDarkScheme.addListener(this.handlePrefersChange);
     this.setTheme(this.uiTheme);
-
     this.api = new API();
-    this.api.getSession()
-      .then((session) => {
-        this.authenticated = session.authenticated;
-        this.requiresPassword = session.requiresPassword;
-        this.refresh({
-          updateCharts: this.updateCharts,
-        }).catch((err) => {
-          this.notify(err.message || err.toString());
-        });
-      })
-      .catch((err) => {
-        this.notify(err.message || err.toString());
-      });
-
-    setInterval(() => {
-      this.refresh({
-        updateCharts: this.updateCharts,
-      }).catch(console.error);
-    }, 1000);
-
-    this.api.getuiTrafficStats()
-      .then((res) => {
-        this.uiTrafficStats = res;
-      })
-      .catch(() => {
-        this.uiTrafficStats = false;
-      });
-
-    this.api.getChartType()
-      .then((res) => {
-        this.uiChartType = parseInt(res, 10);
-      })
-      .catch(() => {
-        this.uiChartType = 0;
-      });
-
-    Promise.resolve().then(async () => {
-      const lang = await this.api.getLang();
-      if (lang !== localStorage.getItem('lang') && i18n.availableLocales.includes(lang)) {
-        localStorage.setItem('lang', lang);
-        i18n.locale = lang;
-      }
-
-      const currentRelease = await this.api.getRelease();
-      const latestRelease = await fetch('https://wg-easy.github.io/wg-easy/changelog.json')
-        .then((res) => res.json())
-        .then((releases) => {
-          const releasesArray = Object.entries(releases).map(([version, changelog]) => ({
-            version: parseInt(version, 10),
-            changelog,
-          }));
-          releasesArray.sort((a, b) => {
-            return b.version - a.version;
-          });
-
-          return releasesArray[0];
-        });
-
-      if (currentRelease >= latestRelease.version) return;
-
-      this.currentRelease = currentRelease;
-      this.latestRelease = latestRelease;
-    }).catch((err) => console.error(err));
+    document.addEventListener('visibilitychange', this.handleVisibilityChange);
+    this.initialize().catch((err) => this.notify(err.message || err.toString()));
+  },
+  beforeDestroy() {
+    clearTimeout(this.pollTimer);
+    document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+    this.prefersDarkScheme.removeListener(this.handlePrefersChange);
   },
   computed: {
+    chartTypeConfig() {
+      return UI_CHART_TYPES[this.uiChartType] || UI_CHART_TYPES[0];
+    },
+    chartsEnabled() {
+      return this.uiShowCharts && Boolean(this.chartTypeConfig.type);
+    },
     chartOptionsTX() {
       const opts = {
         ...this.chartOptions,
+        chart: { ...this.chartOptions.chart },
+        stroke: { ...this.chartOptions.stroke },
         colors: [CHART_COLORS.tx[this.theme]],
       };
-      opts.chart.type = UI_CHART_TYPES[this.uiChartType].type || false;
-      opts.stroke.width = UI_CHART_TYPES[this.uiChartType].strokeWidth;
+      opts.chart.type = this.chartTypeConfig.type || false;
+      opts.stroke.width = this.chartTypeConfig.strokeWidth;
       return opts;
     },
     chartOptionsRX() {
       const opts = {
         ...this.chartOptions,
+        chart: { ...this.chartOptions.chart },
+        stroke: { ...this.chartOptions.stroke },
         colors: [CHART_COLORS.rx[this.theme]],
       };
-      opts.chart.type = UI_CHART_TYPES[this.uiChartType].type || false;
-      opts.stroke.width = UI_CHART_TYPES[this.uiChartType].strokeWidth;
+      opts.chart.type = this.chartTypeConfig.type || false;
+      opts.stroke.width = this.chartTypeConfig.strokeWidth;
       return opts;
     },
     updateCharts() {
-      return this.uiChartType > 0 && this.uiShowCharts;
+      return this.chartsEnabled;
     },
     theme() {
       if (this.uiTheme === 'auto') {

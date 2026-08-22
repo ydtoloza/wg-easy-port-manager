@@ -45,6 +45,7 @@ Asegúrate de que tu sistema cumple con lo siguiente:
 * Docker y Docker Compose instalados.
 * `nftables` e `iptables` disponibles en el sistema host.
 * Módulo del kernel de WireGuard cargado.
+* Un proxy HTTPS o una red administrativa privada. No expongas el puerto 51821 directamente a Internet.
 
 #### Ejemplo de `docker-compose.yml`
 
@@ -61,6 +62,7 @@ services:
       - LANG=es # Idioma de la interfaz
       - WG_HOST=${WG_HOST} # Cambia por la IP pública de tu servidor
       - PASSWORD_HASH=${PASSWORD_HASH} # Genera tu propio hash bcrypt (ver abajo)
+      - SESSION_SECRET=${SESSION_SECRET} # Mínimo 32 bytes aleatorios
       - WG_PERSISTENT_KEEPALIVE=25
       - WG_DEVICE=eth0 # Cambia si tu interfaz principal no es eth0
       - WG_DEFAULT_ADDRESS_V6=fd42:42:42::x # Rango IPv6 opcional
@@ -70,11 +72,16 @@ services:
     network_mode: "host" # Modo de red de alto rendimiento
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
       - NET_RAW
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 ```
 
-> **Nota sobre `PASSWORD_HASH`**: No uses contraseñas en texto plano y **nunca subas tu hash real al repositorio**. Copia `.env.example` a `.env`, genera tu propio hash con `docker run --rm ghcr.io/ydtoloza/wg-easy-port-manager wgpw TU_PASSWORD` y rellénalo allí. En docker-compose, los símbolos `$` del hash van escapados con doble `$$` (en un archivo `.env` no hace falta escapar).
+> **Configuración obligatoria**: No uses contraseñas en texto plano y **nunca subas tu hash real al repositorio**. Copia `.env.example` a `.env`, genera `PASSWORD_HASH` con `wgpw` y `SESSION_SECRET` con `openssl rand -hex 32`. Escribe el hash entre comillas simples en `.env` para que Compose no interprete sus símbolos `$`.
+
+Consulta [Security and Operations](docs/security-and-operations.md) para TLS, proxy inverso, backups, recuperación y limitaciones operativas.
 
 ---
 
@@ -106,6 +113,7 @@ Ensure your host system meets the following requirements:
 * Docker & Docker Compose installed.
 * `nftables` and `iptables` available on the host system (required for port forwarding and Docker routing compatibility).
 * WireGuard kernel module loaded.
+* An HTTPS reverse proxy or private administrative network. Do not expose port 51821 directly to the Internet.
 
 #### Example `docker-compose.yml`
 
@@ -122,6 +130,7 @@ services:
       - LANG=en # Set UI Language
       - WG_HOST=${WG_HOST} # Change to your server's public IP
       - PASSWORD_HASH=${PASSWORD_HASH} # Replace with your own bcrypt hash (see below)
+      - SESSION_SECRET=${SESSION_SECRET} # At least 32 random bytes
       - WG_PERSISTENT_KEEPALIVE=25
       - WG_DEVICE=eth0 # Change if your main interface is not eth0
       - WG_DEFAULT_ADDRESS_V6=fd42:42:42::x # Optional IPv6 range
@@ -131,11 +140,16 @@ services:
     network_mode: "host"
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
       - NET_RAW
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 ```
 
-> **Note on `PASSWORD_HASH`**: Never use plain-text passwords and **never commit your real hash to the repository**. Copy `.env.example` to `.env`, generate your own hash with `docker run --rm ghcr.io/ydtoloza/wg-easy-port-manager wgpw YOUR_PASSWORD` and fill it in there. In docker-compose files the `$` characters of the hash must be escaped as `$$` (no escaping needed in a `.env` file).
+> **Required configuration**: Never use plain-text passwords and **never commit your real hash**. Copy `.env.example` to `.env`, generate `PASSWORD_HASH` with `wgpw`, and generate `SESSION_SECRET` with `openssl rand -hex 32`. Put the hash in single quotes in `.env` so Compose does not interpret its `$` characters.
+
+See [Security and Operations](docs/security-and-operations.md) for TLS, reverse proxy, backup, recovery and operational limitations.
 
 ---
 

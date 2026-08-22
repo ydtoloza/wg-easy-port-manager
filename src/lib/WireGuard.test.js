@@ -6,6 +6,41 @@ const fs = require('node:fs/promises');
 const Util = require('./Util');
 const ServerError = require('./ServerError');
 
+const KEYS = {
+  serverPrivate: Buffer.alloc(32, 1).toString('base64'),
+  serverPublic: Buffer.alloc(32, 2).toString('base64'),
+  clientPrivate: Buffer.alloc(32, 3).toString('base64'),
+  clientPublic: Buffer.alloc(32, 4).toString('base64'),
+  preShared: Buffer.alloc(32, 5).toString('base64'),
+};
+const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+
+const makeConfig = () => ({
+  server: {
+    privateKey: KEYS.serverPrivate,
+    publicKey: KEYS.serverPublic,
+    address: '10.8.0.1',
+    addressV6: 'fd42:42:42::1',
+  },
+  clients: {
+    client1: {
+      id: 'client1',
+      name: 'client1',
+      address: '10.8.0.2',
+      addressV6: 'fd42:42:42::2',
+      privateKey: KEYS.clientPrivate,
+      publicKey: KEYS.clientPublic,
+      preSharedKey: KEYS.preShared,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      enabled: true,
+      portForwards: [
+        { proto: 'tcp', extPort: 2000, intPort: 2000 },
+      ],
+    },
+  },
+});
+
 jest.mock('node:fs/promises');
 jest.mock('./Util');
 jest.mock('../config', () => ({
@@ -13,6 +48,7 @@ jest.mock('../config', () => ({
   WG_HOST: '10.0.0.1',
   WG_PORT: '51820',
   WG_CONFIG_PORT: '51820',
+  WG_DEVICE: 'eth0',
   WG_MTU: '1420',
   WG_DEFAULT_DNS: '1.1.1.1',
   WG_DEFAULT_ADDRESS: '10.8.0.x',
@@ -33,31 +69,27 @@ describe('WireGuard', () => {
   beforeEach(() => {
     jest.clearAllMocks();
 
-    fs.readFile.mockResolvedValue(JSON.stringify({
-      server: {
-        privateKey: 'server-priv',
-        publicKey: 'server-pub',
-        address: '10.8.0.1',
-      },
-      clients: {
-        client1: {
-          id: 'client1',
-          name: 'client1',
-          address: '10.8.0.2',
-          enabled: true,
-          portForwards: [
-            { proto: 'tcp', extPort: 2000, intPort: 2000 },
-          ],
-        },
-      },
-    }));
+    fs.readFile.mockImplementation(async (filename) => {
+      if (String(filename).includes('server-settings')) {
+        const err = new Error('not found');
+        err.code = 'ENOENT';
+        throw err;
+      }
+      return JSON.stringify(makeConfig());
+    });
 
     fs.writeFile.mockResolvedValue();
     fs.rename.mockResolvedValue();
     fs.unlink.mockResolvedValue();
+    fs.open.mockImplementation(async () => ({
+      writeFile: jest.fn().mockResolvedValue(),
+      sync: jest.fn().mockResolvedValue(),
+      close: jest.fn().mockResolvedValue(),
+    }));
 
     Util.exec.mockResolvedValue();
-    Util.isValidIPv4.mockImplementation((ip) => /^10\.8\.0\.\d+$/.test(ip));
+    Util.execFile.mockResolvedValue();
+    Util.isValidIPv4.mockImplementation((ip) => /^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip));
     Util.isValidIPv6.mockReturnValue(true);
     Util.isValidName.mockImplementation((s) => typeof s === 'string' && s.length > 0 && s.length <= 128
       // eslint-disable-next-line no-control-regex
@@ -68,6 +100,10 @@ describe('WireGuard', () => {
 
     const WireGuardClass = require('./WireGuard'); // eslint-disable-line global-require
     wg = new WireGuardClass();
+  });
+
+  afterAll(() => {
+    Object.defineProperty(process, 'platform', originalPlatform);
   });
 
   describe('__isPortAllowed', () => {
@@ -112,30 +148,27 @@ describe('WireGuard', () => {
 
     it('rolls back completely if nft fails', async () => {
       await wg.getConfig();
-      // Simulate nft failure during apply
-      Util.exec.mockImplementation(async (cmd) => {
-        if (cmd.includes('nft add rule')) {
-          throw new Error('nft failed');
-        }
-      });
+      Util.execFile.mockRejectedValue(new Error('nft failed'));
 
-      try {
-        await wg.addPortForward('client1', 'tcp', 3000, 3000);
-      } catch (err) {
-        expect(err.message).toMatch(/Failed to apply DNAT rules: nft failed/);
-        expect(err.rollbackErrors).toEqual([]);
-      }
+      let caught;
+      await wg.addPortForward('client1', 'tcp', 3000, 3000).catch((err) => {
+        caught = err;
+      });
+      expect(caught.message).toMatch(/Failed to apply DNAT rules atomically: nft failed/);
+      expect(caught.rollbackErrors).toEqual([
+        expect.stringContaining('Host rollback failed'),
+      ]);
 
       const config = await wg.getConfig();
       // ensure memory rollback
       expect(config.clients.client1.portForwards.length).toBe(1);
 
-      // ensure we re-applied state (flush + re-add)
-      const calls = Util.exec.mock.calls.map((c) => c[0]);
-      expect(calls).toContain('nft flush chain ip wgeasy_dnat prerouting');
+      expect(Util.execFile).toHaveBeenCalledWith('nft', ['-f', '-'], expect.objectContaining({
+        input: expect.stringContaining('flush chain ip wgeasy_dnat prerouting'),
+      }));
 
       // ensure we saved back
-      expect(fs.writeFile).toHaveBeenCalled();
+      expect(fs.open).toHaveBeenCalled();
     });
 
     it('rolls back if saveConfig fails', async () => {
@@ -143,11 +176,7 @@ describe('WireGuard', () => {
       // nft succeeds, but save fails
       fs.rename.mockRejectedValueOnce(new Error('disk full'));
 
-      try {
-        await wg.addPortForward('client1', 'tcp', 3000, 3000);
-      } catch (err) {
-        expect(err.message).toMatch(/disk full/);
-      }
+      await expect(wg.addPortForward('client1', 'tcp', 3000, 3000)).rejects.toThrow(/disk full/);
 
       const config = await wg.getConfig();
       expect(config.clients.client1.portForwards.length).toBe(1);
@@ -162,25 +191,54 @@ describe('WireGuard', () => {
     });
   });
 
+  describe('client activation', () => {
+    it('updates DNAT rules when a client is disabled and enabled', async () => {
+      await wg.disableClient({ clientId: 'client1' });
+      const disabledRuleset = Util.execFile.mock.calls.findLast((call) => call[0] === 'nft')[2].input;
+      expect(disabledRuleset).not.toContain('dport 2000');
+
+      await wg.enableClient({ clientId: 'client1' });
+      const enabledRuleset = Util.execFile.mock.calls.findLast((call) => call[0] === 'nft')[2].input;
+      expect(enabledRuleset).toContain('tcp dport 2000');
+    });
+  });
+
+  describe('network initialization', () => {
+    it('fsyncs files and their directory around atomic renames', async () => {
+      await wg.__writeAtomic('durable.json', '{}', 0o600);
+      const fileHandle = await fs.open.mock.results[0].value;
+      const directoryHandle = await fs.open.mock.results[1].value;
+      expect(fileHandle.sync.mock.invocationCallOrder[0]).toBeLessThan(fs.rename.mock.invocationCallOrder[0]);
+      expect(fs.rename.mock.invocationCallOrder[0]).toBeLessThan(directoryHandle.sync.mock.invocationCallOrder[0]);
+    });
+
+    it('does not require nftables IPv6 support when IPv6 is disabled', async () => {
+      await wg.getConfig();
+      wg.__serverSettings.enableIpv6 = false;
+      Util.exec.mockImplementation(async (command) => {
+        if (command.includes('nft') && command.includes('ip6')) throw new Error('Address family not supported');
+      });
+
+      await expect(wg.__applyAllDnatRules()).resolves.toBeUndefined();
+      const ruleset = Util.execFile.mock.calls.findLast((call) => call[0] === 'nft')[2].input;
+      expect(ruleset).not.toContain('ip6');
+    });
+
+    it('takes the active interface down before replacing wg0.conf', async () => {
+      await wg.init();
+      const downCall = Util.exec.mock.calls.findIndex((call) => call[0] === 'wg-quick down wg0');
+      expect(downCall).toBeGreaterThanOrEqual(0);
+      expect(Util.exec.mock.invocationCallOrder[downCall]).toBeLessThan(fs.open.mock.invocationCallOrder[0]);
+    });
+  });
+
   describe('restoreConfiguration', () => {
     it('rolls back disk and host on failure', async () => {
       await wg.getConfig(); // init state
 
-      const backupJson = JSON.stringify({
-        server: {
-          privateKey: 'server-priv-valid-key==',
-          publicKey: 'server-pub-valid-key==',
-          address: '10.8.0.1',
-        },
-        clients: {
-          client1: {
-            id: 'client1',
-            name: 'client1',
-            address: '10.8.0.2', // Valid IP
-            portForwards: [{ proto: 'tcp', extPort: 3000, intPort: 3000 }],
-          },
-        },
-      });
+      const backup = makeConfig();
+      backup.clients.client1.portForwards = [{ proto: 'tcp', extPort: 3000, intPort: 3000 }];
+      const backupJson = JSON.stringify(backup);
 
       // Simulate wg syncconf failure in reload
       Util.exec.mockImplementation(async (cmd) => {
@@ -204,27 +262,11 @@ describe('WireGuard', () => {
     it('rejects backup with invalid IPs entirely without saving', async () => {
       await wg.getConfig(); // init state
 
-      const backupJson = JSON.stringify({
-        server: {
-          privateKey: 'server-priv-valid-key==',
-          publicKey: 'server-pub-valid-key==',
-          address: '10.8.0.1',
-        },
-        clients: {
-          client1: {
-            id: 'client1',
-            name: 'client1',
-            address: '10.8.0.2; touch /pwn', // Invalid IP
-            portForwards: [{ proto: 'tcp', extPort: 3000, intPort: 3000 }],
-          },
-        },
-      });
+      const backup = makeConfig();
+      backup.clients.client1.address = '10.8.0.2; touch /pwn';
+      const backupJson = JSON.stringify(backup);
 
-      try {
-        await wg.restoreConfiguration(backupJson);
-      } catch (err) {
-        expect(err.message).toMatch(/Invalid IPv4 address/);
-      }
+      await expect(wg.restoreConfiguration(backupJson)).rejects.toThrow(/Invalid or duplicate IPv4 address/);
 
       const config = await wg.getConfig();
       expect(config.clients.client1.address).toBe('10.8.0.2');
@@ -233,43 +275,204 @@ describe('WireGuard', () => {
     it('rejects backup with injected server keys (config injection)', async () => {
       await wg.getConfig(); // init state
 
-      const backupJson = JSON.stringify({
-        server: {
-          privateKey: 'a\nPostUp = touch /pwn', // Injected newline
-          publicKey: 'valid-public-key==',
-          address: '10.8.0.1',
-        },
-        clients: {},
-      });
+      const backup = makeConfig();
+      backup.server.privateKey = 'a\nPostUp = touch /pwn';
+      const backupJson = JSON.stringify(backup);
 
       await expect(wg.restoreConfiguration(backupJson))
-        .rejects.toThrow(/invalid server\.privateKey/);
+        .rejects.toThrow(/Invalid server\.privateKey/);
 
       const config = await wg.getConfig();
-      expect(config.server.privateKey).toBe('server-priv');
+      expect(config.server.privateKey).toBe(KEYS.serverPrivate);
     });
 
     it('rejects backup with invalid client name', async () => {
       await wg.getConfig(); // init state
 
-      const backupJson = JSON.stringify({
-        server: {
-          privateKey: 'server-priv-valid-key==',
-          publicKey: 'server-pub-valid-key==',
-          address: '10.8.0.1',
-        },
-        clients: {
-          client1: {
-            id: 'client1',
-            name: 'evil\n[Peer]',
-            address: '10.8.0.2',
-            portForwards: [],
-          },
-        },
-      });
+      const backup = makeConfig();
+      backup.clients.client1.name = 'evil\n[Peer]';
+      const backupJson = JSON.stringify(backup);
 
       await expect(wg.restoreConfiguration(backupJson))
-        .rejects.toThrow(/invalid client name/);
+        .rejects.toThrow(/Invalid client name/);
+    });
+
+    it('rejects injected client keys and unknown fields', async () => {
+      const backup = makeConfig();
+      backup.clients.client1.publicKey = `${KEYS.clientPublic}\nPostUp = touch /pwn`;
+      await expect(wg.restoreConfiguration(JSON.stringify(backup)))
+        .rejects.toThrow(/client\.publicKey/);
+
+      const backupWithUnknownField = makeConfig();
+      backupWithUnknownField.clients.client1.command = 'touch /pwn';
+      await expect(wg.restoreConfiguration(JSON.stringify(backupWithUnknownField)))
+        .rejects.toThrow(/Invalid client field/);
+    });
+
+    it('restores historical client subnets while new address edits remain restricted', async () => {
+      const backup = makeConfig();
+      backup.clients.client1.address = '192.168.50.2';
+      backup.clients.client1.addressV6 = 'fd99:42:42::2';
+      await expect(wg.restoreConfiguration(JSON.stringify(backup))).resolves.toBeUndefined();
+      await expect(wg.updateClientAddress({ clientId: 'client1', address: '172.16.0.2' }))
+        .rejects.toThrow(/must be a usable host/);
+    });
+  });
+
+  describe('server settings', () => {
+    it('rejects IPv6 templates that place the host inside the network prefix', async () => {
+      await expect(wg.updateServerConfig({ defaultAddressV6: 'fd42:x::' }))
+        .rejects.toThrow(/Invalid value for defaultAddressV6/);
+    });
+  });
+
+  describe('configuration loading', () => {
+    it('assigns collision-free IPv6 addresses to legacy clients', async () => {
+      const legacy = makeConfig();
+      delete legacy.server.addressV6;
+      delete legacy.clients.client1.addressV6;
+      fs.readFile.mockImplementation(async (filename) => {
+        if (String(filename).includes('server-settings')) {
+          const err = new Error('not found');
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return JSON.stringify(legacy);
+      });
+      const WireGuardClass = require('./WireGuard'); // eslint-disable-line global-require
+      const migrated = new WireGuardClass();
+
+      const config = await migrated.getConfig();
+      expect(config.server.addressV6).toBe('fd42:42:42::1');
+      expect(config.clients.client1.addressV6).toBe('fd42:42:42::2');
+    });
+
+    it('rolls back an interrupted server settings transaction on startup', async () => {
+      const previousConfig = makeConfig();
+      previousConfig.server.address = '10.8.0.5';
+      previousConfig.server.addressV6 = 'fd42:42:42::abcd';
+      previousConfig.clients.client1.address = '10.8.0.77';
+      previousConfig.clients.client1.addressV6 = 'fd42:42:42::beef';
+      const candidateConfig = JSON.parse(JSON.stringify(previousConfig));
+      candidateConfig.server.address = '10.9.0.5';
+      candidateConfig.server.addressV6 = 'fd43:42:42::abcd';
+      candidateConfig.clients.client1.address = '10.9.0.77';
+      candidateConfig.clients.client1.addressV6 = 'fd43:42:42::beef';
+      fs.readFile.mockImplementation(async (filename) => {
+        const name = String(filename);
+        if (name.endsWith('server-settings.json')) {
+          return JSON.stringify({ defaultAddress: '10.8.0.x' });
+        }
+        if (name.endsWith('server-settings.transaction.json')) {
+          return JSON.stringify({
+            previous: { defaultAddress: '10.8.0.x' },
+            candidate: { defaultAddress: '10.9.0.x' },
+            previousConfig,
+            candidateConfig,
+          });
+        }
+        return JSON.stringify(candidateConfig);
+      });
+      const WireGuardClass = require('./WireGuard'); // eslint-disable-line global-require
+      const recovering = new WireGuardClass();
+
+      const recovered = await recovering.getConfig();
+      expect(recovered.server.address).toBe('10.8.0.5');
+      expect(recovered.server.addressV6).toBe('fd42:42:42::abcd');
+      expect(recovered.clients.client1.address).toBe('10.8.0.77');
+      expect(recovered.clients.client1.addressV6).toBe('fd42:42:42::beef');
+    });
+
+    it('completes a settings transaction whose candidate was committed', async () => {
+      const WireGuardClass = require('./WireGuard'); // eslint-disable-line global-require
+      const defaults = new WireGuardClass();
+      const previous = { ...defaults.__serverSettings };
+      const candidate = { ...previous, port: 51830 };
+      const previousConfig = makeConfig();
+      const candidateConfig = makeConfig();
+      candidateConfig.server.address = '10.8.0.5';
+      fs.readFile.mockImplementation(async (filename) => {
+        const name = String(filename);
+        if (name.endsWith('server-settings.json')) return JSON.stringify(candidate);
+        if (name.endsWith('server-settings.transaction.json')) {
+          return JSON.stringify({
+            previous, candidate, previousConfig, candidateConfig,
+          });
+        }
+        return JSON.stringify(previousConfig);
+      });
+      const recovering = new WireGuardClass();
+
+      const recovered = await recovering.getConfig();
+      expect(recovering.__serverSettings.port).toBe(51830);
+      expect(recovered.server.address).toBe('10.8.0.5');
+    });
+
+    it('accepts existing names up to the historical 128-character limit', async () => {
+      const existing = makeConfig();
+      existing.clients.client1.name = 'a'.repeat(100);
+      fs.readFile.mockImplementation(async (filename) => {
+        if (String(filename).includes('server-settings')) {
+          const err = new Error('not found');
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return JSON.stringify(existing);
+      });
+      const WireGuardClass = require('./WireGuard'); // eslint-disable-line global-require
+      const compatible = new WireGuardClass();
+
+      await expect(compatible.getConfig()).resolves.toMatchObject({
+        clients: { client1: { name: 'a'.repeat(100) } },
+      });
+    });
+
+    it('does not assign a legacy client the server IPv6 address', async () => {
+      const legacy = makeConfig();
+      legacy.server.addressV6 = 'fd42:42:42::2';
+      delete legacy.clients.client1.addressV6;
+      fs.readFile.mockImplementation(async (filename) => {
+        if (String(filename).includes('server-settings')) {
+          const err = new Error('not found');
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return JSON.stringify(legacy);
+      });
+      const WireGuardClass = require('./WireGuard'); // eslint-disable-line global-require
+      const migrated = new WireGuardClass();
+
+      const config = await migrated.getConfig();
+      expect(config.clients.client1.addressV6).toBe('fd42:42:42::3');
+    });
+
+    it('does not overwrite a corrupt wg0.json', async () => {
+      fs.readFile.mockImplementation(async (filename) => {
+        if (String(filename).includes('server-settings')) {
+          const err = new Error('not found');
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return '{not-json';
+      });
+      const WireGuardClass = require('./WireGuard'); // eslint-disable-line global-require
+      const corrupt = new WireGuardClass();
+
+      await expect(corrupt.getConfig()).rejects.toThrow(/was not overwritten/);
+      expect(fs.writeFile).not.toHaveBeenCalled();
+    });
+
+    it('propagates filesystem errors instead of generating new keys', async () => {
+      fs.readFile.mockImplementation(async (filename) => {
+        const err = new Error('permission denied');
+        err.code = String(filename).includes('server-settings') ? 'ENOENT' : 'EACCES';
+        throw err;
+      });
+      const WireGuardClass = require('./WireGuard'); // eslint-disable-line global-require
+      const inaccessible = new WireGuardClass();
+
+      await expect(inaccessible.getConfig()).rejects.toThrow(/Failed to read wg0\.json/);
+      expect(Util.exec).not.toHaveBeenCalledWith('wg genkey');
     });
   });
 

@@ -21,10 +21,17 @@ class API {
       return undefined;
     }
 
-    const json = await res.json();
+    const text = await res.text();
+    let json;
+    try {
+      json = text ? JSON.parse(text) : undefined;
+    } catch {
+      if (!res.ok) throw new Error(text || res.statusText);
+      throw new Error('El servidor devolvió una respuesta inválida.');
+    }
 
     if (!res.ok) {
-      throw new Error(json.error || res.statusText);
+      throw new Error((json && (json.error || json.message)) || res.statusText);
     }
 
     return json;
@@ -44,7 +51,7 @@ class API {
     });
   }
 
-  async getuiTrafficStats() {
+  async getUiTrafficStats() {
     return this.call({
       method: 'get',
       path: '/ui-traffic-stats',
@@ -103,38 +110,43 @@ class API {
   }
 
   async deleteClient({ clientId }) {
+    const id = encodeURIComponent(clientId);
     return this.call({
       method: 'delete',
-      path: `/wireguard/client/${clientId}`,
+      path: `/wireguard/client/${id}`,
     });
   }
 
   async enableClient({ clientId }) {
+    const id = encodeURIComponent(clientId);
     return this.call({
       method: 'post',
-      path: `/wireguard/client/${clientId}/enable`,
+      path: `/wireguard/client/${id}/enable`,
     });
   }
 
   async disableClient({ clientId }) {
+    const id = encodeURIComponent(clientId);
     return this.call({
       method: 'post',
-      path: `/wireguard/client/${clientId}/disable`,
+      path: `/wireguard/client/${id}/disable`,
     });
   }
 
   async updateClientName({ clientId, name }) {
+    const id = encodeURIComponent(clientId);
     return this.call({
       method: 'put',
-      path: `/wireguard/client/${clientId}/name/`,
+      path: `/wireguard/client/${id}/name/`,
       body: { name },
     });
   }
 
   async updateClientAddress({ clientId, address, addressV6 }) {
+    const id = encodeURIComponent(clientId);
     return this.call({
       method: 'put',
-      path: `/wireguard/client/${clientId}/address/`,
+      path: `/wireguard/client/${id}/address/`,
       body: { address, addressV6 },
     });
   }
@@ -150,26 +162,29 @@ class API {
   async addPortForward({
     clientId, proto, extPort, intPort,
   }) {
+    const id = encodeURIComponent(clientId);
     return this.call({
       method: 'post',
-      path: `/wireguard/client/${clientId}/port-forward`,
+      path: `/wireguard/client/${id}/port-forward`,
       body: { proto, extPort, intPort },
     });
   }
 
   async removePortForward({ clientId, index }) {
+    const id = encodeURIComponent(clientId);
     return this.call({
       method: 'delete',
-      path: `/wireguard/client/${clientId}/port-forward/${index}`,
+      path: `/wireguard/client/${id}/port-forward/${index}`,
     });
   }
 
   async updatePortForward({
     clientId, index, proto, extPort, intPort,
   }) {
+    const id = encodeURIComponent(clientId);
     return this.call({
       method: 'put',
-      path: `/wireguard/client/${clientId}/port-forward/${index}`,
+      path: `/wireguard/client/${id}/port-forward/${index}`,
       body: { proto, extPort, intPort },
     });
   }
