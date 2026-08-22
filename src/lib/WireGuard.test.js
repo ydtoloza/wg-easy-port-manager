@@ -437,6 +437,16 @@ describe('WireGuard', () => {
       await expect(wg.updateServerConfig({ defaultAddressV6: 'fd42:x::' }))
         .rejects.toThrow(/Invalid value for defaultAddressV6/);
     });
+
+    it('never echoes secret-bearing settings in server-config responses', async () => {
+      await wg.getConfig();
+      // Simulate a future release storing a secret among the settings.
+      wg.__serverSettings.webhookSecret = 'supersecret-value';
+      const response = await wg.getServerConfig();
+      expect(response.webhookSecret).toBeUndefined();
+      expect(JSON.stringify(response)).not.toContain('supersecret-value');
+      expect(response.host).toBe('10.0.0.1');
+    });
   });
 
   describe('configuration loading', () => {
