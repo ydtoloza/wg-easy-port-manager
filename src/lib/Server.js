@@ -517,6 +517,18 @@ module.exports = class Server {
         await WireGuard.updateClientName({ clientId, name });
         return { success: true };
       }))
+      .put('/api/wireguard/client/:clientId/keepalive', defineEventHandler(async (event) => {
+        const clientId = getRouterParam(event, 'clientId');
+        if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+          throw createError({ status: 403 });
+        }
+        const { persistentKeepalive } = await readBodyLimited(event);
+        if (persistentKeepalive !== null
+          && (!Number.isInteger(persistentKeepalive) || persistentKeepalive < 0 || persistentKeepalive > 65535)) {
+          throw createError({ status: 400, message: 'persistentKeepalive must be null or an integer between 0 and 65535' });
+        }
+        return WireGuard.updateClientKeepalive({ clientId, persistentKeepalive });
+      }))
       .put('/api/wireguard/client/:clientId/address', defineEventHandler(async (event) => {
         const clientId = getRouterParam(event, 'clientId');
         if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
