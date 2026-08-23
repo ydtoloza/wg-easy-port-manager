@@ -1,0 +1,29 @@
+[Unit]
+Description=wg-easy port manager agent (webhook-driven torrent port sync)
+Documentation=https://github.com/ydtoloza/wg-easy-port-manager/tree/main/contrib/agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Configuration is env-only. Keep the token out of this unit file (which is
+# often world-readable) — put the Environment lines in /etc/wgpm-agent.env
+# (chmod 600, root-owned) instead.
+EnvironmentFile=/etc/wgpm-agent.env
+# Adjust the path to where you placed agent.py (e.g. /opt/wgpm-agent/agent.py).
+ExecStart=/usr/bin/python3 /opt/wgpm-agent/agent.py
+Restart=always
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/wgpm-agent
+StateDirectory=wgpm-agent
+# Point WGPM_STATE_FILE at /var/lib/wgpm-agent/state.json in the env file,
+# since ProtectHome makes ~/.wgpm-agent.json unwritable.
+
+[Install]
+WantedBy=multi-user.target
