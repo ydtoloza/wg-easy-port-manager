@@ -14,6 +14,13 @@ jobs:
     if: github.repository_owner == 'ydtoloza'
     permissions:
       contents: read
+    strategy:
+      # The emulated arm64 leg intermittently dies with
+      # `qemu: uncaught target signal 4 (Illegal instruction)` during npm ci —
+      # a known runner/QEMU flake, not a code failure. Retry instead of
+      # forcing maintainers to click re-run.
+      max-attempts: 3
+      fail-fast: false
     steps:
     - uses: actions/checkout@v4
 
