@@ -827,6 +827,10 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
         downloadableConfig: 'privateKey' in client && client.privateKey != null,
         persistentKeepalive: null,
         latestHandshakeAt: null,
+        endpoint: null,
+        // A handshake within 3x the effective keepalive (or 3x 180s when no
+        // keepalive is configured) means the peer is reachable right now.
+        online: false,
         transferRx: null,
         transferTx: null,
       }));
@@ -844,7 +848,7 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
             const [
               publicKey,
               preSharedKey, // eslint-disable-line no-unused-vars
-              endpoint, // eslint-disable-line no-unused-vars
+              endpoint,
               allowedIps, // eslint-disable-line no-unused-vars
               latestHandshakeAt,
               transferRx,
@@ -858,12 +862,21 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
             client.latestHandshakeAt = latestHandshakeAt === '0'
               ? null
               : new Date(Number(`${latestHandshakeAt}000`));
+            client.endpoint = endpoint && endpoint !== '(none)' ? endpoint : null;
             client.transferRx = Number(transferRx);
             client.transferTx = Number(transferTx);
             client.persistentKeepalive = persistentKeepalive;
           });
       } catch (err) {
         debug(`Warning: Could not fetch wireguard dump: ${err.message}`);
+      }
+
+      const now = Date.now();
+      for (const client of clients) {
+        if (!client.latestHandshakeAt) continue;
+        const effectiveKeepalive = Number(this.__serverSettings.persistentKeepalive) || 180;
+        const onlineWindowMs = 3 * effectiveKeepalive * 1000;
+        client.online = (now - client.latestHandshakeAt.getTime()) < onlineWindowMs;
       }
 
       return clients;
