@@ -44,7 +44,7 @@ const CLIENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const RESERVED_CLIENT_IDS = new Set(['__proto__', 'constructor', 'prototype']);
 const SERVER_SETTING_KEYS = ['host', 'port', 'configPort', 'device', 'defaultDns',
   'defaultAddress', 'defaultAddressV6', 'enableIpv6', 'mtu', 'allowedIps',
-  'persistentKeepalive', 'portFwdMin', 'portFwdMax'];
+  'persistentKeepalive', 'portFwdMin', 'portFwdMax', 'forwardingEnabled'];
 // Settings that must never be echoed by the server-config API. None of the
 // current settings are secret, but when new secret-bearing settings are added
 // to SERVER_SETTING_KEYS (e.g. v2.1 webhook/Bearer secrets) they MUST be
@@ -127,6 +127,10 @@ module.exports = class WireGuard {
       persistentKeepalive: Number(WG_PERSISTENT_KEEPALIVE),
       portFwdMin: Number(WG_PORT_FWD_MIN),
       portFwdMax: Number(WG_PORT_FWD_MAX),
+      // Kill-switch: when false, no DNAT rules are emitted at all (the
+      // forwarding config itself is preserved). Tolerant migration: settings
+      // files written before this key existed keep the default.
+      forwardingEnabled: true,
     };
     this.__config = null;
     this.__initPromise = null;
@@ -200,6 +204,7 @@ module.exports = class WireGuard {
         || (Number.isInteger(Number(value)) && Number(value) >= 0 && Number(value) <= 65535),
       portFwdMin: isPort,
       portFwdMax: isPort,
+      forwardingEnabled: (value) => typeof value === 'boolean',
     };
     const normalized = { ...base };
 
@@ -1568,6 +1573,9 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
     for (const client of clients) {
       if (!client.enabled || !client.portForwards || !client.portForwards.length) continue;
+      // Kill-switch: stop emitting DNAT (external reachability) while keeping
+      // the WireGuard filter rules and the stored forwarding config intact.
+      if (!this.__serverSettings.forwardingEnabled) break;
 
       const peerIP = client.address;
       const peerIPv6 = this.__serverSettings.enableIpv6 ? client.addressV6 : null;

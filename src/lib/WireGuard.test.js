@@ -370,6 +370,60 @@ describe('WireGuard', () => {
     });
   });
 
+  describe('forwarding kill-switch', () => {
+    it('defaults to enabled and tolerates settings files without the key', async () => {
+      const settings = await wg.getServerConfig();
+      expect(settings.forwardingEnabled).toBe(true);
+    });
+
+    it('emitting with the switch off omits DNAT rules but preserves the config', async () => {
+      await wg.getConfig();
+      await wg.updateServerConfig({ forwardingEnabled: false });
+
+      const ruleset = Util.execFile.mock.calls.findLast((call) => call[0] === 'nft')[2].input;
+      expect(ruleset).not.toContain('dnat to');
+
+      const config = await wg.getConfig();
+      expect(config.clients.client1.portForwards).toHaveLength(1);
+    });
+
+    it('restores DNAT when switched back on', async () => {
+      await wg.getConfig();
+      await wg.updateServerConfig({ forwardingEnabled: false });
+      await wg.updateServerConfig({ forwardingEnabled: true });
+
+      const ruleset = Util.execFile.mock.calls.findLast((call) => call[0] === 'nft')[2].input;
+      expect(ruleset).toContain('dnat to 10.8.0.2:2000');
+    });
+
+    it('gates the boot-time emit too', async () => {
+      fs.readFile.mockImplementation(async (filename) => {
+        const name = String(filename);
+        if (name.endsWith('server-settings.json')) {
+          return JSON.stringify({ forwardingEnabled: false });
+        }
+        if (name.includes('server-settings')) {
+          const err = new Error('not found');
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return JSON.stringify(makeConfig());
+      });
+      const WireGuardClass = require('./WireGuard'); // eslint-disable-line global-require
+      const booting = new WireGuardClass();
+      await booting.getConfig();
+      await booting.__applyAllNetworkRules();
+
+      const ruleset = Util.execFile.mock.calls.findLast((call) => call[0] === 'nft')[2].input;
+      expect(ruleset).not.toContain('dnat to');
+    });
+
+    it('rejects non-boolean values', async () => {
+      await expect(wg.updateServerConfig({ forwardingEnabled: 'yes' }))
+        .rejects.toMatchObject({ statusCode: 400 });
+    });
+  });
+
   describe('online flag and endpoint exposure', () => {
     const dumpLine = ({ endpoint = '203.0.113.9:51820', handshakeSecondsAgo = 0 }) => [
       KEYS.clientPublic,
