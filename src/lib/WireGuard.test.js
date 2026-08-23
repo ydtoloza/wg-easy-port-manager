@@ -487,6 +487,8 @@ describe('WireGuard', () => {
       const bad = JSON.parse(JSON.stringify(config));
       bad.clients.client1.persistentKeepalive = 'always';
       await expect(wg.restoreConfiguration(JSON.stringify(bad))).rejects.toMatchObject({ statusCode: 400 });
+    });
+  });
 
   describe('restoreConfiguration', () => {
     it('rolls back disk and host on failure', async () => {
