@@ -564,8 +564,9 @@ new Vue({
     },
     confirmRemovePortForward() {
       if (!this.pfDelete) return;
-      const { client, index } = this.pfDelete;
-      this.api.removePortForward({ clientId: client.id, index })
+      const { client, rule } = this.pfDelete;
+      if (!rule || !rule.id) return;
+      this.api.removePortForward({ clientId: client.id, ruleId: rule.id })
         .catch((err) => this.notify(err.message || err.toString()))
         .finally(() => {
           this.pfDelete = null;
@@ -584,16 +585,17 @@ new Vue({
     },
     updatePortForward(client) {
       if (!this.editingPfRule || !this.editingPfRule.extPort || !this.editingPfRule.intPort) return;
+      if (!this.editingPfRule.id) return;
 
       this.pfError = null;
 
       // Client-side duplicate check (skip current rule being edited)
       const extPort = Number(this.editingPfRule.extPort);
       const proto = this.editingPfRule.proto || 'tcp';
-      const idx = this.editingPfIndex;
+      const editingId = this.editingPfRule.id;
       const alreadyUsed = this.clients.some((c) => Array.isArray(c.portForwards)
-        && c.portForwards.some((r, i) => {
-          if (c.id === client.id && i === idx) return false;
+        && c.portForwards.some((r) => {
+          if (c.id === client.id && r.id === editingId) return false;
           return (r.proto === proto || r.proto === 'both' || proto === 'both') && r.extPort === extPort;
         }));
       if (alreadyUsed) {
@@ -603,7 +605,7 @@ new Vue({
 
       this.api.updatePortForward({
         clientId: client.id,
-        index: idx,
+        ruleId: editingId,
         proto,
         extPort,
         intPort: this.editingPfRule.intPort,
