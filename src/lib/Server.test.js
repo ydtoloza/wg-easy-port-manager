@@ -332,12 +332,59 @@ describe('HTTP server security', () => {
 
     it('serves the peer probe route now that the probe feature merged', async () => {
       WireGuard.lookupPeerToken.mockResolvedValue('client1');
-      const response = await fetch(`${baseUrl}/api/peer/me/port-forward/0/probe`, {
+      const ruleId = '11111111-2222-3333-4444-555555555555';
+      const response = await fetch(`${baseUrl}/api/peer/me/port-forward/${ruleId}/probe`, {
         headers: { Authorization: peerToken },
       });
       expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({ verdict: 'ok' });
-      expect(WireGuard.probePortForward).toHaveBeenCalledWith({ clientId: 'client1', rule: '0' });
+      expect(WireGuard.probePortForward).toHaveBeenCalledWith({ clientId: 'client1', rule: ruleId });
+    });
+
+    it('rejects coercible-but-invalid ports strictly on peer routes', async () => {
+      WireGuard.lookupPeerToken.mockResolvedValue('client1');
+      for (const bad of [true, '0x10', '5e2', 0, 65536]) {
+        const response = await fetch(`${baseUrl}/api/peer/me/port-forward`, {
+          method: 'POST',
+          headers: { Authorization: peerToken, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ proto: 'tcp', extPort: bad, intPort: 80 }),
+        });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({ statusCode: 400, error: 'Invalid ports' });
+      }
+      expect(WireGuard.addPortForward).not.toHaveBeenCalledWith('client1', 'tcp', 16, 80);
+      expect(WireGuard.addPortForward).not.toHaveBeenCalledWith('client1', 'tcp', 1, 80);
+    });
+
+    it('rejects digit-string rule ids on the peer id routes instead of addressing by index', async () => {
+      WireGuard.lookupPeerToken.mockResolvedValue('client1');
+      WireGuard.updatePortForwardByRuleId.mockClear();
+      WireGuard.removePortForwardByRuleId.mockClear();
+
+      const updated = await fetch(`${baseUrl}/api/peer/me/port-forward/id/0`, {
+        method: 'PUT',
+        headers: { Authorization: peerToken, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proto: 'tcp', extPort: 3000, intPort: 3000 }),
+      });
+      expect(updated.status).toBe(400);
+      expect(WireGuard.updatePortForwardByRuleId).not.toHaveBeenCalled();
+
+      const removed = await fetch(`${baseUrl}/api/peer/me/port-forward/id/1`, {
+        method: 'DELETE',
+        headers: { Authorization: peerToken },
+      });
+      expect(removed.status).toBe(400);
+      expect(WireGuard.removePortForwardByRuleId).not.toHaveBeenCalled();
+    });
+
+    it('rejects numeric ids on the peer probe route', async () => {
+      WireGuard.lookupPeerToken.mockResolvedValue('client1');
+      WireGuard.probePortForward.mockClear();
+      const response = await fetch(`${baseUrl}/api/peer/me/port-forward/0/probe`, {
+        headers: { Authorization: peerToken },
+      });
+      expect(response.status).toBe(400);
+      expect(WireGuard.probePortForward).not.toHaveBeenCalled();
     });
   });
 
