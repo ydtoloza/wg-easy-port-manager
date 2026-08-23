@@ -402,6 +402,12 @@ module.exports = class WireGuard {
       if (!Array.isArray(client.portForwards)) {
         client.portForwards = [];
       }
+      // Stable rule ids: every rule gets one at creation; migrate old configs
+      // by healing MISSING ids. A present-but-malformed id is corruption and
+      // fails validation below rather than being silently re-addressed.
+      for (const rule of client.portForwards) {
+        if (isPlainObject(rule) && (rule.id === undefined || rule.id === null)) rule.id = crypto.randomUUID();
+      }
       if (client.networkPolicy === undefined || client.networkPolicy === null) {
         client.networkPolicy = createDefaultNetworkPolicy();
       }
@@ -424,6 +430,7 @@ module.exports = class WireGuard {
         if (host === undefined) throw new Error('Maximum number of clients reached.');
         client.address = this.__serverSettings.defaultAddress.replace('x', host);
       }
+      if (client.persistentKeepalive === undefined) client.persistentKeepalive = null;
     }
 
     if (this.__serverSettings.enableIpv6 && !config.server.addressV6) {
@@ -482,7 +489,8 @@ module.exports = class WireGuard {
     const forwardedPorts = new Set();
     const networkPolicies = new Map();
     const allowedClientKeys = ['id', 'name', 'address', 'addressV6', 'privateKey', 'publicKey',
-      'preSharedKey', 'createdAt', 'updatedAt', 'enabled', 'portForwards', 'allowedIPs', 'networkPolicy'];
+      'preSharedKey', 'createdAt', 'updatedAt', 'enabled', 'portForwards', 'allowedIPs', 'networkPolicy',
+      'persistentKeepalive'];
 
     for (const [clientId, client] of Object.entries(config.clients)) {
       if (!CLIENT_ID_RE.test(clientId) || RESERVED_CLIENT_IDS.has(clientId) || !isPlainObject(client)) {
@@ -522,6 +530,11 @@ module.exports = class WireGuard {
         && (!Array.isArray(client.allowedIPs) || client.allowedIPs.some((value) => typeof value !== 'string' || /[\r\n]/.test(value)))) {
         throw new ServerError(`Invalid client.allowedIPs: ${clientId}`, 400);
       }
+      if (client.persistentKeepalive !== undefined && client.persistentKeepalive !== null
+        && (!Number.isInteger(client.persistentKeepalive)
+          || client.persistentKeepalive < 0 || client.persistentKeepalive > 65535)) {
+        throw new ServerError(`Invalid client.persistentKeepalive: ${clientId}`, 400);
+      }
       if (!Array.isArray(client.portForwards)) {
         throw new ServerError(`Invalid client.portForwards: ${clientId}`, 400);
       }
@@ -529,7 +542,10 @@ module.exports = class WireGuard {
 
       for (const rule of client.portForwards) {
         if (!isPlainObject(rule)) throw new ServerError(`Invalid port forward for ${clientId}`, 400);
-        if (strict && Object.keys(rule).some((key) => !['proto', 'extPort', 'intPort'].includes(key))) {
+        if (!Util.isValidRuleId(rule.id)) {
+          throw new ServerError(`Invalid port forward id for ${clientId}`, 400);
+        }
+        if (strict && Object.keys(rule).some((key) => !['id', 'proto', 'extPort', 'intPort'].includes(key))) {
           throw new ServerError(`Invalid port forward field for ${clientId}`, 400);
         }
         if (!['tcp', 'udp', 'both'].includes(rule.proto)
@@ -899,7 +915,7 @@ ${this.__serverSettings.mtu ? `MTU = ${this.__serverSettings.mtu}\n` : ''}\
 PublicKey = ${config.server.publicKey}
 ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
 }AllowedIPs = ${this.__serverSettings.allowedIps}
-PersistentKeepalive = ${this.__serverSettings.persistentKeepalive}
+PersistentKeepalive = ${client.persistentKeepalive ?? this.__serverSettings.persistentKeepalive}
 Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     });
   }
@@ -1055,6 +1071,28 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     });
   }
 
+  async updateClientKeepalive({ clientId, persistentKeepalive }) {
+    return this.__withMutation(async () => {
+      const client = await this.getClient({ clientId });
+      if (persistentKeepalive !== null
+        && (!Number.isInteger(persistentKeepalive) || persistentKeepalive < 0 || persistentKeepalive > 65535)) {
+        throw new ServerError('persistentKeepalive must be null or an integer between 0 and 65535', 400);
+      }
+      const previous = { persistentKeepalive: client.persistentKeepalive ?? null, updatedAt: client.updatedAt };
+      await this.__transactionalConfigChange(
+        () => {
+          client.persistentKeepalive = persistentKeepalive;
+          client.updatedAt = new Date();
+        },
+        () => {
+          Object.assign(client, previous);
+        },
+        { context: 'update-client-keepalive' },
+      );
+      return { persistentKeepalive, updatedAt: client.updatedAt };
+    });
+  }
+
   async updateClientAddress({ clientId, address, addressV6 }) {
     return this.__withMutation(async () => {
       const config = await this.getConfig();
@@ -1199,10 +1237,14 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
               client.updatedAt = new Date(Math.max(Date.parse(client.updatedAt), Date.now())).toISOString();
             }
             if (!Array.isArray(client.portForwards)) client.portForwards = [];
+            for (const rule of client.portForwards) {
+              if (isPlainObject(rule) && (rule.id === undefined || rule.id === null)) rule.id = crypto.randomUUID();
+            }
             if (client.networkPolicy === undefined || client.networkPolicy === null) {
               client.networkPolicy = createDefaultNetworkPolicy();
             }
             client.networkPolicy = this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false });
+            if (client.persistentKeepalive === undefined) client.persistentKeepalive = null;
           }
         }
       }
@@ -1596,6 +1638,97 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     return this.__withMutation(() => this.__addPortForward(clientId, proto, extPort, intPort));
   }
 
+  // Stable-id addressing: resolve the rule id to its index INSIDE the queued
+  // operation so sibling mutations cannot shift the resolution underneath us.
+  async removePortForwardById(clientId, ruleId) {
+    if (!Util.isValidRuleId(ruleId)) throw new ServerError('Invalid rule id', 400);
+    return this.__withMutation(async () => {
+      const index = this.__findPortForwardIndex(clientId, ruleId);
+      return this.__removePortForward(clientId, index);
+    });
+  }
+
+  async updatePortForwardById(clientId, ruleId, proto, extPort, intPort) {
+    if (!Util.isValidRuleId(ruleId)) throw new ServerError('Invalid rule id', 400);
+    return this.__withMutation(async () => {
+      const index = this.__findPortForwardIndex(clientId, ruleId);
+      return this.__updatePortForward(clientId, index, proto, extPort, intPort);
+    });
+  }
+
+  __findPortForwardIndex(clientId, ruleId) {
+    const client = this.__config ? this.__config.clients[clientId] : null;
+    const rules = client && Array.isArray(client.portForwards) ? client.portForwards : [];
+    const index = rules.findIndex((rule) => rule && rule.id === ruleId);
+    if (index === -1) throw new ServerError('Port forward rule not found', 404);
+    return index;
+  }
+
+  // Sticky auto-assign: prefer ports this peer already holds (so a tracker
+  // keyed on the external port keeps working across re-adds), then the
+  // deterministic lowest-free scan. Scan and claim happen in ONE queued
+  // operation — scanning from a route would let parallel requests race for
+  // the same port.
+  async autoAssignPortForward(clientId, {
+    proto, intPort, rangeStart, rangeEnd,
+  } = {}) {
+    return this.__withMutation(async () => {
+      if (!['tcp', 'udp', 'both'].includes(proto)) {
+        throw new ServerError('proto must be tcp, udp or both', 400);
+      }
+      const internalPort = Util.parsePort(intPort);
+      if (!Number.isInteger(internalPort) || internalPort < 1 || internalPort > 65535) {
+        throw new ServerError('Invalid internal port (must be 1-65535)', 400);
+      }
+      let min = null;
+      let max = null;
+      if (rangeStart !== undefined && rangeStart !== null) {
+        min = Util.parsePort(rangeStart);
+        if (!Number.isInteger(min) || min < 1 || min > 65535) {
+          throw new ServerError('Invalid rangeStart (must be 1-65535)', 400);
+        }
+      }
+      if (rangeEnd !== undefined && rangeEnd !== null) {
+        max = Util.parsePort(rangeEnd);
+        if (!Number.isInteger(max) || max < 1 || max > 65535) {
+          throw new ServerError('Invalid rangeEnd (must be 1-65535)', 400);
+        }
+      }
+      if (min !== null && max !== null && min > max) {
+        throw new ServerError('rangeStart cannot be greater than rangeEnd', 400);
+      }
+
+      const config = await this.getConfig();
+      const client = config.clients[clientId];
+      if (!client) throw new ServerError(`Client not found: ${clientId}`, 404);
+      const rules = Array.isArray(client.portForwards) ? client.portForwards : [];
+
+      const windowMin = Math.max(Number(this.__serverSettings.portFwdMin), min ?? 1);
+      const windowMax = Math.min(Number(this.__serverSettings.portFwdMax), max ?? 65535);
+
+      // Sticky candidates first (ascending), then the deterministic scan.
+      const sticky = [...new Set(rules.map((rule) => rule.extPort))].sort((a, b) => a - b);
+      const candidates = [...sticky, ...Array.from(
+        { length: Math.max(0, windowMax - windowMin + 1) },
+        (_, offset) => windowMin + offset,
+      )];
+
+      const inUse = (port) => Object.values(config.clients).some((peer) => Array.isArray(peer.portForwards)
+        && peer.portForwards.some((rule) => (rule.proto === proto || rule.proto === 'both' || proto === 'both')
+          && rule.extPort === port));
+
+      for (const port of candidates) {
+        if (port < windowMin || port > windowMax) continue; // sticky ports may fall outside the requested window
+        // __isPortAllowed enforces the policy window and the reserved ports
+        // (server port, config port).
+        if (!this.__isPortAllowed(port)) continue;
+        if (inUse(port)) continue;
+        return this.__addPortForward(clientId, proto, port, internalPort);
+      }
+      throw new ServerError('No free port available in the configured range', 409);
+    });
+  }
+
   async __addPortForward(clientId, proto, extPort, intPort) {
     if (process.platform !== 'linux') {
       debug('Preview: Simulated adding port forward');
@@ -1634,15 +1767,19 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         && r.extPort === port));
     if (crossConflict) throw new ServerError(`Port ${proto}/${port} is already assigned to another peer`, 409);
 
+    const created = {
+      id: crypto.randomUUID(), proto, extPort: port, intPort: internalPort,
+    };
     await this.__transactionalDnatChange(
       () => {
-        client.portForwards.push({ proto, extPort: port, intPort: internalPort });
+        client.portForwards.push(created);
       },
       () => {
         client.portForwards.pop();
       },
       'add-port-forward',
     );
+    return { ...created };
   }
 
   async removePortForward(clientId, index) {
@@ -1735,15 +1872,22 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     if (crossConflict) throw new ServerError(`Port ${proto}/${port} is already assigned to another peer`, 409);
 
     const oldRule = client.portForwards[idx];
+    const updated = {
+      id: Util.isValidRuleId(oldRule.id) ? oldRule.id : crypto.randomUUID(),
+      proto,
+      extPort: port,
+      intPort: internalPort,
+    };
     await this.__transactionalDnatChange(
       () => {
-        client.portForwards[idx] = { proto, extPort: port, intPort: internalPort };
+        client.portForwards[idx] = updated;
       },
       () => {
         client.portForwards[idx] = oldRule;
       },
       'update-port-forward',
     );
+    return { ...updated };
   }
 
 };
