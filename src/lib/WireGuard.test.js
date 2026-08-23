@@ -97,6 +97,17 @@ describe('WireGuard', () => {
     Util.isValidName.mockImplementation((s) => typeof s === 'string' && s.length > 0 && s.length <= 128
       // eslint-disable-next-line no-control-regex
       && !/[\u0000-\u001f\u007f]/.test(s));
+    Util.parsePort.mockImplementation((value) => {
+      if (typeof value === 'number') return value;
+      if (typeof value === 'string' && value !== '' && /^\d+$/.test(value)) return Number(value);
+      return NaN;
+    });
+    Util.isValidPort.mockImplementation((value) => {
+      const port = Util.parsePort(value);
+      return Number.isInteger(port) && port >= 1 && port <= 65535;
+    });
+    Util.isValidRuleId.mockImplementation((value) => typeof value === 'string'
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value));
 
     // mock linux to bypass process.platform check in mutating methods
     Object.defineProperty(process, 'platform', { value: 'linux' });
@@ -410,6 +421,126 @@ describe('WireGuard', () => {
     it('rejects non-boolean values', async () => {
       await expect(wg.updateServerConfig({ forwardingEnabled: 'yes' }))
         .rejects.toMatchObject({ statusCode: 400 });
+    });
+  });
+
+  describe('online flag and endpoint exposure', () => {
+    const dumpLine = ({ endpoint = '203.0.113.9:51820', handshakeSecondsAgo = 0 }) => [
+      KEYS.clientPublic,
+      KEYS.preShared,
+      endpoint,
+      '10.8.0.2/32',
+      String(Math.floor(Date.now() / 1000) - handshakeSecondsAgo),
+      '1000',
+      '2000',
+      '0',
+    ].join('\t');
+
+    it('marks a fresh handshake online and passes the endpoint through', async () => {
+      await wg.getConfig();
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
+          return `server-line\n${dumpLine({ handshakeSecondsAgo: 10 })}`;
+        }
+        return '';
+      });
+      const clients = await wg.getClients();
+      expect(clients[0].online).toBe(true);
+      expect(clients[0].endpoint).toBe('203.0.113.9:51820');
+    });
+
+    it('marks a stale handshake offline', async () => {
+      await wg.getConfig();
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
+          // Global keepalive is 25s in the mocked config -> window is 75s.
+          return `server-line\n${dumpLine({ handshakeSecondsAgo: 300 })}`;
+        }
+        return '';
+      });
+      const clients = await wg.getClients();
+      expect(clients[0].online).toBe(false);
+      expect(clients[0].endpoint).toBe('203.0.113.9:51820');
+    });
+
+    it('uses a 3x180s window when no keepalive is configured', async () => {
+      await wg.getConfig();
+      wg.__serverSettings.persistentKeepalive = 0;
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
+          return `server-line\n${dumpLine({ handshakeSecondsAgo: 400 })}`;
+        }
+        return '';
+      });
+      const clients = await wg.getClients();
+      // 400s ago is inside the 540s fallback window.
+      expect(clients[0].online).toBe(true);
+    });
+
+    it('treats no-handshake and (none) endpoint as offline/null', async () => {
+      await wg.getConfig();
+      // handshake '0' means "never handshaked".
+      const line = [
+        KEYS.clientPublic, KEYS.preShared, '(none)', '10.8.0.2/32', '0', '0', '0', '0',
+      ].join('\t');
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return `server-line\n${line}`;
+        return '';
+      });
+      const clients = await wg.getClients();
+      expect(clients[0].online).toBe(false);
+      expect(clients[0].endpoint).toBeNull();
+      expect(clients[0].latestHandshakeAt).toBeNull();
+    });
+  });
+
+  describe('per-peer persistentKeepalive', () => {
+    it('migrates missing values to null and honors overrides in generated configs', async () => {
+      await wg.getConfig();
+      expect((await wg.getConfig()).clients.client1.persistentKeepalive).toBeNull();
+
+      await wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 25 });
+      const conf = await wg.getClientConfiguration({ clientId: 'client1' });
+      expect(conf).toContain('PersistentKeepalive = 25');
+    });
+
+    it('falls back to the global setting when no override is set', async () => {
+      await wg.getConfig();
+      // Mocked config sets WG_PERSISTENT_KEEPALIVE '25'.
+      const conf = await wg.getClientConfiguration({ clientId: 'client1' });
+      expect(conf).toContain('PersistentKeepalive = 25');
+
+      await wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 0 });
+      const zeroed = await wg.getClientConfiguration({ clientId: 'client1' });
+      expect(zeroed).toContain('PersistentKeepalive = 0');
+    });
+
+    it('validates bounds', async () => {
+      await wg.getConfig();
+      await expect(wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: -1 }))
+        .rejects.toMatchObject({ statusCode: 400 });
+      await expect(wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 65536 }))
+        .rejects.toMatchObject({ statusCode: 400 });
+      await expect(wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 25.5 }))
+        .rejects.toMatchObject({ statusCode: 400 });
+      await expect(wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: null }))
+        .resolves.toMatchObject({ persistentKeepalive: null });
+    });
+
+    it('survives backup -> restore round-trips', async () => {
+      await wg.getConfig();
+      await wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 45 });
+
+      const backup = JSON.parse(JSON.stringify(await wg.getConfig()));
+      // strict restore whitelists the field, so this must round-trip:
+      await wg.restoreConfiguration(JSON.stringify(backup));
+      const config = await wg.getConfig();
+      expect(config.clients.client1.persistentKeepalive).toBe(45);
+
+      // and validation rejects corrupt values on restore
+      const bad = JSON.parse(JSON.stringify(config));
+      bad.clients.client1.persistentKeepalive = 'always';
+      await expect(wg.restoreConfiguration(JSON.stringify(bad))).rejects.toMatchObject({ statusCode: 400 });
     });
   });
 
@@ -871,6 +1002,154 @@ describe('WireGuard', () => {
       await update.catch(() => {});
       const clients = await clientsPromise;
       expect(clients.find((client) => client.id === 'client1').name).toBe('client1');
+    });
+  });
+
+  describe('stable port-forward ids', () => {
+    it('assigns a valid id at creation and preserves it across updates', async () => {
+      await wg.getConfig();
+      const created = await wg.addPortForward('client1', 'tcp', 3000, 3000);
+      expect(created.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
+      const updated = await wg.updatePortForward('client1', 1, 'tcp', 3001, 3001);
+      expect(updated.id).toBe(created.id);
+
+      const config = await wg.getConfig();
+      expect(config.clients.client1.portForwards[1].id).toBe(created.id);
+    });
+
+    it('backfills ids for legacy rules on load and on restore', async () => {
+      const config = await wg.getConfig();
+      // The shared fixture ships rules without ids; migration must add them.
+      expect(Util.isValidRuleId(config.clients.client1.portForwards[0].id)).toBe(true);
+
+      const backup = makeConfig(); // no ids
+      await wg.restoreConfiguration(JSON.stringify(backup));
+      const restored = await wg.getConfig();
+      expect(Util.isValidRuleId(restored.clients.client1.portForwards[0].id)).toBe(true);
+    });
+
+    it('restore round-trips preserves existing rule ids', async () => {
+      const backup = makeConfig();
+      const originalId = '11111111-2222-3333-4444-555555555555';
+      backup.clients.client1.portForwards[0].id = originalId;
+      await wg.restoreConfiguration(JSON.stringify(backup));
+      const config = await wg.getConfig();
+      expect(config.clients.client1.portForwards[0].id).toBe(originalId);
+    });
+
+    it('rejects malformed rule ids at validation', async () => {
+      const bad = makeConfig();
+      bad.clients.client1.portForwards[0].id = 'not-a-uuid';
+      await expect(wg.restoreConfiguration(JSON.stringify(bad)))
+        .rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('deletes the intended rule by id even after sibling index shifts', async () => {
+      await wg.getConfig();
+      const first = await wg.addPortForward('client1', 'tcp', 3000, 3000);
+      const second = await wg.addPortForward('client1', 'tcp', 3001, 3001);
+      await wg.addPortForward('client1', 'tcp', 3002, 3002);
+
+      // A "stale view" edit removes index 0; the id-based delete of `second`
+      // must still remove exactly that rule, not whatever now sits at its old
+      // index.
+      await wg.removePortForward('client1', 0);
+      await wg.removePortForwardById('client1', second.id);
+
+      const config = await wg.getConfig();
+      const remaining = config.clients.client1.portForwards.map((rule) => rule.extPort);
+      expect(remaining).toContain(first.extPort);
+      expect(remaining).toContain(3002);
+      expect(remaining).not.toContain(3001);
+    });
+
+    it('returns 404 for an unknown rule id', async () => {
+      await wg.getConfig();
+      await expect(wg.removePortForwardById('client1', '11111111-2222-3333-4444-555555555555'))
+        .rejects.toMatchObject({ statusCode: 404 });
+      await expect(wg.updatePortForwardById('client1', '11111111-2222-3333-4444-555555555555', 'tcp', 3000, 3000))
+        .rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('rejects malformed rule ids before touching the queue', async () => {
+      await expect(wg.removePortForwardById('client1', 'zzz')).rejects.toMatchObject({ statusCode: 400 });
+    });
+  });
+
+  describe('autoAssignPortForward', () => {
+    it('assigns the lowest free port in the policy window', async () => {
+      await wg.getConfig();
+      const rule = await wg.autoAssignPortForward('client1', { proto: 'tcp', intPort: 80 });
+      // portFwdMin is 1024 in the mocked config and nothing else holds it.
+      expect(rule.extPort).toBe(1024);
+      expect(rule.proto).toBe('tcp');
+      expect(rule.intPort).toBe(80);
+      expect(Util.isValidRuleId(rule.id)).toBe(true);
+    });
+
+    it('prefers the port the peer already holds (sticky)', async () => {
+      await wg.getConfig();
+      // client1 holds tcp/2000; auto-assigning udp should reuse extPort 2000
+      // so port-keyed trackers keep working.
+      const rule = await wg.autoAssignPortForward('client1', { proto: 'udp', intPort: 53 });
+      expect(rule.extPort).toBe(2000);
+    });
+
+    it('skips ports held by other peers', async () => {
+      await wg.getConfig();
+      const twoPeers = makeConfig();
+      twoPeers.clients.client2 = {
+        id: 'client2',
+        name: 'client2',
+        address: '10.8.0.3',
+        addressV6: 'fd42:42:42::3',
+        privateKey: KEYS.clientPrivate,
+        publicKey: KEYS.client2Public,
+        preSharedKey: KEYS.preShared,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        enabled: true,
+        portForwards: [{ proto: 'tcp', extPort: 1024, intPort: 80 }],
+      };
+      await wg.restoreConfiguration(JSON.stringify(twoPeers));
+
+      const rule = await wg.autoAssignPortForward('client1', { proto: 'tcp', intPort: 8080 });
+      expect(rule.extPort).toBe(1025);
+    });
+
+    it('honours explicit range bounds and rejects inverted ones', async () => {
+      await wg.getConfig();
+      const rule = await wg.autoAssignPortForward('client1', {
+        proto: 'tcp', intPort: 80, rangeStart: 2000, rangeEnd: 2010,
+      });
+      expect(rule.extPort).toBeGreaterThanOrEqual(2000);
+      expect(rule.extPort).toBeLessThanOrEqual(2010);
+
+      await expect(wg.autoAssignPortForward('client1', {
+        proto: 'tcp', intPort: 80, rangeStart: 2010, rangeEnd: 2000,
+      })).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('returns 409 when the range is exhausted', async () => {
+      await wg.getConfig();
+      // Only candidate in range is the reserved server port (51820).
+      await expect(wg.autoAssignPortForward('client1', {
+        proto: 'tcp', intPort: 80, rangeStart: 51820, rangeEnd: 51820,
+      })).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it('gives N parallel assignments distinct ports', async () => {
+      await wg.getConfig();
+      const results = await Promise.all([
+        wg.autoAssignPortForward('client1', { proto: 'tcp', intPort: 1 }),
+        wg.autoAssignPortForward('client1', { proto: 'tcp', intPort: 2 }),
+        wg.autoAssignPortForward('client1', { proto: 'tcp', intPort: 3 }),
+      ]);
+      const ports = results.map((rule) => rule.extPort);
+      expect(new Set(ports).size).toBe(3);
+      const config = await wg.getConfig();
+      expect(config.clients.client1.portForwards).toHaveLength(4); // fixture rule + 3
     });
   });
 });
