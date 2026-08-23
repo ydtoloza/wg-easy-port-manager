@@ -554,7 +554,10 @@ module.exports = class Server {
         const clientId = event.node.req.wgpmPeerClientId;
         await requireSelfManagePorts(clientId);
         const { proto, extPort, intPort } = parsePeerPortBody(await readBodyLimited(event));
-        await WireGuard.addPortForward(clientId, proto, extPort, intPort);
+        // The queued wrapper re-checks selfManagePorts: a revoke landing
+        // between the pre-check above and the mutation's execution must
+        // still reject (TOCTOU).
+        await WireGuard.addPortForward(clientId, proto, extPort, intPort, { requireSelfManagePorts: true });
         return { success: true };
       }))
       .put('/api/peer/me/port-forward/id/:ruleId', defineEventHandler(async (event) => {
@@ -562,14 +565,14 @@ module.exports = class Server {
         await requireSelfManagePorts(clientId);
         const ruleId = getRouterParam(event, 'ruleId');
         const { proto, extPort, intPort } = parsePeerPortBody(await readBodyLimited(event));
-        await WireGuard.updatePortForwardByRuleId(clientId, ruleId, proto, extPort, intPort);
+        await WireGuard.updatePortForwardByRuleId(clientId, ruleId, proto, extPort, intPort, { requireSelfManagePorts: true });
         return { success: true };
       }))
       .delete('/api/peer/me/port-forward/id/:ruleId', defineEventHandler(async (event) => {
         const clientId = event.node.req.wgpmPeerClientId;
         await requireSelfManagePorts(clientId);
         const ruleId = getRouterParam(event, 'ruleId');
-        await WireGuard.removePortForwardByRuleId(clientId, ruleId);
+        await WireGuard.removePortForwardByRuleId(clientId, ruleId, { requireSelfManagePorts: true });
         return { success: true };
       }));
 

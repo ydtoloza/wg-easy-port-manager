@@ -1146,6 +1146,36 @@ describe('WireGuard', () => {
       const clients = await clientsPromise;
       expect(clients.find((client) => client.id === 'client1').name).toBe('client1');
     });
+
+    it('serves peer profiles and token lookups only after in-flight mutations settle', async () => {
+      await wg.getConfig();
+      const { token } = await wg.issueClientToken({ clientId: 'client1' });
+      let rejectSync;
+      const gate = new Promise((_, reject) => {
+        rejectSync = reject;
+      });
+      Util.exec.mockImplementationOnce(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg syncconf')) return gate;
+        return '';
+      });
+
+      // Memory holds 'renamed' while the commit stalls at wg syncconf.
+      const update = wg.updateClientName({ clientId: 'client1', name: 'renamed' });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      const profilePromise = wg.getPeerProfile({ clientId: 'client1' });
+      const lookupPromise = wg.lookupPeerToken(token);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // The commit fails and rolls back; both reads must observe the
+      // committed state, never the mid-mutation name.
+      rejectSync(new Error('sync failed'));
+      await update.catch(() => {});
+      const profile = await profilePromise;
+      expect(profile.name).toBe('client1');
+      expect(profile.portForwards).toHaveLength(1);
+      expect(await lookupPromise).toBe('client1');
+    });
   });
 
   describe('stable port-forward ids', () => {
@@ -1346,6 +1376,30 @@ describe('WireGuard', () => {
       expect((await wg.getPeerProfile({ clientId: 'client1' })).permissions.selfManagePorts).toBe(true);
       await expect(wg.setClientSelfManagePorts({ clientId: 'client1', enabled: 'yes' }))
         .rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('re-checks selfManagePorts inside the queued mutation (revoke in flight)', async () => {
+      await wg.getConfig();
+      await wg.setClientSelfManagePorts({ clientId: 'client1', enabled: true });
+      // The route-level pre-check passes on this snapshot...
+      const profile = await wg.getPeerProfile({ clientId: 'client1' });
+      expect(profile.permissions.selfManagePorts).toBe(true);
+
+      // ...then the admin revokes before the queued wrapper executes.
+      await wg.setClientSelfManagePorts({ clientId: 'client1', enabled: false });
+      await expect(wg.addPortForward('client1', 'tcp', 3000, 3000, { requireSelfManagePorts: true }))
+        .rejects.toMatchObject({ statusCode: 403 });
+
+      const ruleId = (await wg.getConfig()).clients.client1.portForwards[0].id;
+      await expect(wg.updatePortForwardByRuleId('client1', ruleId, 'tcp', 3000, 3000, { requireSelfManagePorts: true }))
+        .rejects.toMatchObject({ statusCode: 403 });
+      await expect(wg.removePortForwardByRuleId('client1', ruleId, { requireSelfManagePorts: true }))
+        .rejects.toMatchObject({ statusCode: 403 });
+      expect((await wg.getConfig()).clients.client1.portForwards).toHaveLength(1);
+
+      // The admin path stays ungated by the peer flag.
+      await expect(wg.addPortForward('client1', 'tcp', 3001, 3001))
+        .resolves.toMatchObject({ extPort: 3001 });
     });
 
     it('migrates selfManagePorts to false and validates hashes on restore', async () => {

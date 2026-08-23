@@ -1176,39 +1176,46 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
   // Constant-time lookup: every client's stored hash is compared (no early
   // exit), with timingSafeEqual over equal-length buffers. Returns the owning
-  // clientId or null.
+  // clientId or null. Snapshot read behind the mutation queue (same family as
+  // getClients): a lookup must never observe half-applied or rolled-back
+  // state — e.g. a revoke racing this very check.
   async lookupPeerToken(token) {
     if (typeof token !== 'string' || !/^wgpt_[0-9a-f]{64}$/.test(token)) return null;
     const presented = Buffer.from(sha256Hex(token), 'hex');
-    const config = await this.getConfig();
-    let match = null;
-    for (const client of Object.values(config.clients)) {
-      if (!TOKEN_HASH_RE.test(client.tokenHash || '')) continue;
-      const stored = Buffer.from(client.tokenHash, 'hex');
-      if (presented.length === stored.length && crypto.timingSafeEqual(presented, stored)) {
-        match = client.id;
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      let match = null;
+      for (const client of Object.values(config.clients)) {
+        if (!TOKEN_HASH_RE.test(client.tokenHash || '')) continue;
+        const stored = Buffer.from(client.tokenHash, 'hex');
+        if (presented.length === stored.length && crypto.timingSafeEqual(presented, stored)) {
+          match = client.id;
+        }
       }
-    }
-    return match;
+      return match;
+    });
   }
 
   // Dedicated serializer for /api/peer/me — NEVER spread the raw client
   // (privateKey/preSharedKey/tokenHash must not leak to token holders).
+  // Snapshot read behind the mutation queue, like getClients.
   async getPeerProfile({ clientId }) {
-    const config = await this.getConfig();
-    const client = config.clients[clientId];
-    if (!client) throw new ServerError(`Client Not Found: ${clientId}`, 404);
-    return {
-      id: client.id,
-      name: client.name,
-      address: client.address,
-      addressV6: client.addressV6,
-      portForwards: (Array.isArray(client.portForwards) ? client.portForwards : [])
-        .map((rule) => ({ ...rule })),
-      permissions: {
-        selfManagePorts: client.selfManagePorts === true,
-      },
-    };
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      const client = config.clients[clientId];
+      if (!client) throw new ServerError(`Client Not Found: ${clientId}`, 404);
+      return {
+        id: client.id,
+        name: client.name,
+        address: client.address,
+        addressV6: client.addressV6,
+        portForwards: (Array.isArray(client.portForwards) ? client.portForwards : [])
+          .map((rule) => ({ ...rule })),
+        permissions: {
+          selfManagePorts: client.selfManagePorts === true,
+        },
+      };
+    });
   }
 
   async setClientSelfManagePorts({ clientId, enabled }) {
@@ -1993,8 +2000,26 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     }
   }
 
-  async addPortForward(clientId, proto, extPort, intPort) {
-    return this.__withMutation(() => this.__addPortForward(clientId, proto, extPort, intPort));
+  // Internal, queue-context-only guard: enforces selfManagePorts from the
+  // state the queued operation is about to mutate. The route-level pre-check
+  // happens outside the queue; a revoke landing between that check and this
+  // execution must still reject (TOCTOU closure). Never call the public
+  // getPeerProfile here — wrappers re-entering __withMutation are rejected.
+  __assertSelfManagePorts(clientId) {
+    const client = this.__config ? this.__config.clients[clientId] : null;
+    if (!client || client.selfManagePorts !== true) {
+      throw new ServerError('Self port management is disabled for this peer', 403);
+    }
+  }
+
+  async addPortForward(clientId, proto, extPort, intPort, { requireSelfManagePorts = false } = {}) {
+    return this.__withMutation(async () => {
+      if (requireSelfManagePorts) {
+        await this.getConfig();
+        this.__assertSelfManagePorts(clientId);
+      }
+      return this.__addPortForward(clientId, proto, extPort, intPort);
+    });
   }
 
   // Stable-id addressing: resolve the rule id to its index INSIDE the queued
@@ -2189,18 +2214,30 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
   // Resolve a rule reference (stable id or legacy numeric index) to its index
   // INSIDE the queued operation, so sibling mutations cannot shift it.
-  async removePortForwardByRuleId(clientId, ruleId) {
-    return this.__withMutation(async () => this.__removePortForward(clientId, this.__resolveRuleIndex(clientId, ruleId)));
+  async removePortForwardByRuleId(clientId, ruleId, { requireSelfManagePorts = false } = {}) {
+    return this.__withMutation(async () => {
+      if (requireSelfManagePorts) {
+        await this.getConfig();
+        this.__assertSelfManagePorts(clientId);
+      }
+      return this.__removePortForward(clientId, this.__resolveRuleIndex(clientId, ruleId));
+    });
   }
 
-  async updatePortForwardByRuleId(clientId, ruleId, proto, extPort, intPort) {
-    return this.__withMutation(async () => this.__updatePortForward(
-      clientId,
-      this.__resolveRuleIndex(clientId, ruleId),
-      proto,
-      extPort,
-      intPort,
-    ));
+  async updatePortForwardByRuleId(clientId, ruleId, proto, extPort, intPort, { requireSelfManagePorts = false } = {}) {
+    return this.__withMutation(async () => {
+      if (requireSelfManagePorts) {
+        await this.getConfig();
+        this.__assertSelfManagePorts(clientId);
+      }
+      return this.__updatePortForward(
+        clientId,
+        this.__resolveRuleIndex(clientId, ruleId),
+        proto,
+        extPort,
+        intPort,
+      );
+    });
   }
 
   __resolveRuleIndex(clientId, ruleId) {
