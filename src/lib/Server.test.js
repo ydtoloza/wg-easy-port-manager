@@ -50,6 +50,20 @@ jest.mock('../services/WireGuard', () => ({
   setClientSelfManagePorts: jest.fn().mockResolvedValue({ selfManagePorts: true }),
   getWebhookConfig: jest.fn().mockResolvedValue({ configured: true, url: 'https://example.test/hook' }),
   setWebhookConfig: jest.fn().mockResolvedValue({ configured: true, url: 'https://example.test/hook' }),
+  probePortForward: jest.fn().mockResolvedValue({
+    rule: {
+      proto: 'tcp', extPort: 2000, intPort: 2000, peerIP: '10.8.0.2',
+    },
+    rulePresent: true,
+    tunnelUp: true,
+    tcpConnectable: true,
+    verdict: 'ok',
+  }),
+  autoAssignPortForward: jest.fn().mockResolvedValue({
+    id: '11111111-2222-3333-4444-555555555555', proto: 'tcp', extPort: 1024, intPort: 80,
+  }),
+  removePortForwardById: jest.fn().mockResolvedValue(),
+  updatePortForwardById: jest.fn().mockResolvedValue(),
   getNetworkPolicyOptions: jest.fn().mockReturnValue({ protocolPresets: [], maxCustomRules: 32 }),
   updateClientNetworkPolicy: jest.fn().mockResolvedValue({
     networkPolicy: { blockedProtocols: ['http'], customRules: [], peerAllowlist: [] },
@@ -316,12 +330,14 @@ describe('HTTP server security', () => {
       expect(WireGuard.removePortForwardByRuleId).toHaveBeenCalledWith('client1', ruleId);
     });
 
-    it('answers the peer probe route with 501 until the probe feature merges', async () => {
+    it('serves the peer probe route now that the probe feature merged', async () => {
       WireGuard.lookupPeerToken.mockResolvedValue('client1');
       const response = await fetch(`${baseUrl}/api/peer/me/port-forward/0/probe`, {
         headers: { Authorization: peerToken },
       });
-      expect(response.status).toBe(501);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ verdict: 'ok' });
+      expect(WireGuard.probePortForward).toHaveBeenCalledWith({ clientId: 'client1', rule: '0' });
     });
   });
 
@@ -374,6 +390,73 @@ describe('HTTP server security', () => {
       expect(updated.status).toBe(200);
       expect(WireGuard.setWebhookConfig).toHaveBeenCalledWith({ url: 'https://example.test/hook', secret: 's' });
     });
+  });
+
+  it('exposes the probe endpoint for admins (rule id or index)', async () => {
+    const response = await fetch(`${baseUrl}/api/wireguard/client/client1/port-forward/0/probe`, {
+      headers: { Authorization: 'correct-password' },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ verdict: 'ok' });
+    expect(WireGuard.probePortForward).toHaveBeenCalledWith({ clientId: 'client1', rule: '0' });
+
+    const bad = await fetch(`${baseUrl}/api/wireguard/client/client1/port-forward/bogus/probe`, {
+      headers: { Authorization: 'correct-password' },
+    });
+    expect(bad.status).toBe(400);
+  });
+
+  it('routes auto-assign through the service and returns the claimed rule', async () => {
+    const response = await fetch(`${baseUrl}/api/wireguard/client/client1/port-forward/auto`, {
+      method: 'POST',
+      headers: { Authorization: 'correct-password', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        proto: 'tcp', intPort: 80, rangeStart: 1024, rangeEnd: 2048,
+      }),
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.success).toBe(true);
+    expect(body.rule.extPort).toBe(1024);
+    expect(WireGuard.autoAssignPortForward).toHaveBeenCalledWith('client1', {
+      proto: 'tcp', intPort: 80, rangeStart: 1024, rangeEnd: 2048,
+    });
+  });
+
+  it('rejects coercible-but-invalid ports strictly (true, hex, exponent)', async () => {
+    for (const bad of [true, '0x10', '5e2', 0, 65536]) {
+      const response = await fetch(`${baseUrl}/api/wireguard/client/client1/port-forward`, {
+        method: 'POST',
+        headers: { Authorization: 'correct-password', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proto: 'tcp', extPort: bad, intPort: 80 }),
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ statusCode: 400, error: 'Invalid ports' });
+    }
+  });
+
+  it('addresses rules by id on the id-based routes', async () => {
+    const ruleId = '11111111-2222-3333-4444-555555555555';
+    const removed = await fetch(`${baseUrl}/api/wireguard/client/client1/port-forward/id/${ruleId}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'correct-password' },
+    });
+    expect(removed.status).toBe(200);
+    expect(WireGuard.removePortForwardById).toHaveBeenCalledWith('client1', ruleId);
+
+    const updated = await fetch(`${baseUrl}/api/wireguard/client/client1/port-forward/id/${ruleId}`, {
+      method: 'PUT',
+      headers: { Authorization: 'correct-password', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ proto: 'tcp', extPort: 3000, intPort: 3000 }),
+    });
+    expect(updated.status).toBe(200);
+    expect(WireGuard.updatePortForwardById).toHaveBeenCalledWith('client1', ruleId, 'tcp', 3000, 3000);
+
+    const malformed = await fetch(`${baseUrl}/api/wireguard/client/client1/port-forward/id/not-a-uuid`, {
+      method: 'DELETE',
+      headers: { Authorization: 'correct-password' },
+    });
+    expect(malformed.status).toBe(400);
   });
 
   it('caps concurrent password checks', async () => {

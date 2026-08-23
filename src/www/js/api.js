@@ -147,6 +147,15 @@ class API {
     });
   }
 
+  async updateClientKeepalive({ clientId, persistentKeepalive }) {
+    const id = encodeURIComponent(clientId);
+    return this.call({
+      method: 'put',
+      path: `/wireguard/client/${id}/keepalive`,
+      body: { persistentKeepalive },
+    });
+  }
+
   async updateClientAddress({ clientId, address, addressV6 }) {
     const id = encodeURIComponent(clientId);
     return this.call({
@@ -191,21 +200,41 @@ class API {
     });
   }
 
-  async removePortForward({ clientId, index }) {
+  async autoAssignPortForward({
+    clientId, proto, intPort, rangeStart, rangeEnd,
+  }) {
     const id = encodeURIComponent(clientId);
     return this.call({
+      method: 'post',
+      path: `/wireguard/client/${id}/port-forward/auto`,
+      body: {
+        proto,
+        intPort,
+        ...(rangeStart === undefined || rangeStart === null ? {} : { rangeStart }),
+        ...(rangeEnd === undefined || rangeEnd === null ? {} : { rangeEnd }),
+      },
+    });
+  }
+
+  // Rule ids are stable across sibling edits; index-based addressing silently
+  // targets the wrong rule when two editors interleave.
+  async removePortForward({ clientId, ruleId }) {
+    const id = encodeURIComponent(clientId);
+    const rule = encodeURIComponent(ruleId);
+    return this.call({
       method: 'delete',
-      path: `/wireguard/client/${id}/port-forward/${index}`,
+      path: `/wireguard/client/${id}/port-forward/id/${rule}`,
     });
   }
 
   async updatePortForward({
-    clientId, index, proto, extPort, intPort,
+    clientId, ruleId, proto, extPort, intPort,
   }) {
     const id = encodeURIComponent(clientId);
+    const rule = encodeURIComponent(ruleId);
     return this.call({
       method: 'put',
-      path: `/wireguard/client/${id}/port-forward/${index}`,
+      path: `/wireguard/client/${id}/port-forward/id/${rule}`,
       body: { proto, extPort, intPort },
     });
   }
