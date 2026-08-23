@@ -308,7 +308,7 @@ describe('HTTP server security', () => {
         body: JSON.stringify({ proto: 'tcp', extPort: 3000, intPort: 3000 }),
       });
       expect(allowed.status).toBe(200);
-      expect(WireGuard.addPortForward).toHaveBeenCalledWith('client1', 'tcp', 3000, 3000);
+      expect(WireGuard.addPortForward).toHaveBeenCalledWith('client1', 'tcp', 3000, 3000, { requireSelfManagePorts: true });
     });
 
     it('scopes byId mutations to the pinned peer', async () => {
@@ -320,14 +320,14 @@ describe('HTTP server security', () => {
         body: JSON.stringify({ proto: 'tcp', extPort: 3001, intPort: 3000 }),
       });
       expect(updated.status).toBe(200);
-      expect(WireGuard.updatePortForwardByRuleId).toHaveBeenCalledWith('client1', ruleId, 'tcp', 3001, 3000);
+      expect(WireGuard.updatePortForwardByRuleId).toHaveBeenCalledWith('client1', ruleId, 'tcp', 3001, 3000, { requireSelfManagePorts: true });
 
       const removed = await fetch(`${baseUrl}/api/peer/me/port-forward/id/${ruleId}`, {
         method: 'DELETE',
         headers: { Authorization: peerToken },
       });
       expect(removed.status).toBe(200);
-      expect(WireGuard.removePortForwardByRuleId).toHaveBeenCalledWith('client1', ruleId);
+      expect(WireGuard.removePortForwardByRuleId).toHaveBeenCalledWith('client1', ruleId, { requireSelfManagePorts: true });
     });
 
     it('serves the peer probe route now that the probe feature merged', async () => {

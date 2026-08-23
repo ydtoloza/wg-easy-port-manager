@@ -573,7 +573,10 @@ module.exports = class Server {
         const clientId = event.node.req.wgpmPeerClientId;
         await requireSelfManagePorts(clientId);
         const { proto, extPort, intPort } = parsePortForwardBody(await readBodyLimited(event));
-        await WireGuard.addPortForward(clientId, proto, extPort, intPort);
+        // The queued wrapper re-checks selfManagePorts: a revoke landing
+        // between the pre-check above and the mutation's execution must
+        // still reject (TOCTOU).
+        await WireGuard.addPortForward(clientId, proto, extPort, intPort, { requireSelfManagePorts: true });
         return { success: true };
       }))
       .put('/api/peer/me/port-forward/id/:ruleId', defineEventHandler(async (event) => {
@@ -584,7 +587,7 @@ module.exports = class Server {
           throw createError({ status: 400, message: 'Invalid rule id' });
         }
         const { proto, extPort, intPort } = parsePortForwardBody(await readBodyLimited(event));
-        await WireGuard.updatePortForwardByRuleId(clientId, ruleId, proto, extPort, intPort);
+        await WireGuard.updatePortForwardByRuleId(clientId, ruleId, proto, extPort, intPort, { requireSelfManagePorts: true });
         return { success: true };
       }))
       .delete('/api/peer/me/port-forward/id/:ruleId', defineEventHandler(async (event) => {
@@ -594,7 +597,7 @@ module.exports = class Server {
         if (!Util.isValidRuleId(ruleId)) {
           throw createError({ status: 400, message: 'Invalid rule id' });
         }
-        await WireGuard.removePortForwardByRuleId(clientId, ruleId);
+        await WireGuard.removePortForwardByRuleId(clientId, ruleId, { requireSelfManagePorts: true });
         return { success: true };
       }));
 
