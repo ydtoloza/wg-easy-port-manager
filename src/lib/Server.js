@@ -521,28 +521,19 @@ module.exports = class Server {
       }
     };
 
-    const parsePeerPortBody = (body) => {
-      if (!body || !['tcp', 'udp', 'both'].includes(body.proto)) {
-        throw createError({ status: 400, message: 'proto must be tcp, udp or both' });
-      }
-      const extPort = Number(body.extPort);
-      const intPort = Number(body.intPort);
-      if (!Number.isInteger(extPort) || !Number.isInteger(intPort)
-        || extPort < 1 || extPort > 65535 || intPort < 1 || intPort > 65535) {
-        throw createError({ status: 400, message: 'Invalid ports' });
-      }
-      return { proto: body.proto, extPort, intPort };
-    };
-
+    // Peer bodies reuse the shared type-strict parser: Number() alone would
+    // let "0x10" claim port 16 and true claim port 1.
     peerRouter
       .get('/api/peer/me', defineEventHandler((event) => {
         return WireGuard.getPeerProfile({ clientId: event.node.req.wgpmPeerClientId });
       }))
       .get('/api/peer/me/port-forward/:indexOrId/probe', defineEventHandler(async (event) => {
+        // UUID-only on the peer path: a digit string would fall through to
+        // positional addressing on an id-addressed surface (the admin probe
+        // route keeps legacy index support).
         const rule = getRouterParam(event, 'indexOrId');
-        if (!/^\d+$/.test(rule)
-          && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rule)) {
-          throw createError({ status: 400, message: 'Invalid rule id or index' });
+        if (!Util.isValidRuleId(rule)) {
+          throw createError({ status: 400, message: 'Invalid rule id' });
         }
         // Transitional: active once the reachability-probe feature merges.
         if (typeof WireGuard.probePortForward !== 'function') {
@@ -553,7 +544,7 @@ module.exports = class Server {
       .post('/api/peer/me/port-forward', defineEventHandler(async (event) => {
         const clientId = event.node.req.wgpmPeerClientId;
         await requireSelfManagePorts(clientId);
-        const { proto, extPort, intPort } = parsePeerPortBody(await readBodyLimited(event));
+        const { proto, extPort, intPort } = parsePortForwardBody(await readBodyLimited(event));
         await WireGuard.addPortForward(clientId, proto, extPort, intPort);
         return { success: true };
       }))
@@ -561,7 +552,10 @@ module.exports = class Server {
         const clientId = event.node.req.wgpmPeerClientId;
         await requireSelfManagePorts(clientId);
         const ruleId = getRouterParam(event, 'ruleId');
-        const { proto, extPort, intPort } = parsePeerPortBody(await readBodyLimited(event));
+        if (!Util.isValidRuleId(ruleId)) {
+          throw createError({ status: 400, message: 'Invalid rule id' });
+        }
+        const { proto, extPort, intPort } = parsePortForwardBody(await readBodyLimited(event));
         await WireGuard.updatePortForwardByRuleId(clientId, ruleId, proto, extPort, intPort);
         return { success: true };
       }))
@@ -569,6 +563,9 @@ module.exports = class Server {
         const clientId = event.node.req.wgpmPeerClientId;
         await requireSelfManagePorts(clientId);
         const ruleId = getRouterParam(event, 'ruleId');
+        if (!Util.isValidRuleId(ruleId)) {
+          throw createError({ status: 400, message: 'Invalid rule id' });
+        }
         await WireGuard.removePortForwardByRuleId(clientId, ruleId);
         return { success: true };
       }));

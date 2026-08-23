@@ -1218,6 +1218,17 @@ describe('WireGuard', () => {
     it('rejects malformed rule ids before touching the queue', async () => {
       await expect(wg.removePortForwardById('client1', 'zzz')).rejects.toMatchObject({ statusCode: 400 });
     });
+
+    it('never resolves digit strings positionally on the peer ByRuleId methods', async () => {
+      await wg.getConfig();
+      // "0" is not a rule id: it must miss, not edit/delete index 0.
+      await expect(wg.updatePortForwardByRuleId('client1', '0', 'tcp', 3000, 3000))
+        .rejects.toMatchObject({ statusCode: 404 });
+      await expect(wg.removePortForwardByRuleId('client1', '0'))
+        .rejects.toMatchObject({ statusCode: 404 });
+      const config = await wg.getConfig();
+      expect(config.clients.client1.portForwards[0].extPort).toBe(2000);
+    });
   });
 
   describe('autoAssignPortForward', () => {

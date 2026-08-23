@@ -2203,12 +2203,14 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     ));
   }
 
+  // Resolve a rule id to its index INSIDE the queued operation, so sibling
+  // mutations cannot shift it. Id-only by design: this serves the peer-facing
+  // ByRuleId methods, where a digit string must never degrade into positional
+  // addressing (routes pre-check Util.isValidRuleId; the admin legacy index
+  // routes go through removePortForward/updatePortForward instead).
   __resolveRuleIndex(clientId, ruleId) {
     const client = this.__config ? this.__config.clients[clientId] : null;
     const rules = client && Array.isArray(client.portForwards) ? client.portForwards : [];
-    if (/^\d+$/.test(String(ruleId))) {
-      return Number(ruleId);
-    }
     const index = rules.findIndex((rule) => rule && rule.id === ruleId);
     if (index === -1) throw new ServerError('Port forward rule not found', 404);
     return index;
