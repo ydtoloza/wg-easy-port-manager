@@ -2,9 +2,13 @@
 
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const Util = require('./Util');
 const ServerError = require('./ServerError');
+
+jest.mock('./Webhook', () => ({ deliver: jest.fn() }));
+const Webhook = require('./Webhook');
 
 const KEYS = {
   serverPrivate: Buffer.alloc(32, 1).toString('base64'),
@@ -356,6 +360,181 @@ describe('WireGuard', () => {
         policy: { blockedProtocols: [], customRules: [], peerAllowlist: [] },
       })).rejects.toMatchObject({ statusCode: 409 });
       await expect(wg.getClient({ clientId: 'toString' })).rejects.toMatchObject({ statusCode: 404 });
+    });
+  });
+
+  describe('peer tokens', () => {
+    it('issues tokens shown once, storing only the sha256 hash', async () => {
+      await wg.getConfig();
+      const { token, tokenCreatedAt } = await wg.issueClientToken({ clientId: 'client1' });
+      expect(token).toMatch(/^wgpt_[0-9a-f]{64}$/);
+      expect(tokenCreatedAt).toBeInstanceOf(Date);
+
+      const config = await wg.getConfig();
+      expect(config.clients.client1.tokenHash).toBe(crypto.createHash('sha256').update(token).digest('hex'));
+      expect(JSON.stringify(config)).not.toContain(token);
+    });
+
+    it('looks tokens up without leaking which peer matched', async () => {
+      await wg.getConfig();
+      const { token } = await wg.issueClientToken({ clientId: 'client1' });
+      expect(await wg.lookupPeerToken(token)).toBe('client1');
+      expect(await wg.lookupPeerToken(`wgpt_${'0'.repeat(64)}`)).toBeNull();
+      expect(await wg.lookupPeerToken('not-a-token')).toBeNull();
+    });
+
+    it('revokes tokens', async () => {
+      await wg.getConfig();
+      const { token } = await wg.issueClientToken({ clientId: 'client1' });
+      await wg.revokeClientToken({ clientId: 'client1' });
+      expect(await wg.lookupPeerToken(token)).toBeNull();
+      const config = await wg.getConfig();
+      expect(config.clients.client1.tokenHash).toBeNull();
+    });
+
+    it('serializes peer profiles without secrets or private keys', async () => {
+      await wg.getConfig();
+      await wg.issueClientToken({ clientId: 'client1' });
+      const profile = await wg.getPeerProfile({ clientId: 'client1' });
+      expect(profile).toMatchObject({
+        id: 'client1',
+        name: 'client1',
+        address: '10.8.0.2',
+        permissions: { selfManagePorts: false },
+      });
+      const serialized = JSON.stringify(profile);
+      expect(serialized).not.toContain('privateKey');
+      expect(serialized).not.toContain('tokenHash');
+      expect(serialized).not.toContain('preSharedKey');
+    });
+
+    it('toggles selfManagePorts and validates it', async () => {
+      await wg.getConfig();
+      await wg.setClientSelfManagePorts({ clientId: 'client1', enabled: true });
+      expect((await wg.getPeerProfile({ clientId: 'client1' })).permissions.selfManagePorts).toBe(true);
+      await expect(wg.setClientSelfManagePorts({ clientId: 'client1', enabled: 'yes' }))
+        .rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('migrates selfManagePorts to false and validates hashes on restore', async () => {
+      await wg.getConfig();
+      expect((await wg.getConfig()).clients.client1.selfManagePorts).toBe(false);
+
+      const bad = makeConfig();
+      bad.clients.client1.tokenHash = 'not-a-hash';
+      await expect(wg.restoreConfiguration(JSON.stringify(bad))).rejects.toMatchObject({ statusCode: 400 });
+    });
+  });
+
+  describe('webhook configuration', () => {
+    it('stores the config in a 0600 sidecar file and never echoes the secret', async () => {
+      await wg.getConfig();
+      const result = await wg.setWebhookConfig({ url: 'https://example.test/hook', secret: 'topsecret' });
+      expect(result).toEqual({ configured: true, url: 'https://example.test/hook' });
+
+      const status = await wg.getWebhookConfig();
+      expect(status).toEqual({ configured: true, url: 'https://example.test/hook' });
+      expect(JSON.stringify(status)).not.toContain('topsecret');
+    });
+
+    it('clears the config with url:null and rejects plaintext targets by default', async () => {
+      await wg.getConfig();
+      await wg.setWebhookConfig({ url: 'https://example.test/hook', secret: 's' });
+      expect(await wg.setWebhookConfig({ url: null, secret: null })).toEqual({ configured: false, url: null });
+
+      await expect(wg.setWebhookConfig({ url: 'http://example.test/hook', secret: 's' }))
+        .rejects.toMatchObject({ statusCode: 400 });
+      await expect(wg.setWebhookConfig({ url: 'https://example.test/hook', secret: '' }))
+        .rejects.toMatchObject({ statusCode: 400 });
+      await expect(wg.setWebhookConfig({ url: 'ftp://example.test/hook', secret: 's' }))
+        .rejects.toMatchObject({ statusCode: 400 });
+    });
+  });
+
+  describe('port events', () => {
+    let store;
+    let deliveries;
+
+    beforeEach(() => {
+      store = {};
+      deliveries = [];
+      jest.spyOn(wg, '__writeAtomic').mockImplementation(async (filename, contents) => {
+        store[filename] = contents;
+      });
+      fs.readFile.mockImplementation(async (filename) => {
+        const name = String(filename);
+        // __writeAtomic is spied with bare filenames; reads use full paths.
+        const base = name.split('/').pop();
+        if (store[base] !== undefined) return store[base];
+        if (base === 'wg0.json') return JSON.stringify(makeConfig());
+        const err = new Error('not found');
+        err.code = 'ENOENT';
+        throw err;
+      });
+    });
+
+    it('emits port.confirmed / port.changed with strictly increasing persisted seqs', async () => {
+      await wg.getConfig();
+      await wg.setWebhookConfig({ url: 'https://example.test/hook', secret: 's3cret' });
+      Webhook.deliver.mockImplementation(async (config) => {
+        deliveries.push(config);
+        return true;
+      });
+
+      await wg.addPortForward('client1', 'tcp', 3000, 3000);
+      await wg.updatePortForward('client1', 1, 'tcp', 3001, 3000);
+
+      expect(deliveries).toHaveLength(2);
+      const confirmed = JSON.parse(deliveries[0].body);
+      const changed = JSON.parse(deliveries[1].body);
+      expect(confirmed).toMatchObject({
+        v: 1, event: 'port.confirmed', peerId: 'client1', seq: 1, proto: 'tcp', extPort: 3000, intPort: 3000,
+      });
+      expect(confirmed.eventId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(changed).toMatchObject({
+        event: 'port.changed', seq: 2, extPort: 3001, previousExtPort: 3000,
+      });
+      expect(deliveries[0].secret).toBe('s3cret');
+      expect(deliveries[0].allowInsecure).toBe(false);
+      // sidecar persisted
+      expect(JSON.parse(store['wg0-events.json'])).toEqual({ client1: 2 });
+    });
+
+    it('continues the sequence across a simulated restart', async () => {
+      await wg.getConfig();
+      await wg.setWebhookConfig({ url: 'https://example.test/hook', secret: 's' });
+      Webhook.deliver.mockResolvedValue(true);
+      await wg.addPortForward('client1', 'tcp', 3000, 3000);
+
+      const WireGuardClass = require('./WireGuard'); // eslint-disable-line global-require
+      const restarted = new WireGuardClass();
+      jest.spyOn(restarted, '__writeAtomic').mockImplementation(async (filename, contents) => {
+        store[filename] = contents;
+      });
+      await restarted.getConfig();
+      await restarted.setWebhookConfig({ url: 'https://example.test/hook', secret: 's' });
+      deliveries = [];
+      Webhook.deliver.mockImplementation(async (config) => {
+        deliveries.push(config);
+        return true;
+      });
+      await restarted.updatePortForward('client1', 1, 'tcp', 3001, 3000);
+      expect(JSON.parse(deliveries[0].body).seq).toBe(2);
+    });
+
+    it('never blocks mutations on delivery', async () => {
+      await wg.getConfig();
+      await wg.setWebhookConfig({ url: 'https://example.test/hook', secret: 's' });
+      Webhook.deliver.mockImplementation(() => new Promise(() => {})); // never settles
+      await wg.addPortForward('client1', 'tcp', 3000, 3000);
+      const config = await wg.getConfig();
+      expect(config.clients.client1.portForwards).toHaveLength(2);
+    });
+
+    it('emits nothing when no webhook is configured', async () => {
+      await wg.getConfig();
+      await wg.addPortForward('client1', 'tcp', 3000, 3000);
+      expect(Webhook.deliver).not.toHaveBeenCalled();
     });
   });
 
