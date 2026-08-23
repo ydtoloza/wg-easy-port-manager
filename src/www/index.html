@@ -457,8 +457,17 @@
                 </div>
 
                 <div v-show="isPfExpanded(client.id)" class="px-4 pb-4">
+                  <!-- Kill-switch banner: rules stay visible but inactive -->
+                  <div v-if="!forwardingEnabled"
+                    class="mb-3 flex items-start gap-2 px-3 py-2 rounded-lg border border-amber-300/70 dark:border-amber-700/50 bg-amber-50 dark:bg-amber-900/20 text-xs font-medium text-amber-700 dark:text-amber-400">
+                    <svg class="w-4 h-4 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                    </svg>
+                    <span>{{$t("forwardingDisabledBanner")}}</span>
+                  </div>
                   <!-- Existing Rules -->
-                  <div class="space-y-2 mb-4" v-if="client.portForwards && client.portForwards.length > 0">
+                  <div class="space-y-2 mb-4" v-if="client.portForwards && client.portForwards.length > 0"
+                    :class="{ 'opacity-50 pointer-events-none': !forwardingEnabled }">
                     <div class="grid grid-cols-[auto_1fr_auto_1fr_auto] gap-2 items-center px-3 py-2 text-xs font-medium text-gray-500 dark:text-neutral-400 uppercase tracking-wider">
                       <span>Protocol</span>
                       <span>External Port</span>
@@ -514,7 +523,8 @@
                   </div>
 
                   <!-- Add New Rule -->
-                  <div class="bg-white dark:bg-neutral-700/50 p-3 rounded-lg border border-dashed border-gray-300 dark:border-neutral-600">
+                  <div class="bg-white dark:bg-neutral-700/50 p-3 rounded-lg border border-dashed border-gray-300 dark:border-neutral-600"
+                    :class="{ 'opacity-50 pointer-events-none': !forwardingEnabled }">
                     <div class="flex flex-wrap sm:flex-nowrap items-center gap-2">
                       <select v-model="newPf[client.id].proto" class="text-xs font-bold text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 outline-none flex-shrink-0">
                         <option value="tcp" class="bg-white dark:bg-neutral-800">TCP</option>
@@ -1014,6 +1024,13 @@
                         </div>
                       </div>
                       <div>
+                        <label class="flex items-center gap-2 block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider cursor-pointer">
+                          <input type="checkbox" v-model="serverConfigEdit.forwardingEnabled" class="rounded text-red-800 focus:ring-red-800 border-gray-300 dark:border-neutral-600 dark:bg-neutral-700" />
+                          {{$t("forwardingEnabled")}}
+                        </label>
+                        <p class="mt-1 ml-6 text-xs font-normal normal-case tracking-normal text-gray-400 dark:text-neutral-500">{{$t("forwardingEnabledHint")}}</p>
+                      </div>
+                      <div>
                         <label class="block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider">Network Device</label>
                         <input type="text" v-model="serverConfigEdit.device"
                           class="rounded p-2 border-2 dark:bg-neutral-600 dark:text-neutral-200 border-gray-100 dark:border-neutral-500 focus:border-red-800 dark:focus:border-red-700 outline-none w-full text-sm" placeholder="eth0" />
@@ -1107,7 +1124,7 @@
   <script src="./js/vendor/timeago.full.min.js"></script>
   <script src="./js/api.js"></script>
   <script src="./js/i18n.js"></script>
-  <script src="./js/app-template.generated.js?v=d50d40411463"></script>
+  <script src="./js/app-template.generated.js?v=e4e3e28f446f"></script>
   <script src="./js/app.js?v=5"></script>
 </body>
 

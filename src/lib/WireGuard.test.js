@@ -578,6 +578,31 @@ describe('WireGuard', () => {
       expect(ruleset).not.toContain('dnat to');
     });
 
+    it('emits no DNAT when restoring a config while the switch is seeded off', async () => {
+      fs.readFile.mockImplementation(async (filename) => {
+        const name = String(filename);
+        if (name.endsWith('server-settings.json')) {
+          return JSON.stringify({ forwardingEnabled: false });
+        }
+        if (name.includes('server-settings')) {
+          const err = new Error('not found');
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return JSON.stringify(makeConfig());
+      });
+      const WireGuardClass = require('./WireGuard'); // eslint-disable-line global-require
+      const restoring = new WireGuardClass();
+      await restoring.getConfig();
+
+      await restoring.restoreConfiguration(JSON.stringify(makeConfig()));
+
+      const ruleset = Util.execFile.mock.calls.findLast((call) => call[0] === 'nft')[2].input;
+      expect(ruleset).not.toContain('dnat to');
+      // The restore path preserves the forwarding config for when it returns.
+      expect((await restoring.getConfig()).clients.client1.portForwards).toHaveLength(1);
+    });
+
     it('rejects non-boolean values', async () => {
       await expect(wg.updateServerConfig({ forwardingEnabled: 'yes' }))
         .rejects.toMatchObject({ statusCode: 400 });
