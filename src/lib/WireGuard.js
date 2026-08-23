@@ -430,6 +430,7 @@ module.exports = class WireGuard {
         if (host === undefined) throw new Error('Maximum number of clients reached.');
         client.address = this.__serverSettings.defaultAddress.replace('x', host);
       }
+      if (client.persistentKeepalive === undefined) client.persistentKeepalive = null;
     }
 
     if (this.__serverSettings.enableIpv6 && !config.server.addressV6) {
@@ -488,7 +489,8 @@ module.exports = class WireGuard {
     const forwardedPorts = new Set();
     const networkPolicies = new Map();
     const allowedClientKeys = ['id', 'name', 'address', 'addressV6', 'privateKey', 'publicKey',
-      'preSharedKey', 'createdAt', 'updatedAt', 'enabled', 'portForwards', 'allowedIPs', 'networkPolicy'];
+      'preSharedKey', 'createdAt', 'updatedAt', 'enabled', 'portForwards', 'allowedIPs', 'networkPolicy',
+      'persistentKeepalive'];
 
     for (const [clientId, client] of Object.entries(config.clients)) {
       if (!CLIENT_ID_RE.test(clientId) || RESERVED_CLIENT_IDS.has(clientId) || !isPlainObject(client)) {
@@ -527,6 +529,11 @@ module.exports = class WireGuard {
       if (client.allowedIPs !== undefined
         && (!Array.isArray(client.allowedIPs) || client.allowedIPs.some((value) => typeof value !== 'string' || /[\r\n]/.test(value)))) {
         throw new ServerError(`Invalid client.allowedIPs: ${clientId}`, 400);
+      }
+      if (client.persistentKeepalive !== undefined && client.persistentKeepalive !== null
+        && (!Number.isInteger(client.persistentKeepalive)
+          || client.persistentKeepalive < 0 || client.persistentKeepalive > 65535)) {
+        throw new ServerError(`Invalid client.persistentKeepalive: ${clientId}`, 400);
       }
       if (!Array.isArray(client.portForwards)) {
         throw new ServerError(`Invalid client.portForwards: ${clientId}`, 400);
@@ -895,7 +902,7 @@ ${this.__serverSettings.mtu ? `MTU = ${this.__serverSettings.mtu}\n` : ''}\
 PublicKey = ${config.server.publicKey}
 ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
 }AllowedIPs = ${this.__serverSettings.allowedIps}
-PersistentKeepalive = ${this.__serverSettings.persistentKeepalive}
+PersistentKeepalive = ${client.persistentKeepalive ?? this.__serverSettings.persistentKeepalive}
 Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     });
   }
@@ -1051,6 +1058,28 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     });
   }
 
+  async updateClientKeepalive({ clientId, persistentKeepalive }) {
+    return this.__withMutation(async () => {
+      const client = await this.getClient({ clientId });
+      if (persistentKeepalive !== null
+        && (!Number.isInteger(persistentKeepalive) || persistentKeepalive < 0 || persistentKeepalive > 65535)) {
+        throw new ServerError('persistentKeepalive must be null or an integer between 0 and 65535', 400);
+      }
+      const previous = { persistentKeepalive: client.persistentKeepalive ?? null, updatedAt: client.updatedAt };
+      await this.__transactionalConfigChange(
+        () => {
+          client.persistentKeepalive = persistentKeepalive;
+          client.updatedAt = new Date();
+        },
+        () => {
+          Object.assign(client, previous);
+        },
+        { context: 'update-client-keepalive' },
+      );
+      return { persistentKeepalive, updatedAt: client.updatedAt };
+    });
+  }
+
   async updateClientAddress({ clientId, address, addressV6 }) {
     return this.__withMutation(async () => {
       const config = await this.getConfig();
@@ -1202,6 +1231,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
               client.networkPolicy = createDefaultNetworkPolicy();
             }
             client.networkPolicy = this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false });
+            if (client.persistentKeepalive === undefined) client.persistentKeepalive = null;
           }
         }
       }

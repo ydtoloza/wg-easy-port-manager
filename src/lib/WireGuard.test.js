@@ -370,6 +370,56 @@ describe('WireGuard', () => {
     });
   });
 
+  describe('per-peer persistentKeepalive', () => {
+    it('migrates missing values to null and honors overrides in generated configs', async () => {
+      await wg.getConfig();
+      expect((await wg.getConfig()).clients.client1.persistentKeepalive).toBeNull();
+
+      await wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 25 });
+      const conf = await wg.getClientConfiguration({ clientId: 'client1' });
+      expect(conf).toContain('PersistentKeepalive = 25');
+    });
+
+    it('falls back to the global setting when no override is set', async () => {
+      await wg.getConfig();
+      // Mocked config sets WG_PERSISTENT_KEEPALIVE '25'.
+      const conf = await wg.getClientConfiguration({ clientId: 'client1' });
+      expect(conf).toContain('PersistentKeepalive = 25');
+
+      await wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 0 });
+      const zeroed = await wg.getClientConfiguration({ clientId: 'client1' });
+      expect(zeroed).toContain('PersistentKeepalive = 0');
+    });
+
+    it('validates bounds', async () => {
+      await wg.getConfig();
+      await expect(wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: -1 }))
+        .rejects.toMatchObject({ statusCode: 400 });
+      await expect(wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 65536 }))
+        .rejects.toMatchObject({ statusCode: 400 });
+      await expect(wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 25.5 }))
+        .rejects.toMatchObject({ statusCode: 400 });
+      await expect(wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: null }))
+        .resolves.toMatchObject({ persistentKeepalive: null });
+    });
+
+    it('survives backup -> restore round-trips', async () => {
+      await wg.getConfig();
+      await wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 45 });
+
+      const backup = JSON.parse(JSON.stringify(await wg.getConfig()));
+      // strict restore whitelists the field, so this must round-trip:
+      await wg.restoreConfiguration(JSON.stringify(backup));
+      const config = await wg.getConfig();
+      expect(config.clients.client1.persistentKeepalive).toBe(45);
+
+      // and validation rejects corrupt values on restore
+      const bad = JSON.parse(JSON.stringify(config));
+      bad.clients.client1.persistentKeepalive = 'always';
+      await expect(wg.restoreConfiguration(JSON.stringify(bad))).rejects.toMatchObject({ statusCode: 400 });
+    });
+  });
+
   describe('restoreConfiguration', () => {
     it('rolls back disk and host on failure', async () => {
       await wg.getConfig(); // init state

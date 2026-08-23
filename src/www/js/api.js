@@ -147,6 +147,15 @@ class API {
     });
   }
 
+  async updateClientKeepalive({ clientId, persistentKeepalive }) {
+    const id = encodeURIComponent(clientId);
+    return this.call({
+      method: 'put',
+      path: `/wireguard/client/${id}/keepalive`,
+      body: { persistentKeepalive },
+    });
+  }
+
   async updateClientAddress({ clientId, address, addressV6 }) {
     const id = encodeURIComponent(clientId);
     return this.call({
