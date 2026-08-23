@@ -83,8 +83,8 @@ jobs:
                 split("\n")
                 | map(select(length > 0))
                 | map(. as $sha | [
-                    {sha: $sha, platform: "linux/amd64", runner: "ubuntu-latest"},
-                    {sha: $sha, platform: "linux/arm64", runner: "ubuntu-24.04-arm"}
+                    {sha: $sha, platform: "linux/amd64", arch: "amd64", runner: "ubuntu-latest"},
+                    {sha: $sha, platform: "linux/arm64", arch: "arm64", runner: "ubuntu-24.04-arm"}
                   ])
                 | flatten
               )}' | jq -c '.')
@@ -143,17 +143,15 @@ jobs:
 
       - name: Export digest
         shell: bash
-        env:
-          PLATFORM_TAG: ${{ matrix.platform }}
         run: |
           mkdir -p /tmp/digests
           DIGEST="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${DIGEST#sha256:}-${PLATFORM_TAG//\//-}"
+          touch "/tmp/digests/${DIGEST#sha256:}-${{ matrix.arch }}"
 
       - name: Upload digest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: digest-${{ matrix.sha }}-${{ replace(matrix.platform, '/', '-') }}
+          name: digest-${{ matrix.sha }}-${{ matrix.arch }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
