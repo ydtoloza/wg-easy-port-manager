@@ -5,7 +5,9 @@ const path = require('path');
 const debug = require('debug')('WireGuard');
 const crypto = require('node:crypto');
 const { AsyncLocalStorage } = require('node:async_hooks');
+const net = require('node:net');
 const QRCode = require('qrcode');
+const { parseDnatRules, rulePresent: dnatRulePresent } = require('./NftRules');
 
 const Util = require('./Util');
 const ServerError = require('./ServerError');
@@ -135,6 +137,7 @@ module.exports = class WireGuard {
     this.__activeMutation = false;
     this.__settingsRecoveryPending = false;
     this.__settingsRecoveryConfig = null;
+    this.__probeState = new Map(); // key: `${clientId}:${ruleKey}` -> { lastAt, inFlight }
   }
 
   // Serializes every state change (and read snapshots, see the public read
@@ -324,6 +327,7 @@ module.exports = class WireGuard {
     await this.__syncDirectory();
     this.__settingsRecoveryPending = false;
     this.__settingsRecoveryConfig = null;
+    this.__probeState = new Map(); // key: `${clientId}:${ruleKey}` -> { lastAt, inFlight }
   }
 
   async __buildConfig() {
@@ -1577,6 +1581,112 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
   async __applyAllDnatRules() {
     return this.__applyAllNetworkRules();
+  }
+
+  // Best-effort TCP connect. Locally originated traffic may take a hairpin
+  // path instead of traversing prerouting DNAT, which the verdict labels
+  // honestly as 'dnat-local'.
+  __tcpConnect(host, port, timeoutMs = 2000) {
+    return new Promise((resolve) => {
+      const socket = net.connect({ host, port });
+      const finish = (result) => {
+        socket.removeAllListeners();
+        socket.destroy();
+        resolve(result);
+      };
+      socket.setTimeout(timeoutMs, () => finish(false));
+      socket.once('connect', () => finish(true));
+      socket.once('error', () => finish(false));
+    });
+  }
+
+  __peerTunnelUp(client) {
+    const now = Date.now();
+    const effectiveKeepalive = Number(this.__serverSettings.persistentKeepalive) || 180;
+    const onlineWindowMs = 3 * effectiveKeepalive * 1000;
+    return now - client.latestHandshakeAt.getTime() < onlineWindowMs;
+  }
+
+  // Three-level reachability verdict for one forwarding rule. Runs OUTSIDE the
+  // mutation queue (it performs network I/O with a 2s budget); the rule is
+  // snapshotted synchronously up front so concurrent mutations cannot change
+  // what is being probed mid-flight.
+  async probePortForward({ clientId, rule }) {
+    const config = await this.getConfig();
+    const client = config.clients[clientId];
+    if (!client) throw new ServerError(`Client not found: ${clientId}`, 404);
+    const rules = Array.isArray(client.portForwards) ? client.portForwards : [];
+    const resolved = typeof rule === 'string' && /^[0-9]+$/.test(rule)
+      ? rules[Number(rule)]
+      : rules.find((entry) => entry && entry.id === rule);
+    if (!resolved || !Number.isInteger(resolved.extPort) || !Number.isInteger(resolved.intPort)) {
+      throw new ServerError('Port forward rule not found', 404);
+    }
+    const snapshot = {
+      proto: resolved.proto,
+      extPort: Number(resolved.extPort),
+      intPort: Number(resolved.intPort),
+      peerIP: client.address,
+    };
+
+    const probeKey = `${clientId}:${resolved.id ?? `${snapshot.proto}/${snapshot.extPort}`}`;
+    const state = this.__probeState.get(probeKey);
+    if (state && state.inFlight) return state.inFlight;
+    if (state && Date.now() - state.lastAt < 30_000) {
+      throw new ServerError('Probe rate limit: try again in less than 30s', 429);
+    }
+
+    const execution = (async () => {
+      let liveRules = [];
+      try {
+        const tableJson = await Util.exec('nft -j list table ip wgeasy_dnat', { log: false });
+        liveRules = parseDnatRules(tableJson);
+      } catch (err) {
+        debug(`Probe: could not list nft rules: ${err.message}`);
+      }
+      const isPresent = dnatRulePresent(liveRules, snapshot);
+
+      let tunnelUp = false;
+      try {
+        const dump = await Util.exec('wg show wg0 dump', { log: false });
+        const peerLine = String(dump).trim().split('\n').slice(1)
+          .find((line) => line.split('\t')[0] === client.publicKey);
+        const handshake = peerLine ? Number(peerLine.split('\t')[4]) : 0;
+        if (handshake > 0) {
+          tunnelUp = this.__peerTunnelUp({ latestHandshakeAt: new Date(handshake * 1000) });
+        }
+      } catch (err) {
+        debug(`Probe: could not read wg dump: ${err.message}`);
+      }
+
+      const tcpConnectable = await this.__tcpConnect(this.__serverSettings.host, snapshot.extPort);
+
+      let verdict;
+      if (!isPresent) {
+        verdict = tcpConnectable ? 'dnat-local' : 'rule-missing';
+      } else if (!tunnelUp) {
+        verdict = tcpConnectable ? 'dnat-local' : 'tunnel-down';
+      } else {
+        verdict = tcpConnectable ? 'ok' : 'unreachable';
+      }
+      return {
+        rule: { ...snapshot },
+        rulePresent: isPresent,
+        tunnelUp,
+        tcpConnectable,
+        verdict,
+      };
+    })();
+
+    this.__probeState.set(probeKey, { lastAt: Date.now(), inFlight: execution });
+    try {
+      return await execution;
+    } finally {
+      const current = this.__probeState.get(probeKey);
+      if (current && current.inFlight === execution) {
+        this.__probeState.set(probeKey, { lastAt: Date.now(), inFlight: null });
+      }
+    }
   }
 
   async addPortForward(clientId, proto, extPort, intPort) {

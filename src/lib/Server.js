@@ -589,6 +589,18 @@ module.exports = class Server {
         await WireGuard.updatePortForward(clientId, numIndex, proto, p, ip);
         return { success: true };
       }))
+      .get('/api/wireguard/client/:clientId/port-forward/:index/probe', defineEventHandler(async (event) => {
+        const clientId = getRouterParam(event, 'clientId');
+        if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+          throw createError({ status: 403 });
+        }
+        // Accepts a stable rule id or a legacy numeric index.
+        const rule = getRouterParam(event, 'index');
+        if (!/^\d+$/.test(rule) && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rule)) {
+          throw createError({ status: 400, message: 'Invalid rule id or index' });
+        }
+        return WireGuard.probePortForward({ clientId, rule });
+      }))
       .get('/api/wireguard/server-config', defineEventHandler(async () => {
         return WireGuard.getServerConfig();
       }))

@@ -359,6 +359,144 @@ describe('WireGuard', () => {
     });
   });
 
+  describe('port-forward reachability probe', () => {
+    const nftTable = (present) => JSON.stringify({
+      nftables: present ? [{
+        rule: {
+          family: 'ip',
+          chain: 'prerouting',
+          expr: [
+            { match: { left: { payload: { protocol: 'tcp', field: 'dport' } }, op: 'eq', right: 2000 } },
+            { dnat: { family: 'ip', addr: '10.8.0.2', port: 2000 } },
+          ],
+        },
+      }] : [],
+    });
+    const dumpFor = (handshakeSecondsAgo) => {
+      const ts = Math.floor(Date.now() / 1000) - handshakeSecondsAgo;
+      return `server\n${[KEYS.clientPublic, KEYS.preShared, '203.0.113.9:51820', '10.8.0.2/32', String(ts), '1', '2', '0'].join('\t')}`;
+    };
+
+    const setupProbe = async ({ nftPresent, handshakeSecondsAgo, tcpResult }) => {
+      await wg.getConfig();
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('nft -j list table')) return nftTable(nftPresent);
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(handshakeSecondsAgo);
+        return '';
+      });
+      jest.spyOn(wg, '__tcpConnect').mockResolvedValue(tcpResult);
+    };
+
+    it('derives ok when rule, tunnel and connect all succeed', async () => {
+      await setupProbe({ nftPresent: true, handshakeSecondsAgo: 10, tcpResult: true });
+      const verdict = await wg.probePortForward({ clientId: 'client1', rule: '0' });
+      expect(verdict).toMatchObject({
+        rulePresent: true, tunnelUp: true, tcpConnectable: true, verdict: 'ok',
+      });
+      expect(verdict.rule).toMatchObject({
+        proto: 'tcp', extPort: 2000, intPort: 2000, peerIP: '10.8.0.2',
+      });
+    });
+
+    it('derives rule-missing when the rule is absent and nothing answers', async () => {
+      const instance = new (require('./WireGuard'))(); // eslint-disable-line global-require
+      await instance.getConfig();
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('nft -j list table')) return nftTable(false);
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(10);
+        return '';
+      });
+      jest.spyOn(instance, '__tcpConnect').mockResolvedValue(false);
+      const verdict = await instance.probePortForward({ clientId: 'client1', rule: '0' });
+      expect(verdict).toMatchObject({ rulePresent: false, tcpConnectable: false, verdict: 'rule-missing' });
+    });
+
+    it('derives tunnel-down when the rule exists but the tunnel is stale', async () => {
+      const wg2 = new (require('./WireGuard'))(); // eslint-disable-line global-require
+      await wg2.getConfig();
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('nft -j list table')) return nftTable(true);
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(3600);
+        return '';
+      });
+      jest.spyOn(wg2, '__tcpConnect').mockResolvedValue(false);
+      const verdict = await wg2.probePortForward({ clientId: 'client1', rule: '0' });
+      expect(verdict).toMatchObject({ rulePresent: true, tunnelUp: false, verdict: 'tunnel-down' });
+    });
+
+    it('derives unreachable when rule and tunnel are up but TCP fails', async () => {
+      const wg3 = new (require('./WireGuard'))(); // eslint-disable-line global-require
+      await wg3.getConfig();
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('nft -j list table')) return nftTable(true);
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(10);
+        return '';
+      });
+      jest.spyOn(wg3, '__tcpConnect').mockResolvedValue(false);
+      const verdict = await wg3.probePortForward({ clientId: 'client1', rule: '0' });
+      expect(verdict).toMatchObject({ rulePresent: true, tunnelUp: true, verdict: 'unreachable' });
+    });
+
+    it('labels hairpin connects honestly as dnat-local', async () => {
+      const wg4 = new (require('./WireGuard'))(); // eslint-disable-line global-require
+      await wg4.getConfig();
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('nft -j list table')) return nftTable(false);
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(10);
+        return '';
+      });
+      jest.spyOn(wg4, '__tcpConnect').mockResolvedValue(true);
+      const verdict = await wg4.probePortForward({ clientId: 'client1', rule: '0' });
+      expect(verdict).toMatchObject({ rulePresent: false, tcpConnectable: true, verdict: 'dnat-local' });
+    });
+
+    it('rate-limits repeated probes of the same rule', async () => {
+      const wg5 = new (require('./WireGuard'))(); // eslint-disable-line global-require
+      await wg5.getConfig();
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('nft -j list table')) return nftTable(true);
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(10);
+        return '';
+      });
+      jest.spyOn(wg5, '__tcpConnect').mockResolvedValue(true);
+      await wg5.probePortForward({ clientId: 'client1', rule: '0' });
+      await expect(wg5.probePortForward({ clientId: 'client1', rule: '0' }))
+        .rejects.toMatchObject({ statusCode: 429 });
+    });
+
+    it('single-flights concurrent probes of the same rule', async () => {
+      const wg6 = new (require('./WireGuard'))(); // eslint-disable-line global-require
+      await wg6.getConfig();
+      let release;
+      const gate = new Promise((resolve) => {
+        release = resolve;
+      });
+      let tcpCalls = 0;
+      jest.spyOn(wg6, '__tcpConnect').mockImplementation(async () => {
+        tcpCalls += 1;
+        await gate;
+        return true;
+      });
+      const probes = Promise.all([
+        wg6.probePortForward({ clientId: 'client1', rule: '0' }),
+        wg6.probePortForward({ clientId: 'client1', rule: '0' }),
+      ]);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      release();
+      const results = await probes;
+      expect(tcpCalls).toBe(1);
+      expect(results[0]).toEqual(results[1]);
+    });
+
+    it('returns 404 for an unknown rule', async () => {
+      await wg.getConfig();
+      await expect(wg.probePortForward({ clientId: 'client1', rule: '99' }))
+        .rejects.toMatchObject({ statusCode: 404 });
+      await expect(wg.probePortForward({ clientId: 'client1', rule: '11111111-2222-3333-4444-555555555555' }))
+        .rejects.toMatchObject({ statusCode: 404 });
+    });
+  });
+
   describe('restoreConfiguration', () => {
     it('rolls back disk and host on failure', async () => {
       await wg.getConfig(); // init state
