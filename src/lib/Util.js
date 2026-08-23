@@ -2,6 +2,8 @@
 
 const childProcess = require('child_process');
 
+const RULE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 module.exports = class Util {
 
   static isValidIPv4(str) {
@@ -35,6 +37,23 @@ module.exports = class Util {
     // Reject control characters (e.g. newlines) that could break config files.
     // eslint-disable-next-line no-control-regex
     return !/[\u0000-\u001f\u007f]/.test(str);
+  }
+
+  // Type-strict port parsing. `Number()` alone accepts `true` → 1,
+  // `'0x10'` → 16 and `'5e2'` → 500 — none of those are ports.
+  static parsePort(value) {
+    if (typeof value === 'number') return value;
+    if (typeof value === 'string' && value !== '' && /^\d+$/.test(value)) return Number(value);
+    return NaN;
+  }
+
+  static isValidPort(value) {
+    const port = this.parsePort(value);
+    return Number.isInteger(port) && port >= 1 && port <= 65535;
+  }
+
+  static isValidRuleId(value) {
+    return typeof value === 'string' && RULE_ID_RE.test(value);
   }
 
   static async exec(cmd, {

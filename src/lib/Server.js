@@ -25,6 +25,7 @@ const {
 } = require('h3');
 
 const WireGuard = require('../services/WireGuard');
+const Util = require('./Util');
 
 const {
   PORT,
@@ -161,6 +162,19 @@ const readBodyLimited = async (event) => {
   } catch (err) {
     throw createError({ statusCode: 400, message: 'Invalid JSON', cause: err });
   }
+};
+
+// Shared, type-strict validation for port-forward bodies. `Number()` alone
+// would accept true -> 1, '0x10' -> 16 and '5e2' -> 500, so ports go through
+// Util.parsePort. Policy/conflict checks stay in the service layer.
+const parsePortForwardBody = (body) => {
+  if (!body || !['tcp', 'udp', 'both'].includes(body.proto)) {
+    throw createError({ status: 400, message: 'proto must be tcp, udp or both' });
+  }
+  if (!Util.isValidPort(body.extPort) || !Util.isValidPort(body.intPort)) {
+    throw createError({ status: 400, message: 'Invalid ports' });
+  }
+  return { proto: body.proto, extPort: Util.parsePort(body.extPort), intPort: Util.parsePort(body.intPort) };
 };
 
 // Validate that cross-site requests cannot use the session cookie.
@@ -517,6 +531,18 @@ module.exports = class Server {
         await WireGuard.updateClientName({ clientId, name });
         return { success: true };
       }))
+      .put('/api/wireguard/client/:clientId/keepalive', defineEventHandler(async (event) => {
+        const clientId = getRouterParam(event, 'clientId');
+        if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+          throw createError({ status: 403 });
+        }
+        const { persistentKeepalive } = await readBodyLimited(event);
+        if (persistentKeepalive !== null
+          && (!Number.isInteger(persistentKeepalive) || persistentKeepalive < 0 || persistentKeepalive > 65535)) {
+          throw createError({ status: 400, message: 'persistentKeepalive must be null or an integer between 0 and 65535' });
+        }
+        return WireGuard.updateClientKeepalive({ clientId, persistentKeepalive });
+      }))
       .put('/api/wireguard/client/:clientId/address', defineEventHandler(async (event) => {
         const clientId = getRouterParam(event, 'clientId');
         if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
@@ -542,16 +568,42 @@ module.exports = class Server {
         if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
           throw createError({ status: 403 });
         }
-        const { proto, extPort, intPort } = await readBodyLimited(event);
-        if (!['tcp', 'udp', 'both'].includes(proto)) {
+        const { proto, extPort, intPort } = parsePortForwardBody(await readBodyLimited(event));
+        await WireGuard.addPortForward(clientId, proto, extPort, intPort);
+        return { success: true };
+      }))
+      .post('/api/wireguard/client/:clientId/port-forward/auto', defineEventHandler(async (event) => {
+        const clientId = getRouterParam(event, 'clientId');
+        if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+          throw createError({ status: 403 });
+        }
+        const {
+          proto, intPort, rangeStart, rangeEnd,
+        } = await readBodyLimited(event);
+        if (!proto || !['tcp', 'udp', 'both'].includes(proto)) {
           throw createError({ status: 400, message: 'proto must be tcp, udp or both' });
         }
-        const p = Number(extPort);
-        const ip = Number(intPort);
-        if (!Number.isInteger(p) || !Number.isInteger(ip) || p < 1 || p > 65535 || ip < 1 || ip > 65535) {
-          throw createError({ status: 400, message: 'Invalid ports' });
+        if (!Util.isValidPort(intPort)) {
+          throw createError({ status: 400, message: 'Invalid internal port' });
         }
-        await WireGuard.addPortForward(clientId, proto, p, ip);
+        const rule = await WireGuard.autoAssignPortForward(clientId, {
+          proto,
+          intPort: Util.parsePort(intPort),
+          ...(rangeStart === undefined || rangeStart === null ? {} : { rangeStart }),
+          ...(rangeEnd === undefined || rangeEnd === null ? {} : { rangeEnd }),
+        });
+        return { success: true, rule };
+      }))
+      .delete('/api/wireguard/client/:clientId/port-forward/id/:ruleId', defineEventHandler(async (event) => {
+        const clientId = getRouterParam(event, 'clientId');
+        if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+          throw createError({ status: 403 });
+        }
+        const ruleId = getRouterParam(event, 'ruleId');
+        if (!Util.isValidRuleId(ruleId)) {
+          throw createError({ status: 400, message: 'Invalid rule id' });
+        }
+        await WireGuard.removePortForwardById(clientId, ruleId);
         return { success: true };
       }))
       .delete('/api/wireguard/client/:clientId/port-forward/:index', defineEventHandler(async (event) => {
@@ -567,6 +619,19 @@ module.exports = class Server {
         await WireGuard.removePortForward(clientId, numIndex);
         return { success: true };
       }))
+      .put('/api/wireguard/client/:clientId/port-forward/id/:ruleId', defineEventHandler(async (event) => {
+        const clientId = getRouterParam(event, 'clientId');
+        if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+          throw createError({ status: 403 });
+        }
+        const ruleId = getRouterParam(event, 'ruleId');
+        if (!Util.isValidRuleId(ruleId)) {
+          throw createError({ status: 400, message: 'Invalid rule id' });
+        }
+        const { proto, extPort, intPort } = parsePortForwardBody(await readBodyLimited(event));
+        await WireGuard.updatePortForwardById(clientId, ruleId, proto, extPort, intPort);
+        return { success: true };
+      }))
       .put('/api/wireguard/client/:clientId/port-forward/:index', defineEventHandler(async (event) => {
         const clientId = getRouterParam(event, 'clientId');
         const index = getRouterParam(event, 'index');
@@ -577,16 +642,8 @@ module.exports = class Server {
         if (!Number.isInteger(numIndex) || numIndex < 0) {
           throw createError({ status: 400, message: 'Invalid index' });
         }
-        const { proto, extPort, intPort } = await readBodyLimited(event);
-        if (!['tcp', 'udp', 'both'].includes(proto)) {
-          throw createError({ status: 400, message: 'proto must be tcp, udp or both' });
-        }
-        const p = Number(extPort);
-        const ip = Number(intPort);
-        if (!Number.isInteger(p) || !Number.isInteger(ip) || p < 1 || p > 65535 || ip < 1 || ip > 65535) {
-          throw createError({ status: 400, message: 'Invalid ports' });
-        }
-        await WireGuard.updatePortForward(clientId, numIndex, proto, p, ip);
+        const { proto, extPort, intPort } = parsePortForwardBody(await readBodyLimited(event));
+        await WireGuard.updatePortForward(clientId, numIndex, proto, extPort, intPort);
         return { success: true };
       }))
       .get('/api/wireguard/client/:clientId/port-forward/:index/probe', defineEventHandler(async (event) => {
