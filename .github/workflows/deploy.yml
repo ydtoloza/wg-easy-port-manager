@@ -8,6 +8,7 @@ on:
       - 'src/**'
       - 'Dockerfile'
       - '.dockerignore'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -66,28 +67,42 @@ jobs:
             fi
           done
 
+          # Manual dispatches rebuild the head commit (used to recover from
+          # transient registry/QEMU failures without pushing an empty commit).
+          if [[ ${#CODE_COMMITS[@]} -eq 0 && "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            CODE_COMMITS+=("$AFTER")
+          fi
+
           if [[ ${#CODE_COMMITS[@]} -eq 0 ]]; then
             echo "The push did not contain a code-changing commit" >&2
             exit 1
           fi
 
           MATRIX=$(printf '%s\n' "${CODE_COMMITS[@]}" \
-            | jq -Rsc 'split("\n") | map(select(length > 0)) | {sha: .}')
+            | jq -Rs '{include: (
+                split("\n")
+                | map(select(length > 0))
+                | map(. as $sha | [
+                    {sha: $sha, platform: "linux/amd64", runner: "ubuntu-latest"},
+                    {sha: $sha, platform: "linux/arm64", runner: "ubuntu-24.04-arm"}
+                  ])
+                | flatten
+              )}')
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "head_image_sha=${CODE_COMMITS[-1]}" >> "$GITHUB_OUTPUT"
 
   publish:
-    name: Publish ${{ matrix.sha }}
+    name: Publish ${{ matrix.sha }} · ${{ matrix.platform }}
     needs:
       - quality
       - commits
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix: ${{ fromJSON(needs.commits.outputs.matrix) }}
     steps:
       - name: Checkout commit
@@ -100,8 +115,74 @@ jobs:
         shell: bash
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push per-platform image by digest
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.title=WG-Easy Port Manager
+            org.opencontainers.image.description=WireGuard management with DNAT and per-client network policies
+            org.opencontainers.image.revision=${{ matrix.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=CC-BY-NC-SA-4.0
+          cache-from: type=gha,scope=main-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=main-${{ matrix.platform }}
+
+      - name: Export digest
+        shell: bash
+        env:
+          PLATFORM_TAG: ${{ matrix.platform }}
+        run: |
+          mkdir -p /tmp/digests
+          DIGEST="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${DIGEST#sha256:}-${PLATFORM_TAG//\//-}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digest-${{ matrix.sha }}-${{ matrix.platform }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge manifest ${{ matrix.sha }}
+    needs:
+      - commits
+      - publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.commits.outputs.matrix) }}
+    steps:
+      - name: Normalize image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: /tmp/digests
+          pattern: digest-${{ matrix.sha }}-*
+          merge-multiple: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -125,28 +206,27 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build and publish commit image
+      - name: Create multi-arch manifest
         if: steps.image_exists.outputs.exists != 'true'
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.image.outputs.name }}:sha-${{ matrix.sha }}
-          labels: |
-            org.opencontainers.image.title=WG-Easy Port Manager
-            org.opencontainers.image.description=WireGuard management with DNAT and per-client network policies
-            org.opencontainers.image.revision=${{ matrix.sha }}
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.licenses=CC-BY-NC-SA-4.0
-          cache-from: type=gha,scope=main
-          cache-to: type=gha,mode=max,scope=main
+        working-directory: /tmp/digests
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}:sha-${{ matrix.sha }}
+        run: |
+          docker buildx imagetools create \
+            --tag "$IMAGE" \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Inspect final image
+        if: steps.image_exists.outputs.exists != 'true'
+        shell: bash
+        run: docker buildx imagetools inspect "${{ steps.image.outputs.name }}:sha-${{ matrix.sha }}"
 
   promote:
     name: Update main image
     needs:
       - commits
-      - publish
+      - merge
     runs-on: ubuntu-latest
     permissions:
       contents: read
