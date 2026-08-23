@@ -33,6 +33,15 @@ jest.mock('../config', () => ({
 
 jest.mock('../services/WireGuard', () => ({
   getClients: jest.fn().mockResolvedValue([]),
+  probePortForward: jest.fn().mockResolvedValue({
+    rule: {
+      proto: 'tcp', extPort: 2000, intPort: 2000, peerIP: '10.8.0.2',
+    },
+    rulePresent: true,
+    tunnelUp: true,
+    tcpConnectable: true,
+    verdict: 'ok',
+  }),
   autoAssignPortForward: jest.fn().mockResolvedValue({
     id: '11111111-2222-3333-4444-555555555555', proto: 'tcp', extPort: 1024, intPort: 80,
   }),
@@ -225,6 +234,20 @@ describe('HTTP server security', () => {
       statusCode: 409,
       error: 'Port tcp/8080 is already assigned to another peer',
     });
+  });
+
+  it('exposes the probe endpoint for admins (rule id or index)', async () => {
+    const response = await fetch(`${baseUrl}/api/wireguard/client/client1/port-forward/0/probe`, {
+      headers: { Authorization: 'correct-password' },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ verdict: 'ok' });
+    expect(WireGuard.probePortForward).toHaveBeenCalledWith({ clientId: 'client1', rule: '0' });
+
+    const bad = await fetch(`${baseUrl}/api/wireguard/client/client1/port-forward/bogus/probe`, {
+      headers: { Authorization: 'correct-password' },
+    });
+    expect(bad.status).toBe(400);
   });
 
   it('routes auto-assign through the service and returns the claimed rule', async () => {
