@@ -79,7 +79,7 @@ jobs:
           fi
 
           MATRIX=$(printf '%s\n' "${CODE_COMMITS[@]}" \
-            | jq -Rs '{include: (
+            | jq -Rsc '{include: (
                 split("\n")
                 | map(select(length > 0))
                 | map(. as $sha | [
@@ -87,7 +87,7 @@ jobs:
                     {sha: $sha, platform: "linux/arm64", runner: "ubuntu-24.04-arm"}
                   ])
                 | flatten
-              )}')
+              )}' | jq -c '.')
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "head_image_sha=${CODE_COMMITS[-1]}" >> "$GITHUB_OUTPUT"
 
