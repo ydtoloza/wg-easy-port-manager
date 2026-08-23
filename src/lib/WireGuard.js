@@ -41,6 +41,7 @@ const {
   WG_NFT_MASQUERADE,
   WG_SEED_TUNING,
   ALLOW_INSECURE_WEBHOOK,
+  ALLOW_PRIVATE_WEBHOOK,
 } = require('../config');
 
 const WIREGUARD_KEY_RE = /^[A-Za-z0-9+/]{43}=$/;
@@ -1340,7 +1341,11 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     };
     Webhook.deliver(
       {
-        url: webhook.url, secret: webhook.secret, body: JSON.stringify(payload), allowInsecure: !!ALLOW_INSECURE_WEBHOOK,
+        url: webhook.url,
+        secret: webhook.secret,
+        body: JSON.stringify(payload),
+        allowInsecure: !!ALLOW_INSECURE_WEBHOOK,
+        allowPrivate: !!ALLOW_PRIVATE_WEBHOOK,
       },
     ).then((delivered) => {
       if (!delivered) debug(`webhook event ${payload.event} seq=${seq} dropped after retries`);
@@ -1585,8 +1590,17 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       throw err;
     }
 
-    // Single funnel for port events: only reached on the success path.
-    if (event) await this.__emitPortEvent(event);
+    // Single funnel for port events: only reached on the success path. The
+    // events sidecar is auxiliary bookkeeping: a failure here must never
+    // surface as a request error after DNAT+config already committed (a
+    // client retry would then hit a 409), so it is debug-logged and swallowed.
+    if (event) {
+      try {
+        await this.__emitPortEvent(event);
+      } catch (err) {
+        debug(`webhook emit skipped: ${err.message}`);
+      }
+    }
   }
 
   async __transactionalDnatChange(mutate, rollback, context = 'dnat-change', options = {}) {
@@ -2206,6 +2220,15 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         client.portForwards.splice(index, 0, ruleToRemove);
       },
       'remove-port-forward',
+      {
+        event: {
+          type: 'port.deleted',
+          clientId,
+          proto: ruleToRemove.proto,
+          extPort: ruleToRemove.extPort,
+          intPort: ruleToRemove.intPort,
+        },
+      },
     );
   }
 
