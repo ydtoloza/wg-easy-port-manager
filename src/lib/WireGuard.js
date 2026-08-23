@@ -841,30 +841,38 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
     // half-applied (or later rolled-back) in-memory state.
     return this.__withMutation(async () => {
       const config = await this.getConfig();
-      const clients = Object.entries(config.clients).map(([clientId, client]) => ({
-        id: clientId,
-        name: client.name,
-        enabled: client.enabled,
-        address: client.address,
-        publicKey: client.publicKey,
-        createdAt: new Date(client.createdAt),
-        updatedAt: new Date(client.updatedAt),
-        allowedIPs: client.allowedIPs || [`${client.address}/32`, (this.__serverSettings.enableIpv6 && client.addressV6 ? `${client.addressV6}/128` : null)].filter(Boolean),
-        addressV6: client.addressV6,
-        portForwards: Array.isArray(client.portForwards)
-          ? client.portForwards.map((rule) => ({ ...rule }))
-          : [],
-        networkPolicy: this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false }),
-        downloadableConfig: 'privateKey' in client && client.privateKey != null,
-        persistentKeepalive: null,
-        latestHandshakeAt: null,
-        endpoint: null,
-        // A handshake within 3x the effective keepalive (or 3x 180s when no
-        // keepalive is configured) means the peer is reachable right now.
-        online: false,
-        transferRx: null,
-        transferTx: null,
-      }));
+      // Stored per-peer overrides, snapshotted before dump parsing: the wg
+      // dump reports the SERVER-side keepalive (typically 0), not the value
+      // the peer itself was told to use, so the online window must resolve
+      // from this snapshot.
+      const storedKeepalives = new Map();
+      const clients = Object.entries(config.clients).map(([clientId, client]) => {
+        storedKeepalives.set(clientId, client.persistentKeepalive ?? null);
+        return {
+          id: clientId,
+          name: client.name,
+          enabled: client.enabled,
+          address: client.address,
+          publicKey: client.publicKey,
+          createdAt: new Date(client.createdAt),
+          updatedAt: new Date(client.updatedAt),
+          allowedIPs: client.allowedIPs || [`${client.address}/32`, (this.__serverSettings.enableIpv6 && client.addressV6 ? `${client.addressV6}/128` : null)].filter(Boolean),
+          addressV6: client.addressV6,
+          portForwards: Array.isArray(client.portForwards)
+            ? client.portForwards.map((rule) => ({ ...rule }))
+            : [],
+          networkPolicy: this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false }),
+          downloadableConfig: 'privateKey' in client && client.privateKey != null,
+          persistentKeepalive: null,
+          latestHandshakeAt: null,
+          endpoint: null,
+          // A handshake within 3x the effective keepalive (or 3x 180s when no
+          // keepalive is configured) means the peer is reachable right now.
+          online: false,
+          transferRx: null,
+          transferTx: null,
+        };
+      });
 
       // Loop WireGuard status
       try {
@@ -896,7 +904,10 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
             client.endpoint = endpoint && endpoint !== '(none)' ? endpoint : null;
             client.transferRx = Number(transferRx);
             client.transferTx = Number(transferTx);
-            client.persistentKeepalive = persistentKeepalive;
+            // int-or-null so the API field is typed, not a raw dump string.
+            client.persistentKeepalive = /^\d+$/.test(String(persistentKeepalive ?? ''))
+              ? Number(persistentKeepalive)
+              : null;
           });
       } catch (err) {
         debug(`Warning: Could not fetch wireguard dump: ${err.message}`);
@@ -905,7 +916,7 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
       const now = Date.now();
       for (const client of clients) {
         if (!client.latestHandshakeAt) continue;
-        const effectiveKeepalive = Number(this.__serverSettings.persistentKeepalive) || 180;
+        const effectiveKeepalive = this.__effectiveKeepalive(storedKeepalives.get(client.id));
         const onlineWindowMs = 3 * effectiveKeepalive * 1000;
         client.online = (now - client.latestHandshakeAt.getTime()) < onlineWindowMs;
       }
@@ -1904,10 +1915,18 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     });
   }
 
+  // Client-over-global keepalive resolution for reachability windows. A
+  // per-peer override (Feature 2) lengthens the online window 3x that value;
+  // unset (null) falls back to the global setting, and 0/NaN (keepalive
+  // disabled) falls back to the 3x180s baseline.
+  __effectiveKeepalive(storedKeepalive) {
+    const resolved = storedKeepalive != null ? storedKeepalive : this.__serverSettings.persistentKeepalive;
+    return Number(resolved) || 180;
+  }
+
   __peerTunnelUp(client) {
     const now = Date.now();
-    const effectiveKeepalive = Number(this.__serverSettings.persistentKeepalive) || 180;
-    const onlineWindowMs = 3 * effectiveKeepalive * 1000;
+    const onlineWindowMs = 3 * this.__effectiveKeepalive(client.storedKeepalive ?? null) * 1000;
     return now - client.latestHandshakeAt.getTime() < onlineWindowMs;
   }
 
@@ -1957,7 +1976,10 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
           .find((line) => line.split('\t')[0] === client.publicKey);
         const handshake = peerLine ? Number(peerLine.split('\t')[4]) : 0;
         if (handshake > 0) {
-          tunnelUp = this.__peerTunnelUp({ latestHandshakeAt: new Date(handshake * 1000) });
+          tunnelUp = this.__peerTunnelUp({
+            latestHandshakeAt: new Date(handshake * 1000),
+            storedKeepalive: client.persistentKeepalive,
+          });
         }
       } catch (err) {
         debug(`Probe: could not read wg dump: ${err.message}`);
