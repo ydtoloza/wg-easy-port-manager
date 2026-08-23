@@ -146,7 +146,7 @@ jobs:
         run: |
           mkdir -p /tmp/digests
           DIGEST="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${DIGEST#sha256:}-${{ matrix.arch }}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
