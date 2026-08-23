@@ -359,6 +359,76 @@ describe('WireGuard', () => {
     });
   });
 
+  describe('online flag and endpoint exposure', () => {
+    const dumpLine = ({ endpoint = '203.0.113.9:51820', handshakeSecondsAgo = 0 }) => [
+      KEYS.clientPublic,
+      KEYS.preShared,
+      endpoint,
+      '10.8.0.2/32',
+      String(Math.floor(Date.now() / 1000) - handshakeSecondsAgo),
+      '1000',
+      '2000',
+      '0',
+    ].join('\t');
+
+    it('marks a fresh handshake online and passes the endpoint through', async () => {
+      await wg.getConfig();
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
+          return `server-line\n${dumpLine({ handshakeSecondsAgo: 10 })}`;
+        }
+        return '';
+      });
+      const clients = await wg.getClients();
+      expect(clients[0].online).toBe(true);
+      expect(clients[0].endpoint).toBe('203.0.113.9:51820');
+    });
+
+    it('marks a stale handshake offline', async () => {
+      await wg.getConfig();
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
+          // Global keepalive is 25s in the mocked config -> window is 75s.
+          return `server-line\n${dumpLine({ handshakeSecondsAgo: 300 })}`;
+        }
+        return '';
+      });
+      const clients = await wg.getClients();
+      expect(clients[0].online).toBe(false);
+      expect(clients[0].endpoint).toBe('203.0.113.9:51820');
+    });
+
+    it('uses a 3x180s window when no keepalive is configured', async () => {
+      await wg.getConfig();
+      wg.__serverSettings.persistentKeepalive = 0;
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
+          return `server-line\n${dumpLine({ handshakeSecondsAgo: 400 })}`;
+        }
+        return '';
+      });
+      const clients = await wg.getClients();
+      // 400s ago is inside the 540s fallback window.
+      expect(clients[0].online).toBe(true);
+    });
+
+    it('treats no-handshake and (none) endpoint as offline/null', async () => {
+      await wg.getConfig();
+      // handshake '0' means "never handshaked".
+      const line = [
+        KEYS.clientPublic, KEYS.preShared, '(none)', '10.8.0.2/32', '0', '0', '0', '0',
+      ].join('\t');
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return `server-line\n${line}`;
+        return '';
+      });
+      const clients = await wg.getClients();
+      expect(clients[0].online).toBe(false);
+      expect(clients[0].endpoint).toBeNull();
+      expect(clients[0].latestHandshakeAt).toBeNull();
+    });
+  });
+
   describe('restoreConfiguration', () => {
     it('rolls back disk and host on failure', async () => {
       await wg.getConfig(); // init state
