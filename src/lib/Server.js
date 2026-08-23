@@ -1,6 +1,7 @@
 'use strict';
 
 const bcrypt = require('bcryptjs');
+const { createHash } = require('node:crypto');
 const { createServer } = require('node:http');
 const { stat, readFile } = require('node:fs/promises');
 const { isIP } = require('node:net');
@@ -42,6 +43,8 @@ const {
 } = require('../config');
 
 const requiresPassword = !!PASSWORD_HASH;
+
+const sha256Hex = (value) => createHash('sha256').update(value).digest('hex');
 
 const SESSION_COOKIE_MAX_AGE = 12 * 60 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS = 20; // per IP per window
@@ -407,10 +410,64 @@ module.exports = class Server {
         return { success: true };
       }));
 
+    // Peer-token gate for /api/peer/me — mounted BEFORE the admin gate so
+    // scoped tokens never flow into the admin-password Authorization path.
+    // The admin gate below exempts the exact /api/peer/me prefix; anything
+    // under it without a valid Bearer peer token is rejected here.
+    app.use(
+      fromNodeMiddleware(async (req, res, next) => {
+        const isPeerPath = req.url === '/api/peer/me' || req.url.startsWith('/api/peer/me/');
+        if (!isPeerPath) return next();
+
+        const auth = req.headers['authorization'];
+        const token = typeof auth === 'string' && auth.startsWith('Bearer wgpt_')
+          ? auth.slice('Bearer wgpt_'.length)
+          : null;
+        if (!token || !/^[0-9a-f]{64}$/.test(token)) {
+          res.statusCode = 401;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: 'Peer token required' }));
+          return;
+        }
+
+        // Separate rate-limit buckets keyed by token-hash prefix: these must
+        // not share buckets with admin logins (success resets shared counters
+        // and would enable lockout evasion).
+        const bucket = `peer-token:${sha256Hex(`wgpt_${token}`).slice(0, 16)}`;
+        if (!beginPasswordCheck(bucket)) {
+          res.statusCode = 429;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: 'Too many attempts, try again later' }));
+          return;
+        }
+        let clientId = null;
+        try {
+          clientId = await WireGuard.lookupPeerToken(`wgpt_${token}`);
+        } finally {
+          completePasswordCheck(bucket, clientId !== null);
+        }
+        if (!clientId) {
+          res.statusCode = 401;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: 'Invalid peer token' }));
+          return;
+        }
+        // Handlers resolve the peer server-side from the token, never from
+        // path or body.
+        req.wgpmPeerClientId = clientId;
+        return next();
+      }),
+    );
+
     // WireGuard
     app.use(
       fromNodeMiddleware((req, res, next) => {
         if (!requiresPassword || !req.url.startsWith('/api/')) {
+          return next();
+        }
+
+        // Scoped peer endpoints authenticate against their own gate above.
+        if (req.url === '/api/peer/me' || req.url.startsWith('/api/peer/me/')) {
           return next();
         }
 
@@ -449,6 +506,72 @@ module.exports = class Server {
         res.end(JSON.stringify({ error: 'Not Logged In' }));
       }),
     );
+
+    // Scoped peer endpoints. clientId comes exclusively from the pinned token
+    // (req.wgpmPeerClientId). Mutations require selfManagePorts and answer
+    // 403 otherwise; reads (profile, probe) are always allowed for the
+    // token's own peer.
+    const peerRouter = createRouter();
+    app.use(peerRouter);
+
+    const requireSelfManagePorts = async (clientId) => {
+      const profile = await WireGuard.getPeerProfile({ clientId });
+      if (!profile.permissions.selfManagePorts) {
+        throw createError({ status: 403, message: 'Self port management is disabled for this peer' });
+      }
+    };
+
+    const parsePeerPortBody = (body) => {
+      if (!body || !['tcp', 'udp', 'both'].includes(body.proto)) {
+        throw createError({ status: 400, message: 'proto must be tcp, udp or both' });
+      }
+      const extPort = Number(body.extPort);
+      const intPort = Number(body.intPort);
+      if (!Number.isInteger(extPort) || !Number.isInteger(intPort)
+        || extPort < 1 || extPort > 65535 || intPort < 1 || intPort > 65535) {
+        throw createError({ status: 400, message: 'Invalid ports' });
+      }
+      return { proto: body.proto, extPort, intPort };
+    };
+
+    peerRouter
+      .get('/api/peer/me', defineEventHandler((event) => {
+        return WireGuard.getPeerProfile({ clientId: event.node.req.wgpmPeerClientId });
+      }))
+      .get('/api/peer/me/port-forward/:indexOrId/probe', defineEventHandler(async (event) => {
+        const rule = getRouterParam(event, 'indexOrId');
+        if (!/^\d+$/.test(rule)
+          && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rule)) {
+          throw createError({ status: 400, message: 'Invalid rule id or index' });
+        }
+        // Transitional: active once the reachability-probe feature merges.
+        if (typeof WireGuard.probePortForward !== 'function') {
+          throw createError({ status: 501, message: 'Probe feature not available' });
+        }
+        return WireGuard.probePortForward({ clientId: event.node.req.wgpmPeerClientId, rule });
+      }))
+      .post('/api/peer/me/port-forward', defineEventHandler(async (event) => {
+        const clientId = event.node.req.wgpmPeerClientId;
+        await requireSelfManagePorts(clientId);
+        const { proto, extPort, intPort } = parsePeerPortBody(await readBodyLimited(event));
+        await WireGuard.addPortForward(clientId, proto, extPort, intPort);
+        return { success: true };
+      }))
+      .put('/api/peer/me/port-forward/id/:ruleId', defineEventHandler(async (event) => {
+        const clientId = event.node.req.wgpmPeerClientId;
+        await requireSelfManagePorts(clientId);
+        const ruleId = getRouterParam(event, 'ruleId');
+        const { proto, extPort, intPort } = parsePeerPortBody(await readBodyLimited(event));
+        await WireGuard.updatePortForwardByRuleId(clientId, ruleId, proto, extPort, intPort);
+        return { success: true };
+      }))
+      .delete('/api/peer/me/port-forward/id/:ruleId', defineEventHandler(async (event) => {
+        const clientId = event.node.req.wgpmPeerClientId;
+        await requireSelfManagePorts(clientId);
+        const ruleId = getRouterParam(event, 'ruleId');
+        await WireGuard.removePortForwardByRuleId(clientId, ruleId);
+        return { success: true };
+      }));
 
     const router2 = createRouter();
     app.use(router2);
@@ -665,6 +788,39 @@ module.exports = class Server {
         const body = await readBodyLimited(event);
         const result = await WireGuard.updateServerConfig(body);
         return result;
+      }))
+      .post('/api/wireguard/client/:clientId/token', defineEventHandler(async (event) => {
+        const clientId = getRouterParam(event, 'clientId');
+        if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+          throw createError({ status: 403 });
+        }
+        // The plaintext token is returned exactly once and never stored.
+        return WireGuard.issueClientToken({ clientId });
+      }))
+      .delete('/api/wireguard/client/:clientId/token', defineEventHandler(async (event) => {
+        const clientId = getRouterParam(event, 'clientId');
+        if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+          throw createError({ status: 403 });
+        }
+        return WireGuard.revokeClientToken({ clientId });
+      }))
+      .put('/api/wireguard/client/:clientId/self-manage-ports', defineEventHandler(async (event) => {
+        const clientId = getRouterParam(event, 'clientId');
+        if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+          throw createError({ status: 403 });
+        }
+        const { enabled } = await readBodyLimited(event);
+        if (typeof enabled !== 'boolean') {
+          throw createError({ status: 400, message: 'enabled must be a boolean' });
+        }
+        return WireGuard.setClientSelfManagePorts({ clientId, enabled });
+      }))
+      .get('/api/wireguard/webhook-config', defineEventHandler(async () => {
+        return WireGuard.getWebhookConfig();
+      }))
+      .put('/api/wireguard/webhook-config', defineEventHandler(async (event) => {
+        const { url, secret } = await readBodyLimited(event);
+        return WireGuard.setWebhookConfig({ url, secret });
       }));
 
     const safePathJoin = (base, target) => {

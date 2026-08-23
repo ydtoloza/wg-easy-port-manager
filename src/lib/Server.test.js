@@ -33,6 +33,23 @@ jest.mock('../config', () => ({
 
 jest.mock('../services/WireGuard', () => ({
   getClients: jest.fn().mockResolvedValue([]),
+  lookupPeerToken: jest.fn(),
+  getPeerProfile: jest.fn().mockResolvedValue({
+    id: 'client1',
+    name: 'client1',
+    address: '10.8.0.2',
+    addressV6: 'fd42:42:42::2',
+    portForwards: [],
+    permissions: { selfManagePorts: true },
+  }),
+  addPortForward: jest.fn().mockResolvedValue(),
+  updatePortForwardByRuleId: jest.fn().mockResolvedValue(),
+  removePortForwardByRuleId: jest.fn().mockResolvedValue(),
+  issueClientToken: jest.fn().mockResolvedValue({ token: `wgpt_${'a'.repeat(64)}`, tokenCreatedAt: new Date(0) }),
+  revokeClientToken: jest.fn().mockResolvedValue({ success: true }),
+  setClientSelfManagePorts: jest.fn().mockResolvedValue({ selfManagePorts: true }),
+  getWebhookConfig: jest.fn().mockResolvedValue({ configured: true, url: 'https://example.test/hook' }),
+  setWebhookConfig: jest.fn().mockResolvedValue({ configured: true, url: 'https://example.test/hook' }),
   probePortForward: jest.fn().mockResolvedValue({
     rule: {
       proto: 'tcp', extPort: 2000, intPort: 2000, peerIP: '10.8.0.2',
@@ -233,6 +250,145 @@ describe('HTTP server security', () => {
     expect(await response.json()).toEqual({
       statusCode: 409,
       error: 'Port tcp/8080 is already assigned to another peer',
+    });
+  });
+
+  describe('scoped peer tokens', () => {
+    const peerToken = `Bearer wgpt_${'ab'.repeat(32)}`;
+
+    it('serves the peer profile for a valid token', async () => {
+      WireGuard.lookupPeerToken.mockResolvedValueOnce('client1');
+      const response = await fetch(`${baseUrl}/api/peer/me`, { headers: { Authorization: peerToken } });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ id: 'client1', permissions: { selfManagePorts: true } });
+      expect(WireGuard.lookupPeerToken).toHaveBeenCalledWith(`wgpt_${'ab'.repeat(32)}`);
+    });
+
+    it('rejects missing, malformed and unknown tokens', async () => {
+      const missing = await fetch(`${baseUrl}/api/peer/me`);
+      expect(missing.status).toBe(401);
+
+      const malformed = await fetch(`${baseUrl}/api/peer/me`, { headers: { Authorization: 'Bearer wgpt_nonsense' } });
+      expect(malformed.status).toBe(401);
+
+      WireGuard.lookupPeerToken.mockResolvedValueOnce(null);
+      const unknown = await fetch(`${baseUrl}/api/peer/me`, { headers: { Authorization: peerToken } });
+      expect(unknown.status).toBe(401);
+      expect(await unknown.json()).toMatchObject({ error: 'Invalid peer token' });
+    });
+
+    it('never treats the admin password as a peer token', async () => {
+      const response = await fetch(`${baseUrl}/api/peer/me`, { headers: { Authorization: 'correct-password' } });
+      expect(response.status).toBe(401);
+    });
+
+    it('does not let peer tokens reach admin routes', async () => {
+      WireGuard.getClients.mockClear();
+      const response = await fetch(`${baseUrl}/api/wireguard/client`, { headers: { Authorization: peerToken } });
+      expect(response.status).toBe(401);
+      expect(WireGuard.getClients).not.toHaveBeenCalled();
+    });
+
+    it('mutates own forwards only with selfManagePorts', async () => {
+      WireGuard.lookupPeerToken.mockResolvedValue('client1');
+
+      WireGuard.getPeerProfile.mockResolvedValueOnce({
+        id: 'client1', permissions: { selfManagePorts: false },
+      });
+      const forbidden = await fetch(`${baseUrl}/api/peer/me/port-forward`, {
+        method: 'POST',
+        headers: { Authorization: peerToken, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proto: 'tcp', extPort: 3000, intPort: 3000 }),
+      });
+      expect(forbidden.status).toBe(403);
+
+      const allowed = await fetch(`${baseUrl}/api/peer/me/port-forward`, {
+        method: 'POST',
+        headers: { Authorization: peerToken, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proto: 'tcp', extPort: 3000, intPort: 3000 }),
+      });
+      expect(allowed.status).toBe(200);
+      expect(WireGuard.addPortForward).toHaveBeenCalledWith('client1', 'tcp', 3000, 3000);
+    });
+
+    it('scopes byId mutations to the pinned peer', async () => {
+      WireGuard.lookupPeerToken.mockResolvedValue('client1');
+      const ruleId = '11111111-2222-3333-4444-555555555555';
+      const updated = await fetch(`${baseUrl}/api/peer/me/port-forward/id/${ruleId}`, {
+        method: 'PUT',
+        headers: { Authorization: peerToken, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proto: 'tcp', extPort: 3001, intPort: 3000 }),
+      });
+      expect(updated.status).toBe(200);
+      expect(WireGuard.updatePortForwardByRuleId).toHaveBeenCalledWith('client1', ruleId, 'tcp', 3001, 3000);
+
+      const removed = await fetch(`${baseUrl}/api/peer/me/port-forward/id/${ruleId}`, {
+        method: 'DELETE',
+        headers: { Authorization: peerToken },
+      });
+      expect(removed.status).toBe(200);
+      expect(WireGuard.removePortForwardByRuleId).toHaveBeenCalledWith('client1', ruleId);
+    });
+
+    it('serves the peer probe route now that the probe feature merged', async () => {
+      WireGuard.lookupPeerToken.mockResolvedValue('client1');
+      const response = await fetch(`${baseUrl}/api/peer/me/port-forward/0/probe`, {
+        headers: { Authorization: peerToken },
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ verdict: 'ok' });
+      expect(WireGuard.probePortForward).toHaveBeenCalledWith({ clientId: 'client1', rule: '0' });
+    });
+  });
+
+  describe('token and webhook admin routes', () => {
+    it('issues tokens once and revokes them', async () => {
+      const issued = await fetch(`${baseUrl}/api/wireguard/client/client1/token`, {
+        method: 'POST',
+        headers: { Authorization: 'correct-password' },
+      });
+      expect(issued.status).toBe(200);
+      expect(await issued.json()).toMatchObject({ token: expect.stringMatching(/^wgpt_[0-9a-f]{64}$/) });
+      expect(WireGuard.issueClientToken).toHaveBeenCalledWith({ clientId: 'client1' });
+
+      const revoked = await fetch(`${baseUrl}/api/wireguard/client/client1/token`, {
+        method: 'DELETE',
+        headers: { Authorization: 'correct-password' },
+      });
+      expect(revoked.status).toBe(200);
+      expect(WireGuard.revokeClientToken).toHaveBeenCalledWith({ clientId: 'client1' });
+    });
+
+    it('toggles self-managed ports', async () => {
+      const response = await fetch(`${baseUrl}/api/wireguard/client/client1/self-manage-ports`, {
+        method: 'PUT',
+        headers: { Authorization: 'correct-password', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: true }),
+      });
+      expect(response.status).toBe(200);
+      expect(WireGuard.setClientSelfManagePorts).toHaveBeenCalledWith({ clientId: 'client1', enabled: true });
+
+      const invalid = await fetch(`${baseUrl}/api/wireguard/client/client1/self-manage-ports`, {
+        method: 'PUT',
+        headers: { Authorization: 'correct-password', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: 'yes' }),
+      });
+      expect(invalid.status).toBe(400);
+    });
+
+    it('manages the webhook config without ever echoing the secret', async () => {
+      const status = await fetch(`${baseUrl}/api/wireguard/webhook-config`, {
+        headers: { Authorization: 'correct-password' },
+      });
+      expect(await status.json()).toEqual({ configured: true, url: 'https://example.test/hook' });
+
+      const updated = await fetch(`${baseUrl}/api/wireguard/webhook-config`, {
+        method: 'PUT',
+        headers: { Authorization: 'correct-password', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: 'https://example.test/hook', secret: 's' }),
+      });
+      expect(updated.status).toBe(200);
+      expect(WireGuard.setWebhookConfig).toHaveBeenCalledWith({ url: 'https://example.test/hook', secret: 's' });
     });
   });
 

@@ -7,6 +7,7 @@ const crypto = require('node:crypto');
 const { AsyncLocalStorage } = require('node:async_hooks');
 const net = require('node:net');
 const QRCode = require('qrcode');
+const Webhook = require('./Webhook');
 const { parseDnatRules, rulePresent: dnatRulePresent } = require('./NftRules');
 
 const Util = require('./Util');
@@ -39,9 +40,12 @@ const {
   WG_PORT_FWD_MAX,
   WG_NFT_MASQUERADE,
   WG_SEED_TUNING,
+  ALLOW_INSECURE_WEBHOOK,
 } = require('../config');
 
 const WIREGUARD_KEY_RE = /^[A-Za-z0-9+/]{43}=$/;
+const TOKEN_HASH_RE = /^[0-9a-f]{64}$/;
+const sha256Hex = (value) => crypto.createHash('sha256').update(value).digest('hex');
 const CLIENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const RESERVED_CLIENT_IDS = new Set(['__proto__', 'constructor', 'prototype']);
 const SERVER_SETTING_KEYS = ['host', 'port', 'configPort', 'device', 'defaultDns',
@@ -141,6 +145,8 @@ module.exports = class WireGuard {
     this.__activeMutation = false;
     this.__settingsRecoveryPending = false;
     this.__settingsRecoveryConfig = null;
+    this.__webhookConfig = null;
+    this.__eventSeq = null;
     this.__probeState = new Map(); // key: `${clientId}:${ruleKey}` -> { lastAt, inFlight }
   }
 
@@ -332,6 +338,8 @@ module.exports = class WireGuard {
     await this.__syncDirectory();
     this.__settingsRecoveryPending = false;
     this.__settingsRecoveryConfig = null;
+    this.__webhookConfig = null;
+    this.__eventSeq = null;
     this.__probeState = new Map(); // key: `${clientId}:${ruleKey}` -> { lastAt, inFlight }
   }
 
@@ -339,6 +347,7 @@ module.exports = class WireGuard {
     if (this.__config) return this.__config;
 
     await this.__loadServerSettings();
+    await this.__loadWebhookConfig();
 
     if (!this.__serverSettings.host) {
       throw new Error('WG_HOST Environment Variable Not Set!');
@@ -439,6 +448,9 @@ module.exports = class WireGuard {
         if (host === undefined) throw new Error('Maximum number of clients reached.');
         client.address = this.__serverSettings.defaultAddress.replace('x', host);
       }
+      if (client.selfManagePorts === undefined || client.selfManagePorts === null) {
+        client.selfManagePorts = false;
+      }
       if (client.persistentKeepalive === undefined) client.persistentKeepalive = null;
     }
 
@@ -499,7 +511,7 @@ module.exports = class WireGuard {
     const networkPolicies = new Map();
     const allowedClientKeys = ['id', 'name', 'address', 'addressV6', 'privateKey', 'publicKey',
       'preSharedKey', 'createdAt', 'updatedAt', 'enabled', 'portForwards', 'allowedIPs', 'networkPolicy',
-      'persistentKeepalive'];
+      'tokenHash', 'tokenCreatedAt', 'selfManagePorts', 'persistentKeepalive'];
 
     for (const [clientId, client] of Object.entries(config.clients)) {
       if (!CLIENT_ID_RE.test(clientId) || RESERVED_CLIENT_IDS.has(clientId) || !isPlainObject(client)) {
@@ -538,6 +550,16 @@ module.exports = class WireGuard {
       if (client.allowedIPs !== undefined
         && (!Array.isArray(client.allowedIPs) || client.allowedIPs.some((value) => typeof value !== 'string' || /[\r\n]/.test(value)))) {
         throw new ServerError(`Invalid client.allowedIPs: ${clientId}`, 400);
+      }
+      if (client.tokenHash !== undefined && client.tokenHash !== null && !TOKEN_HASH_RE.test(client.tokenHash)) {
+        throw new ServerError(`Invalid client.tokenHash: ${clientId}`, 400);
+      }
+      if (client.tokenCreatedAt !== undefined && client.tokenCreatedAt !== null && !isValidDate(client.tokenCreatedAt)) {
+        throw new ServerError(`Invalid client.tokenCreatedAt: ${clientId}`, 400);
+      }
+      if (client.selfManagePorts !== undefined && client.selfManagePorts !== null
+        && typeof client.selfManagePorts !== 'boolean') {
+        throw new ServerError(`Invalid client.selfManagePorts: ${clientId}`, 400);
       }
       if (client.persistentKeepalive !== undefined && client.persistentKeepalive !== null
         && (!Number.isInteger(client.persistentKeepalive)
@@ -1102,6 +1124,218 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     });
   }
 
+  // ── Peer tokens (self-service port management) ──────────────────
+
+  // Issue (or rotate) a peer token. The plaintext token exists exactly once
+  // in the HTTP response; only its sha256 is persisted.
+  async issueClientToken({ clientId }) {
+    return this.__withMutation(async () => {
+      const client = await this.getClient({ clientId });
+      const token = `wgpt_${crypto.randomBytes(32).toString('hex')}`;
+      const previous = {
+        tokenHash: client.tokenHash ?? null,
+        tokenCreatedAt: client.tokenCreatedAt ?? null,
+        updatedAt: client.updatedAt,
+      };
+      const issued = { tokenHash: sha256Hex(token), tokenCreatedAt: new Date() };
+      await this.__transactionalConfigChange(
+        () => {
+          Object.assign(client, issued, { updatedAt: new Date() });
+        },
+        () => {
+          Object.assign(client, previous);
+        },
+        { context: 'issue-client-token' },
+      );
+      return { token, tokenCreatedAt: issued.tokenCreatedAt };
+    });
+  }
+
+  async revokeClientToken({ clientId }) {
+    return this.__withMutation(async () => {
+      const client = await this.getClient({ clientId });
+      const previous = {
+        tokenHash: client.tokenHash ?? null,
+        tokenCreatedAt: client.tokenCreatedAt ?? null,
+        updatedAt: client.updatedAt,
+      };
+      await this.__transactionalConfigChange(
+        () => {
+          client.tokenHash = null;
+          client.tokenCreatedAt = null;
+          client.updatedAt = new Date();
+        },
+        () => {
+          Object.assign(client, previous);
+        },
+        { context: 'revoke-client-token' },
+      );
+      return { success: true };
+    });
+  }
+
+  // Constant-time lookup: every client's stored hash is compared (no early
+  // exit), with timingSafeEqual over equal-length buffers. Returns the owning
+  // clientId or null.
+  async lookupPeerToken(token) {
+    if (typeof token !== 'string' || !/^wgpt_[0-9a-f]{64}$/.test(token)) return null;
+    const presented = Buffer.from(sha256Hex(token), 'hex');
+    const config = await this.getConfig();
+    let match = null;
+    for (const client of Object.values(config.clients)) {
+      if (!TOKEN_HASH_RE.test(client.tokenHash || '')) continue;
+      const stored = Buffer.from(client.tokenHash, 'hex');
+      if (presented.length === stored.length && crypto.timingSafeEqual(presented, stored)) {
+        match = client.id;
+      }
+    }
+    return match;
+  }
+
+  // Dedicated serializer for /api/peer/me — NEVER spread the raw client
+  // (privateKey/preSharedKey/tokenHash must not leak to token holders).
+  async getPeerProfile({ clientId }) {
+    const config = await this.getConfig();
+    const client = config.clients[clientId];
+    if (!client) throw new ServerError(`Client Not Found: ${clientId}`, 404);
+    return {
+      id: client.id,
+      name: client.name,
+      address: client.address,
+      addressV6: client.addressV6,
+      portForwards: (Array.isArray(client.portForwards) ? client.portForwards : [])
+        .map((rule) => ({ ...rule })),
+      permissions: {
+        selfManagePorts: client.selfManagePorts === true,
+      },
+    };
+  }
+
+  async setClientSelfManagePorts({ clientId, enabled }) {
+    return this.__withMutation(async () => {
+      const client = await this.getClient({ clientId });
+      if (typeof enabled !== 'boolean') {
+        throw new ServerError('enabled must be a boolean', 400);
+      }
+      const previous = { selfManagePorts: client.selfManagePorts ?? false, updatedAt: client.updatedAt };
+      await this.__transactionalConfigChange(
+        () => {
+          client.selfManagePorts = enabled;
+          client.updatedAt = new Date();
+        },
+        () => {
+          Object.assign(client, previous);
+        },
+        { context: 'set-client-self-manage-ports' },
+      );
+      return { selfManagePorts: enabled };
+    });
+  }
+
+  // ── Webhook configuration (sidecar file, secret never echoed) ──
+
+  async __loadWebhookConfig() {
+    // Webhooks are auxiliary: any problem with the config file disables them
+    // with a warning rather than taking the panel down at boot.
+    try {
+      const raw = await fs.readFile(path.join(WG_PATH, 'webhook.json'), 'utf8');
+      const parsed = JSON.parse(raw);
+      this.__webhookConfig = isPlainObject(parsed)
+        && typeof parsed.url === 'string'
+        && (parsed.secret === undefined || typeof parsed.secret === 'string')
+        ? { url: parsed.url, secret: parsed.secret ?? '' }
+        : null;
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        debug(`Warning: webhook config unavailable: ${err.message}`);
+      }
+      this.__webhookConfig = null;
+    }
+  }
+
+  async getWebhookConfig() {
+    await this.getConfig();
+    return {
+      configured: !!(this.__webhookConfig && this.__webhookConfig.url),
+      url: (this.__webhookConfig && this.__webhookConfig.url) || null,
+    };
+  }
+
+  async setWebhookConfig({ url, secret }) {
+    return this.__withMutation(async () => {
+      if (url !== null) {
+        if (typeof url !== 'string' || url.length === 0 || url.length > 2048 || /[\r\n]/.test(url)) {
+          throw new ServerError('Invalid webhook url', 400);
+        }
+        let parsed;
+        try {
+          parsed = new URL(url);
+        } catch {
+          throw new ServerError('Invalid webhook url', 400);
+        }
+        if (parsed.protocol !== 'https:' && !(ALLOW_INSECURE_WEBHOOK && parsed.protocol === 'http:')) {
+          throw new ServerError('Webhook url must be https:// (or http:// with ALLOW_INSECURE_WEBHOOK=true)', 400);
+        }
+        if (typeof secret !== 'string' || secret.length === 0 || secret.length > 255 || /[\r\n]/.test(secret)) {
+          throw new ServerError('A webhook secret (1-255 chars, no line breaks) is required', 400);
+        }
+      }
+      const next = url === null ? null : { url, secret };
+      await this.__writeAtomic('webhook.json', JSON.stringify(next ?? {}), 0o600);
+      this.__webhookConfig = next;
+      return { configured: !!next, url: next ? next.url : null };
+    });
+  }
+
+  // ── Port events (seq + delivery) ────────────────────────────────
+
+  // Strictly increasing per-peer sequence numbers, persisted in the
+  // wg0-events.json sidecar so receivers can detect gaps across restarts.
+  async __nextEventSeq(peerId) {
+    if (this.__eventSeq === null) {
+      try {
+        const raw = await fs.readFile(path.join(WG_PATH, 'wg0-events.json'), 'utf8');
+        const parsed = JSON.parse(raw);
+        this.__eventSeq = isPlainObject(parsed) ? parsed : {};
+      } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+        this.__eventSeq = {};
+      }
+    }
+    const next = Number(this.__eventSeq[peerId] || 0) + 1;
+    this.__eventSeq[peerId] = next;
+    await this.__writeAtomic('wg0-events.json', JSON.stringify(this.__eventSeq), 0o600);
+    return next;
+  }
+
+  // Called from the single success path of __transactionalConfigChange (inside
+  // the queue: seq allocation and the sidecar write are part of the commit).
+  // Delivery itself is detached — webhook I/O must never block mutations.
+  async __emitPortEvent(event) {
+    const webhook = this.__webhookConfig;
+    if (!webhook || !webhook.url) return;
+    const seq = await this.__nextEventSeq(event.clientId);
+    const payload = {
+      v: 1,
+      event: event.type,
+      eventId: crypto.randomUUID(),
+      peerId: event.clientId,
+      seq,
+      proto: event.proto,
+      extPort: event.extPort,
+      previousExtPort: event.previousExtPort ?? null,
+      intPort: event.intPort,
+      ts: new Date().toISOString(),
+    };
+    Webhook.deliver(
+      {
+        url: webhook.url, secret: webhook.secret, body: JSON.stringify(payload), allowInsecure: !!ALLOW_INSECURE_WEBHOOK,
+      },
+    ).then((delivered) => {
+      if (!delivered) debug(`webhook event ${payload.event} seq=${seq} dropped after retries`);
+    });
+  }
+
   async updateClientAddress({ clientId, address, addressV6 }) {
     return this.__withMutation(async () => {
       const config = await this.getConfig();
@@ -1253,6 +1487,9 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
               client.networkPolicy = createDefaultNetworkPolicy();
             }
             client.networkPolicy = this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false });
+            if (client.selfManagePorts === undefined || client.selfManagePorts === null) {
+              client.selfManagePorts = false;
+            }
             if (client.persistentKeepalive === undefined) client.persistentKeepalive = null;
           }
         }
@@ -1278,6 +1515,7 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     applyDnat = false,
     context = 'config-change',
     reloadWireGuard = false,
+    event = null,
   } = {}) {
     await mutate();
     let interfaceDown = false;
@@ -1335,6 +1573,9 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       if (rollbackErrors.length) err.data = { rollbackFailed: true };
       throw err;
     }
+
+    // Single funnel for port events: only reached on the success path.
+    if (event) await this.__emitPortEvent(event);
   }
 
   async __transactionalDnatChange(mutate, rollback, context = 'dnat-change', options = {}) {
@@ -1896,6 +2137,15 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         client.portForwards.pop();
       },
       'add-port-forward',
+      {
+        event: {
+          type: 'port.confirmed',
+          clientId,
+          proto,
+          extPort: port,
+          intPort: internalPort,
+        },
+      },
     );
     return { ...created };
   }
@@ -1935,6 +2185,33 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       },
       'remove-port-forward',
     );
+  }
+
+  // Resolve a rule reference (stable id or legacy numeric index) to its index
+  // INSIDE the queued operation, so sibling mutations cannot shift it.
+  async removePortForwardByRuleId(clientId, ruleId) {
+    return this.__withMutation(async () => this.__removePortForward(clientId, this.__resolveRuleIndex(clientId, ruleId)));
+  }
+
+  async updatePortForwardByRuleId(clientId, ruleId, proto, extPort, intPort) {
+    return this.__withMutation(async () => this.__updatePortForward(
+      clientId,
+      this.__resolveRuleIndex(clientId, ruleId),
+      proto,
+      extPort,
+      intPort,
+    ));
+  }
+
+  __resolveRuleIndex(clientId, ruleId) {
+    const client = this.__config ? this.__config.clients[clientId] : null;
+    const rules = client && Array.isArray(client.portForwards) ? client.portForwards : [];
+    if (/^\d+$/.test(String(ruleId))) {
+      return Number(ruleId);
+    }
+    const index = rules.findIndex((rule) => rule && rule.id === ruleId);
+    if (index === -1) throw new ServerError('Port forward rule not found', 404);
+    return index;
   }
 
   async updatePortForward(clientId, index, proto, extPort, intPort) {
@@ -2004,6 +2281,16 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         client.portForwards[idx] = oldRule;
       },
       'update-port-forward',
+      {
+        event: {
+          type: 'port.changed',
+          clientId,
+          proto,
+          extPort: port,
+          previousExtPort: oldRule.extPort,
+          intPort: internalPort,
+        },
+      },
     );
     return { ...updated };
   }

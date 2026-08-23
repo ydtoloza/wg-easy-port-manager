@@ -15,6 +15,9 @@ module.exports.PASSWORD_HASH = process.env.PASSWORD_HASH;
 module.exports.SESSION_SECRET = process.env.SESSION_SECRET;
 module.exports.SESSION_COOKIE_SECURE = isTrue(process.env.SESSION_COOKIE_SECURE);
 module.exports.TRUSTED_PROXY_IP = process.env.TRUSTED_PROXY_IP;
+// Allow http:// (plaintext) webhook targets. Never enable behind untrusted
+// networks: webhook delivery runs on the host-network container.
+module.exports.ALLOW_INSECURE_WEBHOOK = isTrue(process.env.ALLOW_INSECURE_WEBHOOK);
 module.exports.ALLOW_INSECURE_NO_AUTH = isTrue(process.env.ALLOW_INSECURE_NO_AUTH);
 module.exports.WG_PATH = process.env.WG_PATH || '/etc/wireguard/';
 module.exports.WG_DEVICE = process.env.WG_DEVICE || 'eth0';
