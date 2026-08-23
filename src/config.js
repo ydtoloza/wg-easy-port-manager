@@ -18,6 +18,10 @@ module.exports.TRUSTED_PROXY_IP = process.env.TRUSTED_PROXY_IP;
 // Allow http:// (plaintext) webhook targets. Never enable behind untrusted
 // networks: webhook delivery runs on the host-network container.
 module.exports.ALLOW_INSECURE_WEBHOOK = isTrue(process.env.ALLOW_INSECURE_WEBHOOK);
+// Opt out of the webhook connect-time SSRF gate: delivery to hosts resolving
+// to loopback/private/link-local ranges (e.g. a receiver on the same LAN) is
+// blocked unless this is set.
+module.exports.ALLOW_PRIVATE_WEBHOOK = isTrue(process.env.ALLOW_PRIVATE_WEBHOOK);
 module.exports.ALLOW_INSECURE_NO_AUTH = isTrue(process.env.ALLOW_INSECURE_NO_AUTH);
 module.exports.WG_PATH = process.env.WG_PATH || '/etc/wireguard/';
 module.exports.WG_DEVICE = process.env.WG_DEVICE || 'eth0';

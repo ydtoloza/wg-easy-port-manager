@@ -1438,6 +1438,56 @@ describe('WireGuard', () => {
       expect(config.clients.client1.portForwards).toHaveLength(2);
     });
 
+    it('swallows event-sidecar failures after the commit', async () => {
+      await wg.getConfig();
+      await wg.setWebhookConfig({ url: 'https://example.test/hook', secret: 's' });
+      Webhook.deliver.mockResolvedValue(true);
+      const writeAtomic = jest.spyOn(wg, '__writeAtomic').mockImplementation(async (filename, contents) => {
+        if (filename === 'wg0-events.json') throw new Error('events sidecar unwritable');
+        store[filename] = contents;
+      });
+
+      try {
+        // DNAT+config already committed: the caller must see success, not a
+        // raw fs rejection (a retry would then hit a 409).
+        await expect(wg.addPortForward('client1', 'tcp', 3000, 3000)).resolves.toMatchObject({ extPort: 3000 });
+        const config = await wg.getConfig();
+        expect(config.clients.client1.portForwards).toHaveLength(2);
+        // the seq never persisted, so delivery could not have started
+        expect(Webhook.deliver).not.toHaveBeenCalled();
+      } finally {
+        writeAtomic.mockRestore();
+      }
+    });
+
+    it('emits port.deleted when a forward is removed', async () => {
+      await wg.getConfig();
+      await wg.setWebhookConfig({ url: 'https://example.test/hook', secret: 's3cret' });
+      Webhook.deliver.mockImplementation(async (config) => {
+        deliveries.push(config);
+        return true;
+      });
+
+      const config = await wg.getConfig();
+      const ruleId = config.clients.client1.portForwards[0].id;
+      await wg.removePortForwardById('client1', ruleId);
+
+      expect(deliveries).toHaveLength(1);
+      const deleted = JSON.parse(deliveries[0].body);
+      expect(deleted).toMatchObject({
+        v: 1,
+        event: 'port.deleted',
+        peerId: 'client1',
+        seq: 1,
+        proto: 'tcp',
+        extPort: 2000,
+        intPort: 2000,
+      });
+      expect(deleted.previousExtPort).toBeNull();
+      expect(JSON.parse(store['wg0-events.json'])).toEqual({ client1: 1 });
+      expect((await wg.getConfig()).clients.client1.portForwards).toHaveLength(0);
+    });
+
     it('emits nothing when no webhook is configured', async () => {
       await wg.getConfig();
       await wg.addPortForward('client1', 'tcp', 3000, 3000);
