@@ -5,6 +5,7 @@ const dns = require('node:dns');
 const http = require('node:http');
 const https = require('node:https');
 const { isIP } = require('node:net');
+const tls = require('node:tls');
 const debug = require('debug')('Webhook');
 
 // At-least-once webhook delivery. Hard rules (all empirically verified in the
@@ -15,6 +16,15 @@ const debug = require('debug')('Webhook');
 
 const RETRY_DELAYS_MS = [1000, 5000, 30000, 120000, 600000];
 const REQUEST_TIMEOUT_MS = 5000;
+
+class WebhookError extends Error {
+
+  constructor(message, retryable = false) {
+    super(message);
+    this.retryable = retryable;
+  }
+
+}
 
 const signPayload = (secret, timestamp, body) => {
   const mac = crypto.createHmac('sha256', secret).update(`${timestamp}.${body}`).digest('hex');
@@ -52,37 +62,64 @@ const expandIPv6Groups = (address) => {
   const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
   const missing = 8 - left.length - right.length;
   if ((halves.length === 1 && missing !== 0) || missing < 0) return null;
-  const groups = [...left, ...Array(missing).fill('0'), ...right].map((group) => parseInt(group, 16));
-  return groups.length === 8 && groups.every((group) => Number.isInteger(group)) ? groups : null;
+  const textGroups = [...left, ...Array(missing).fill('0'), ...right];
+  if (textGroups.some((group) => !/^[0-9a-f]{1,4}$/i.test(group))) return null;
+  return textGroups.map((group) => parseInt(group, 16));
+};
+
+const ipv4ToInt = (address) => {
+  const parts = address.split('.').map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return null;
+  return parts.reduce((value, part) => ((value << 8) | part) >>> 0, 0);
+};
+
+const inIPv4Cidr = (value, base, bits) => {
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+  return (value & mask) === (ipv4ToInt(base) & mask);
 };
 
 const isBlockedIPv4 = (address) => {
-  const parts = address.split('.').map(Number);
-  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return true;
-  const [a, b] = parts;
-  return a === 0 // 0.0.0.0/8 "this network"
-    || a === 10 // RFC1918
-    || a === 127 // loopback
-    || (a === 169 && b === 254) // link-local, incl. 169.254.169.254 metadata
-    || (a === 172 && b >= 16 && b <= 31) // RFC1918
-    || (a === 192 && b === 168); // RFC1918
+  const value = ipv4ToInt(address);
+  if (value === null) return true;
+  // IANA special-purpose ranges that are not globally reachable unicast.
+  // The two PCP anycast addresses are the globally reachable exceptions in
+  // 192.0.0.0/24.
+  if (inIPv4Cidr(value, '192.0.0.0', 24)) {
+    return value !== ipv4ToInt('192.0.0.9') && value !== ipv4ToInt('192.0.0.10');
+  }
+  return [
+    ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10],
+    ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12],
+    ['192.0.2.0', 24], ['192.88.99.0', 24], ['192.168.0.0', 16],
+    ['198.18.0.0', 15], ['198.51.100.0', 24], ['203.0.113.0', 24],
+    ['224.0.0.0', 4], ['240.0.0.0', 4],
+  ].some(([base, bits]) => inIPv4Cidr(value, base, bits));
+};
+
+const inIPv6Cidr = (groups, base, bits) => {
+  const baseGroups = expandIPv6Groups(base);
+  const whole = Math.floor(bits / 16);
+  const remainder = bits % 16;
+  for (let index = 0; index < whole; index += 1) {
+    if (groups[index] !== baseGroups[index]) return false;
+  }
+  if (!remainder) return true;
+  const mask = (0xffff << (16 - remainder)) & 0xffff;
+  return (groups[whole] & mask) === (baseGroups[whole] & mask);
 };
 
 const isBlockedIPv6 = (address) => {
   const groups = expandIPv6Groups(address);
   if (!groups) return true;
-  if (groups.every((group) => group === 0)) return true; // :: unspecified
-  const [g0] = groups;
-  if (g0 === 0 && groups[1] === 0 && groups[2] === 0 && groups[3] === 0 && groups[4] === 0) {
-    if (groups[5] === 0xffff) {
-      // ::ffff:0:0/96 IPv4-mapped: judge the embedded v4 address.
-      return isBlockedIPv4(`${(groups[6] >> 8) & 0xff}.${groups[6] & 0xff}.${(groups[7] >> 8) & 0xff}.${groups[7] & 0xff}`);
-    }
-    if (groups[5] === 0 && groups[6] === 0 && groups[7] === 1) return true; // ::1 loopback
-  }
-  if ((g0 & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
-  if ((g0 & 0xfe00) === 0xfc00) return true; // fc00::/7 unique-local
-  return false;
+
+  // Only global-unicast space is eligible. This rejects unspecified,
+  // loopback, ULA, link-local, multicast, mapped/translated IPv4, NAT64 and
+  // other special-purpose forms before considering exceptions inside 2000::/3.
+  if (!inIPv6Cidr(groups, '2000::', 3)) return true;
+  return inIPv6Cidr(groups, '2001::', 23) // protocol assignments and benchmark ranges
+    || inIPv6Cidr(groups, '2001:db8::', 32) // documentation
+    || inIPv6Cidr(groups, '2002::', 16) // deprecated 6to4 transition space
+    || inIPv6Cidr(groups, '3fff::', 20); // documentation
 };
 
 const isBlockedAddress = (address) => {
@@ -108,7 +145,7 @@ const guardedLookup = (allowPrivate) => (hostname, options, callback) => {
     }
     const allowed = list.filter((entry) => !isBlockedAddress(entry.address));
     if (!allowed.length) {
-      return callback(new Error('webhook host resolves only to blocked address ranges'));
+      return callback(new WebhookError('webhook host resolves only to non-global address ranges'));
     }
     if (options.all) return callback(null, allowed);
     return callback(null, allowed[0].address, allowed[0].family);
@@ -121,15 +158,18 @@ const guardedLookup = (allowPrivate) => (hostname, options, callback) => {
 const requestViaNode = (url, init, { allowPrivate = false } = {}) => new Promise((resolve, reject) => {
   const target = new URL(url);
   const transport = target.protocol === 'https:' ? https : http;
+  const literalHost = target.hostname.replace(/^\[/, '').replace(/\]$/, '');
+  const literalFamily = isIP(literalHost);
   let settled = false;
   const request = transport.request(target, {
     method: init.method || 'POST',
     headers: init.headers,
     lookup: guardedLookup(allowPrivate),
-    servername: target.hostname,
+    servername: literalFamily ? '' : target.hostname,
+    ...(literalFamily ? { checkServerIdentity: (_hostname, cert) => tls.checkServerIdentity(literalHost, cert) } : {}),
   });
   const timer = setTimeout(() => {
-    request.destroy(new Error(`webhook request timed out after ${REQUEST_TIMEOUT_MS}ms`));
+    request.destroy(new WebhookError(`webhook request timed out after ${REQUEST_TIMEOUT_MS}ms`, true));
   }, REQUEST_TIMEOUT_MS);
   const finish = (fn) => {
     if (settled) return;
@@ -144,7 +184,7 @@ const requestViaNode = (url, init, { allowPrivate = false } = {}) => new Promise
   request.on('error', (err) => finish(() => reject(err)));
   if (init.signal) {
     init.signal.addEventListener('abort', () => {
-      request.destroy(new Error('webhook request aborted'));
+      request.destroy(new WebhookError('webhook request timed out', true));
     }, { once: true });
   }
   request.end(init.body);
@@ -157,13 +197,13 @@ const attemptOnce = async ({
 }, fetchImpl) => {
   const target = new URL(url);
   if (!isAllowedScheme(target, allowInsecure)) {
-    throw new Error('webhook target must be https:// (or http:// with ALLOW_INSECURE_WEBHOOK=true)');
+    throw new WebhookError('webhook target must be https:// (or http:// with ALLOW_INSECURE_WEBHOOK=true)');
   }
   // Literal-IP hosts skip the socket lookup, so they are gated here. WHATWG
   // hostnames keep their brackets for IPv6 ([::1]); strip them first.
   const literalHost = target.hostname.replace(/^\[/, '').replace(/\]$/, '');
   if (!allowPrivate && isIP(literalHost) && isBlockedAddress(literalHost)) {
-    throw new Error('webhook target address is in a blocked range (set ALLOW_PRIVATE_WEBHOOK=true to override)');
+    throw new WebhookError('webhook target address is not globally routable (set ALLOW_PRIVATE_WEBHOOK=true to override)');
   }
   const timestamp = Math.floor(Date.now() / 1000);
   const response = await fetchImpl(target.toString(), {
@@ -177,21 +217,24 @@ const attemptOnce = async ({
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (response.status >= 300 && response.status < 400) {
-    throw new Error(`webhook redirect (${response.status}) not followed`);
+    throw new WebhookError(`webhook redirect (${response.status}) not followed`);
   }
   if (response.status < 200 || response.status >= 300) {
-    throw new Error(`webhook endpoint answered ${response.status}`);
+    const retryable = response.status === 408 || response.status === 429
+      || (response.status >= 500 && response.status <= 599);
+    throw new WebhookError(`webhook endpoint answered ${response.status}`, retryable);
   }
   return response.status;
 };
 
-// Delivery is fire-and-forget: callers never await this. Retries use a fixed
-// 1s/5s/30s/2m/10m backoff and then the event is DROPPED (at-least-once;
-// receivers dedupe on eventId and reconcile seq gaps by polling client state).
+// Delivery is fire-and-forget: callers never await this. Transient failures
+// use a jittered 1s/5s/30s/2m/10m backoff and then the event is dropped;
+// receivers dedupe on eventId and reconcile seq gaps by polling client state.
 const deliver = async (config, {
   fetchImpl,
   delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   now = () => Date.now(),
+  random = Math.random,
 } = {}) => {
   const startedAt = now();
   const doFetch = fetchImpl
@@ -211,9 +254,22 @@ const deliver = async (config, {
       return true;
     } catch (err) {
       debug(`webhook attempt failed host=${host} attempt=${attempt} reason=${err.message}`);
-      if (attempt === RETRY_DELAYS_MS.length) return false;
+      const code = err.code || (err.cause && err.cause.code) || '';
+      const transientNetworkError = [
+        'EAI_AGAIN', 'ECONNABORTED', 'ECONNREFUSED', 'ECONNRESET',
+        'EHOSTUNREACH', 'ENETDOWN', 'ENETUNREACH', 'EPIPE', 'ETIMEDOUT',
+      ].includes(code);
+      const tlsError = code.startsWith('CERT_')
+        || code.startsWith('ERR_SSL_')
+        || code.startsWith('ERR_TLS_')
+        || ['DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN',
+          'UNABLE_TO_GET_ISSUER_CERT', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+          'UNABLE_TO_VERIFY_LEAF_SIGNATURE'].includes(code);
+      const retryable = !tlsError && (err.retryable === true || transientNetworkError);
+      if (!retryable || attempt === RETRY_DELAYS_MS.length) return false;
       // Only the delay is awaited; nothing here ever blocks a caller.
-      await delay(RETRY_DELAYS_MS[attempt]);
+      const jitter = 0.8 + (0.4 * random());
+      await delay(Math.round(RETRY_DELAYS_MS[attempt] * jitter));
     }
   }
   return false;
