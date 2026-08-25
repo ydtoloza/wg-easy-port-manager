@@ -2018,10 +2018,10 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         : await this.__tcpConnect(this.__serverSettings.host, snapshot.extPort);
 
       let verdict;
-      if (snapshot.proto === 'udp') {
-        verdict = 'indeterminate';
-      } else if (!isPresent) {
+      if (!isPresent) {
         verdict = tcpConnectable ? 'dnat-local' : 'rule-missing';
+      } else if (snapshot.proto === 'udp') {
+        verdict = 'indeterminate';
       } else if (!tunnelUp) {
         verdict = tcpConnectable ? 'dnat-local' : 'tunnel-down';
       } else {

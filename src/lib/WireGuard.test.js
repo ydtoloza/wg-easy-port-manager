@@ -376,13 +376,13 @@ describe('WireGuard', () => {
   });
 
   describe('port-forward reachability probe', () => {
-    const nftTable = (present) => JSON.stringify({
+    const nftTable = (present, proto = 'tcp') => JSON.stringify({
       nftables: present ? [{
         rule: {
           family: 'ip',
           chain: 'prerouting',
           expr: [
-            { match: { left: { payload: { protocol: 'tcp', field: 'dport' } }, op: 'eq', right: 2000 } },
+            { match: { left: { payload: { protocol: proto, field: 'dport' } }, op: 'eq', right: 2000 } },
             { dnat: { family: 'ip', addr: '10.8.0.2', port: 2000 } },
           ],
         },
@@ -471,6 +471,22 @@ describe('WireGuard', () => {
       await wg.getConfig();
       wg.__config.clients.client1.portForwards[0].proto = 'udp';
       Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('nft -j list table')) return nftTable(true, 'udp');
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(10);
+        return '';
+      });
+      const tcpConnect = jest.spyOn(wg, '__tcpConnect');
+
+      const verdict = await wg.probePortForward({ clientId: 'client1', rule: '0' });
+
+      expect(tcpConnect).not.toHaveBeenCalled();
+      expect(verdict).toMatchObject({ rulePresent: true, tcpConnectable: null, verdict: 'indeterminate' });
+    });
+
+    it('reports a missing UDP-only DNAT rule without attempting a TCP probe', async () => {
+      await wg.getConfig();
+      wg.__config.clients.client1.portForwards[0].proto = 'udp';
+      Util.exec.mockImplementation(async (cmd) => {
         if (typeof cmd === 'string' && cmd.includes('nft -j list table')) return nftTable(false);
         if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(10);
         return '';
@@ -480,7 +496,7 @@ describe('WireGuard', () => {
       const verdict = await wg.probePortForward({ clientId: 'client1', rule: '0' });
 
       expect(tcpConnect).not.toHaveBeenCalled();
-      expect(verdict).toMatchObject({ tcpConnectable: null, verdict: 'indeterminate' });
+      expect(verdict).toMatchObject({ rulePresent: false, tcpConnectable: null, verdict: 'rule-missing' });
     });
 
     it('labels hairpin connects honestly as dnat-local', async () => {
