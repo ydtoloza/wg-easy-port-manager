@@ -189,7 +189,7 @@ module.exports = class WireGuard {
     }
 
     const isPort = (value) => Number.isInteger(Number(value)) && Number(value) >= 1 && Number(value) <= 65535;
-    const isPlainString = (value) => typeof value === 'string' && !/[\r\n]/.test(value);
+    const isPlainString = (value) => typeof value === 'string' && !Util.hasControlChars(value);
     const isIPv4Template = (value) => typeof value === 'string'
       && value.split('.').length === 4
       && value.split('.')[3] === 'x'
@@ -546,7 +546,7 @@ module.exports = class WireGuard {
         throw new ServerError(`Invalid client timestamps: ${clientId}`, 400);
       }
       if (client.allowedIPs !== undefined
-        && (!Array.isArray(client.allowedIPs) || client.allowedIPs.some((value) => typeof value !== 'string' || /[\r\n]/.test(value)))) {
+        && (!Array.isArray(client.allowedIPs) || client.allowedIPs.some((value) => typeof value !== 'string' || Util.hasControlChars(value)))) {
         throw new ServerError(`Invalid client.allowedIPs: ${clientId}`, 400);
       }
       if (client.tokenHash !== undefined && client.tokenHash !== null && !TOKEN_HASH_RE.test(client.tokenHash)) {

@@ -2,6 +2,8 @@
 
 const { isIP } = require('node:net');
 
+const Util = require('./lib/Util');
+
 const { release: { version } } = require('./package.json');
 
 const isTrue = (value) => value === 'true' || value === '1';
@@ -93,5 +95,19 @@ module.exports.validateEnvironment = () => {
 
   if (module.exports.TRUSTED_PROXY_IP && !isIP(module.exports.TRUSTED_PROXY_IP)) {
     throw new Error('TRUSTED_PROXY_IP must be a valid IP address.');
+  }
+
+  // C0 controls and DEL in values that flow into generated WireGuard
+  // configuration could inject or break directives. Hook variables
+  // (WG_PRE_UP/WG_POST_UP/WG_PRE_DOWN/WG_POST_DOWN) intentionally contain
+  // shell commands and are deliberately not checked.
+  for (const [name, value] of [
+    ['WG_HOST', module.exports.WG_HOST],
+    ['WG_DEFAULT_DNS', module.exports.WG_DEFAULT_DNS],
+    ['WG_ALLOWED_IPS', module.exports.WG_ALLOWED_IPS],
+  ]) {
+    if (Util.hasControlChars(value)) {
+      throw new Error(`${name} must not contain control characters.`);
+    }
   }
 };

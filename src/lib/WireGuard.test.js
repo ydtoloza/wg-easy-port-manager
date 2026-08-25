@@ -100,8 +100,10 @@ describe('WireGuard', () => {
     Util.isValidIPv4.mockImplementation((ip) => /^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip));
     Util.isValidIPv6.mockReturnValue(true);
     Util.isValidName.mockImplementation((s) => typeof s === 'string' && s.length > 0 && s.length <= 128
+      && !Util.hasControlChars(s));
+    Util.hasControlChars.mockImplementation((s) => typeof s === 'string'
       // eslint-disable-next-line no-control-regex
-      && !/[\u0000-\u001f\u007f]/.test(s));
+      && /[\u0000-\u001f\u007f]/.test(s));
     Util.parsePort.mockImplementation((value) => {
       if (typeof value === 'number') return value;
       if (typeof value === 'string' && value !== '' && /^\d+$/.test(value)) return Number(value);
@@ -866,6 +868,24 @@ describe('WireGuard', () => {
       expect(config.clients.client1.address).toBe('10.8.0.2');
     });
 
+    it('rejects allowedIPs with any C0 control or DEL before touching state', async () => {
+      await wg.getConfig(); // init state
+
+      // NUL, TAB, LF, CR, other C0 (VT) and DEL must all be rejected before
+      // memory, disk, WireGuard or nftables state changes.
+      const badValues = ['10.0.0.0/8\x00', '10.0.0.0/8\t', '10.0.0.0/8\n', '10.0.0.0/8\r', '10.0.0.0/8\x0b', '10.0.0.0/8\x7f'];
+      for (const bad of badValues) {
+        const backup = makeConfig();
+        backup.clients.client1.allowedIPs = [bad];
+        // eslint-disable-next-line no-await-in-loop
+        await expect(wg.restoreConfiguration(JSON.stringify(backup)))
+          .rejects.toThrow(/Invalid client\.allowedIPs/);
+      }
+
+      const config = await wg.getConfig();
+      expect(config.clients.client1.allowedIPs).toBeUndefined();
+    });
+
     it('rejects backup with injected server keys (config injection)', async () => {
       await wg.getConfig(); // init state
 
@@ -930,6 +950,22 @@ describe('WireGuard', () => {
       expect(response.webhookSecret).toBeUndefined();
       expect(JSON.stringify(response)).not.toContain('supersecret-value');
       expect(response.host).toBe('10.0.0.1');
+    });
+
+    it('rejects control characters in settings that reach generated config', async () => {
+      await wg.getConfig();
+      const tainted = [
+        ['host', 'vpn.example.test\t'],
+        ['defaultDns', '1.1.1.1\x00'],
+        ['allowedIps', '0.0.0.0/0\r, ::/0'],
+      ];
+      for (const [key, value] of tainted) {
+        // eslint-disable-next-line no-await-in-loop
+        await expect(wg.updateServerConfig({ [key]: value }))
+          .rejects.toMatchObject({ statusCode: 400 });
+      }
+      // Rejected before any state change: settings are untouched.
+      expect(wg.__serverSettings.host).toBe('10.0.0.1');
     });
 
     it('preserves active webhook state when an unrelated settings transaction commits', async () => {
