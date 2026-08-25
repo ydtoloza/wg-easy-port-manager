@@ -189,7 +189,7 @@ module.exports = class WireGuard {
     }
 
     const isPort = (value) => Number.isInteger(Number(value)) && Number(value) >= 1 && Number(value) <= 65535;
-    const isPlainString = (value) => typeof value === 'string' && !/[\r\n]/.test(value);
+    const isPlainString = (value) => typeof value === 'string' && !Util.hasControlChars(value);
     const isIPv4Template = (value) => typeof value === 'string'
       && value.split('.').length === 4
       && value.split('.')[3] === 'x'
@@ -546,7 +546,7 @@ module.exports = class WireGuard {
         throw new ServerError(`Invalid client timestamps: ${clientId}`, 400);
       }
       if (client.allowedIPs !== undefined
-        && (!Array.isArray(client.allowedIPs) || client.allowedIPs.some((value) => typeof value !== 'string' || /[\r\n]/.test(value)))) {
+        && (!Array.isArray(client.allowedIPs) || client.allowedIPs.some((value) => typeof value !== 'string' || Util.hasControlChars(value)))) {
         throw new ServerError(`Invalid client.allowedIPs: ${clientId}`, 400);
       }
       if (client.tokenHash !== undefined && client.tokenHash !== null && !TOKEN_HASH_RE.test(client.tokenHash)) {
@@ -877,6 +877,9 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
         const dump = await Util.exec('wg show wg0 dump', {
           log: false,
         });
+        // Linear merge (upstream 52fb584): index clients by public key once
+        // instead of rescanning the array for every dump entry.
+        const clientsByPublicKey = new Map(clients.map((client) => [client.publicKey, client]));
         dump
           .trim()
           .split('\n')
@@ -893,7 +896,7 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
               persistentKeepalive,
             ] = line.split('\t');
 
-            const client = clients.find((c) => c.publicKey === publicKey);
+            const client = clientsByPublicKey.get(publicKey);
             if (!client) return;
 
             client.latestHandshakeAt = latestHandshakeAt === '0'
@@ -959,10 +962,25 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
   async getClientQRCodeSVG({ clientId }) {
     const config = await this.getClientConfiguration({ clientId });
-    return QRCode.toString(config, {
-      type: 'svg',
-      width: 512,
-    });
+    // Progressive error-correction fallback (upstream 5c97a8b): start at
+    // high ECC for best scannability and retry at lower levels only when
+    // the payload exceeds the QR capacity at that level. Unrelated errors
+    // rethrow immediately, and the final error never embeds the config.
+    for (const errorCorrectionLevel of ['H', 'Q', 'M', 'L']) {
+      try {
+        return await QRCode.toString(config, {
+          type: 'svg',
+          width: 512,
+          errorCorrectionLevel,
+        });
+      } catch (err) {
+        if (!(err instanceof Error && err.message === 'The amount of data is too big to be stored in a QR Code')) {
+          throw err;
+        }
+        // Capacity overflow: retry with the next lower level.
+      }
+    }
+    throw new Error('Failed to generate QR code: capacity overflow at all error-correction levels');
   }
 
   async createClient({ name }) {

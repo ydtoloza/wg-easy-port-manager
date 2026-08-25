@@ -33,6 +33,8 @@ jest.mock('../config', () => ({
 
 jest.mock('../services/WireGuard', () => ({
   getClients: jest.fn().mockResolvedValue([]),
+  getClient: jest.fn(),
+  getClientConfiguration: jest.fn(),
   lookupPeerToken: jest.fn(),
   getPeerProfile: jest.fn().mockResolvedValue({
     id: 'client1',
@@ -580,6 +582,78 @@ describe('HTTP server security', () => {
     });
   });
 
+  it('does not leak secrets through the client listing endpoint', async () => {
+    // Realistic listing payload (the shape WireGuard.getClients produces).
+    WireGuard.getClients.mockResolvedValueOnce([{
+      id: 'client1',
+      name: 'client1',
+      enabled: true,
+      address: '10.8.0.2',
+      addressV6: 'fd42:42:42::2',
+      publicKey: 'cHVibGljLWtleS1vbmx5PQ==',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      allowedIPs: ['10.8.0.2/32'],
+      portForwards: [],
+      networkPolicy: { blockedProtocols: [], customRules: [], peerAllowlist: [] },
+      downloadableConfig: true,
+      persistentKeepalive: null,
+      latestHandshakeAt: null,
+      endpoint: null,
+      online: false,
+      transferRx: null,
+      transferTx: null,
+    }]);
+
+    const response = await fetch(`${baseUrl}/api/wireguard/client`, {
+      headers: { Authorization: 'correct-password' },
+    });
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    const listing = JSON.parse(body);
+
+    // The wire contract must stay secret-free even though the underlying
+    // config holds key material, token hashes and the webhook secret.
+    expect(listing).toHaveLength(1);
+    for (const secretField of ['privateKey', 'preSharedKey', 'tokenHash', 'token', 'webhookSecret']) {
+      expect(listing[0]).not.toHaveProperty(secretField);
+    }
+    const seededSecrets = ['cHJpdmF0ZS1rZXktc2VjcmV0PQ==', 'cHJlc2hhcmVkLWtleS1zZWNyZXQ9',
+      'dG9rZW4taGFzaC1zZWNyZXQ=', 'wgpt_deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+      'webhook-secret-value'];
+    for (const secret of seededSecrets) {
+      expect(body).not.toContain(secret);
+    }
+  });
+
+  describe('configuration download MIME types', () => {
+    it('serves the attachment as application/octet-stream', async () => {
+      WireGuard.getClient.mockResolvedValueOnce({ name: 'peer <download>' });
+      WireGuard.getClientConfiguration.mockResolvedValueOnce('[Interface]\nPrivateKey = REPLACE_ME\n');
+
+      const download = await fetch(`${baseUrl}/api/wireguard/client/client1/configuration`, {
+        headers: { Authorization: 'correct-password' },
+      });
+      expect(download.status).toBe(200);
+      // text/plain made Firefox-based Android browsers save .conf.txt
+      // (upstream a8ba7f7); the attachment must be an opaque byte stream.
+      expect(download.headers.get('content-type')).toBe('application/octet-stream');
+      expect(download.headers.get('content-disposition'))
+        .toBe('attachment; filename="peer-download.conf"');
+    });
+
+    it('keeps the raw endpoint as text/plain', async () => {
+      WireGuard.getClientConfiguration.mockResolvedValueOnce('[Interface]\nPrivateKey = REPLACE_ME\n');
+
+      const raw = await fetch(`${baseUrl}/api/wireguard/client/client1/configuration/raw`, {
+        headers: { Authorization: 'correct-password' },
+      });
+      expect(raw.status).toBe(200);
+      expect(raw.headers.get('content-type')).toMatch(/^text\/plain/);
+      expect(await raw.text()).toBe('[Interface]\nPrivateKey = REPLACE_ME');
+    });
+  });
+
   it('exposes the probe endpoint for admins (rule id or index)', async () => {
     const response = await fetch(`${baseUrl}/api/wireguard/client/client1/port-forward/0/probe`, {
       headers: { Authorization: 'correct-password' },
@@ -656,5 +730,52 @@ describe('HTTP server security', () => {
     const statuses = responses.map((response) => response.status);
     expect(statuses.filter((status) => status === 429).length).toBeGreaterThanOrEqual(4);
     expect(statuses.filter((status) => status === 401).length).toBeLessThanOrEqual(20);
+  });
+
+  describe('trusted proxy forwarded headers', () => {
+    // The mocked config designates 127.0.0.1 as TRUSTED_PROXY_IP and the
+    // test client connects from 127.0.0.1, so this suite speaks AS the proxy.
+
+    it('accepts the public host from X-Forwarded-Host when sent by the proxy', async () => {
+      const forwarded = await fetch(`${baseUrl}/api/session`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Origin: 'http://vpn.example.test',
+          'X-Forwarded-Host': 'vpn.example.test',
+          // A proxy always attributes the client IP; this also keeps the
+          // request out of the shared 127.0.0.1 rate-limit bucket.
+          'X-Forwarded-For': '203.0.113.60',
+        },
+        body: JSON.stringify({ password: 'wrong-password' }),
+      });
+      // The proxy vouched for the public host, so CSRF passed and only
+      // authentication failed.
+      expect(forwarded.status).toBe(401);
+
+      // Fail-closed control: without the forwarded host the same request is
+      // cross-origin and must never reach authentication.
+      const direct = await fetch(`${baseUrl}/api/session`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Origin: 'http://vpn.example.test',
+          'X-Forwarded-For': '203.0.113.60',
+        },
+        body: JSON.stringify({ password: 'wrong-password' }),
+      });
+      expect(direct.status).toBe(403);
+    });
+
+    it('attributes logins to the client IP supplied by the proxy', async () => {
+      // 20 failures attributed to proxied client 203.0.113.50 lock that
+      // client out while a different proxied client stays unaffected.
+      for (let i = 0; i < 20; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        expect(await postSession(baseUrl, '203.0.113.50')).toBe(401);
+      }
+      expect(await postSession(baseUrl, '203.0.113.50')).toBe(429);
+      expect(await postSession(baseUrl, '203.0.113.51')).toBe(401);
+    });
   });
 });

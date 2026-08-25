@@ -100,8 +100,10 @@ describe('WireGuard', () => {
     Util.isValidIPv4.mockImplementation((ip) => /^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip));
     Util.isValidIPv6.mockReturnValue(true);
     Util.isValidName.mockImplementation((s) => typeof s === 'string' && s.length > 0 && s.length <= 128
+      && !Util.hasControlChars(s));
+    Util.hasControlChars.mockImplementation((s) => typeof s === 'string'
       // eslint-disable-next-line no-control-regex
-      && !/[\u0000-\u001f\u007f]/.test(s));
+      && /[\u0000-\u001f\u007f]/.test(s));
     Util.parsePort.mockImplementation((value) => {
       if (typeof value === 'number') return value;
       if (typeof value === 'string' && value !== '' && /^\d+$/.test(value)) return Number(value);
@@ -766,6 +768,113 @@ describe('WireGuard', () => {
       expect(clients[0].endpoint).toBeNull();
       expect(clients[0].latestHandshakeAt).toBeNull();
     });
+
+    it('merges matched entries linearly and ignores unknown dump peers', async () => {
+      await wg.getConfig();
+      const unknownPeer = [
+        KEYS.client2Public, KEYS.preShared, '203.0.113.10:51820', '10.8.0.9/32',
+        String(Math.floor(Date.now() / 1000) - 10), '5', '6', '25',
+      ].join('\t');
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
+          return `server-line\n${dumpLine({ handshakeSecondsAgo: 10 })}\n${unknownPeer}`;
+        }
+        return '';
+      });
+      const clients = await wg.getClients();
+      // The unknown public key contributes nothing: same array, same shape,
+      // no phantom client.
+      expect(clients).toHaveLength(1);
+      expect(clients[0].id).toBe('client1');
+      // The matched entry is fully populated from its dump line.
+      expect(clients[0].online).toBe(true);
+      expect(clients[0].endpoint).toBe('203.0.113.9:51820');
+      expect(clients[0].transferRx).toBe(1000);
+      expect(clients[0].transferTx).toBe(2000);
+      expect(clients[0].persistentKeepalive).toBe('0');
+    });
+  });
+
+  describe('QR code generation', () => {
+    const QRCode = require('qrcode'); // eslint-disable-line global-require
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it('generates ordinary configurations at the first (high) ECC level', async () => {
+      await wg.getConfig();
+      const svg = await wg.getClientQRCodeSVG({ clientId: 'client1' });
+      expect(svg).toContain('<svg');
+      expect(svg).toContain('viewBox');
+    });
+
+    it('falls back to lower ECC levels only on capacity overflow', async () => {
+      await wg.getConfig();
+      // Lowercase forces byte mode; this length overflows only H (1273
+      // bytes) and already fits at Q.
+      const config = `[Interface]\nPrivateKey = b${'b'.repeat(1400)}=\n`;
+      const attempted = [];
+      const realToString = QRCode.toString.bind(QRCode);
+      jest.spyOn(QRCode, 'toString').mockImplementation((text, opts) => {
+        attempted.push(opts.errorCorrectionLevel);
+        return realToString(text, opts);
+      });
+      jest.spyOn(wg, 'getClientConfiguration').mockResolvedValue(config);
+
+      const svg = await wg.getClientQRCodeSVG({ clientId: 'client1' });
+      expect(svg).toContain('<svg');
+      expect(attempted).toEqual(['H', 'Q']);
+    });
+
+    it('does not retry unrelated errors', async () => {
+      await wg.getConfig();
+      jest.spyOn(QRCode, 'toString').mockRejectedValue(new Error('renderer exploded'));
+
+      await expect(wg.getClientQRCodeSVG({ clientId: 'client1' }))
+        .rejects.toThrow('renderer exploded');
+      expect(QRCode.toString).toHaveBeenCalledTimes(1);
+    });
+
+    it('fails with a controlled error when every level overflows', async () => {
+      await wg.getConfig();
+      // Byte-mode content too large for even the level-L QR capacity.
+      const config = `[Interface]\nPrivateKey = c${'c'.repeat(4000)}=\n`;
+      jest.spyOn(wg, 'getClientConfiguration').mockResolvedValue(config);
+
+      await expect(wg.getClientQRCodeSVG({ clientId: 'client1' }))
+        .rejects.toThrow('Failed to generate QR code: capacity overflow at all error-correction levels');
+      // The controlled error must not embed the configuration contents.
+      await expect(wg.getClientQRCodeSVG({ clientId: 'client1' })).rejects.not.toThrow(/cccc/);
+    });
+  });
+
+  describe('secret exclusion from client listings', () => {
+    it('never returns client secrets from getClients', async () => {
+      await wg.getConfig();
+      // Seed every secret-bearing field with recognizable values.
+      const config = await wg.getConfig();
+      config.clients.client1.privateKey = KEYS.clientPrivate;
+      config.clients.client1.preSharedKey = KEYS.preShared;
+      config.clients.client1.tokenHash = 'f'.repeat(64);
+
+      const clients = await wg.getClients();
+      const serialized = JSON.stringify(clients);
+      expect(clients).toHaveLength(1);
+      for (const client of clients) {
+        expect(client.privateKey).toBeUndefined();
+        expect(client.preSharedKey).toBeUndefined();
+        expect(client.tokenHash).toBeUndefined();
+        expect(client.token).toBeUndefined();
+        expect(client.webhookSecret).toBeUndefined();
+      }
+      expect(serialized).not.toContain(KEYS.clientPrivate);
+      expect(serialized).not.toContain(KEYS.preShared);
+      expect(serialized).not.toContain('f'.repeat(64));
+      expect(serialized).not.toContain('wgpt_');
+      // Only the sanitized boolean hint remains.
+      expect(clients[0].downloadableConfig).toBe(true);
+    });
   });
 
   describe('per-peer persistentKeepalive', () => {
@@ -866,6 +975,24 @@ describe('WireGuard', () => {
       expect(config.clients.client1.address).toBe('10.8.0.2');
     });
 
+    it('rejects allowedIPs with any C0 control or DEL before touching state', async () => {
+      await wg.getConfig(); // init state
+
+      // NUL, TAB, LF, CR, other C0 (VT) and DEL must all be rejected before
+      // memory, disk, WireGuard or nftables state changes.
+      const badValues = ['10.0.0.0/8\x00', '10.0.0.0/8\t', '10.0.0.0/8\n', '10.0.0.0/8\r', '10.0.0.0/8\x0b', '10.0.0.0/8\x7f'];
+      for (const bad of badValues) {
+        const backup = makeConfig();
+        backup.clients.client1.allowedIPs = [bad];
+        // eslint-disable-next-line no-await-in-loop
+        await expect(wg.restoreConfiguration(JSON.stringify(backup)))
+          .rejects.toThrow(/Invalid client\.allowedIPs/);
+      }
+
+      const config = await wg.getConfig();
+      expect(config.clients.client1.allowedIPs).toBeUndefined();
+    });
+
     it('rejects backup with injected server keys (config injection)', async () => {
       await wg.getConfig(); // init state
 
@@ -930,6 +1057,22 @@ describe('WireGuard', () => {
       expect(response.webhookSecret).toBeUndefined();
       expect(JSON.stringify(response)).not.toContain('supersecret-value');
       expect(response.host).toBe('10.0.0.1');
+    });
+
+    it('rejects control characters in settings that reach generated config', async () => {
+      await wg.getConfig();
+      const tainted = [
+        ['host', 'vpn.example.test\t'],
+        ['defaultDns', '1.1.1.1\x00'],
+        ['allowedIps', '0.0.0.0/0\r, ::/0'],
+      ];
+      for (const [key, value] of tainted) {
+        // eslint-disable-next-line no-await-in-loop
+        await expect(wg.updateServerConfig({ [key]: value }))
+          .rejects.toMatchObject({ statusCode: 400 });
+      }
+      // Rejected before any state change: settings are untouched.
+      expect(wg.__serverSettings.host).toBe('10.0.0.1');
     });
 
     it('preserves active webhook state when an unrelated settings transaction commits', async () => {

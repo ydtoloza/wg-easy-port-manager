@@ -149,9 +149,15 @@ setInterval(() => {
   }
 }, LOGIN_WINDOW_MS).unref();
 
+// Forwarded headers are only honored from the configured reverse proxy.
+// The comparison is an exact IP match; CIDR ranges are deliberately not
+// supported.
+const isTrustedProxy = (req) => Boolean(TRUSTED_PROXY_IP)
+  && req.socket.remoteAddress === TRUSTED_PROXY_IP;
+
 const getClientIp = (req) => {
   const peer = req.socket.remoteAddress || 'unknown';
-  if (TRUSTED_PROXY_IP && peer === TRUSTED_PROXY_IP) {
+  if (isTrustedProxy(req)) {
     const forwarded = req.headers['x-forwarded-for'];
     const candidate = typeof forwarded === 'string'
       ? forwarded.split(',').at(-1).trim()
@@ -259,7 +265,7 @@ const isSameOrigin = (req) => {
     const candidateHost = typeof forwardedHost === 'string'
       ? forwardedHost.split(',').at(-1).trim()
       : null;
-    return host === req.headers.host || (Boolean(TRUSTED_PROXY_IP) && Boolean(candidateHost) && host === candidateHost);
+    return host === req.headers.host || (isTrustedProxy(req) && Boolean(candidateHost) && host === candidateHost);
   } catch {
     return false;
   }
@@ -318,6 +324,20 @@ module.exports = class Server {
 
     const app = createApp({ onError: handleRequestError });
     this.app = app;
+
+    // Spoofing gate: forwarded headers are meaningful only when the TCP peer
+    // is the configured proxy. Strip them up front — before the session and
+    // CSRF middlewares read them — so a direct connection cannot claim a
+    // client IP, the public host, or HTTPS merely because TRUSTED_PROXY_IP
+    // is configured.
+    app.use(fromNodeMiddleware((req, res, next) => {
+      if (!isTrustedProxy(req)) {
+        delete req.headers['x-forwarded-for'];
+        delete req.headers['x-forwarded-host'];
+        delete req.headers['x-forwarded-proto'];
+      }
+      next();
+    }));
 
     app.use(fromNodeMiddleware(expressSession({
       name: SESSION_COOKIE_NAME,
@@ -683,7 +703,7 @@ module.exports = class Server {
           .replace(/-$/, '')
           .substring(0, 32);
         setHeader(event, 'Content-Disposition', `attachment; filename="${configName || clientId}.conf"`);
-        setHeader(event, 'Content-Type', 'text/plain');
+        setHeader(event, 'Content-Type', 'application/octet-stream');
         return config;
       }))
       .get('/api/wireguard/client/:clientId/configuration/raw', defineEventHandler(async (event) => {

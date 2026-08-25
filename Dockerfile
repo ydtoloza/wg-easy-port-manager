@@ -1,4 +1,4 @@
-FROM docker.io/library/node:20-alpine AS build_node_modules
+FROM docker.io/library/node:krypton-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43 AS build_node_modules
 
 # Copy Web UI
 COPY src /app
@@ -10,7 +10,7 @@ RUN npm ci &&\
 
 # Copy build result to a new image.
 # This saves a lot of disk space.
-FROM docker.io/library/node:20-alpine
+FROM docker.io/library/node:krypton-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
 HEALTHCHECK CMD /usr/bin/timeout 5s /bin/sh -c "/usr/bin/wg show wg0 >/dev/null && /usr/bin/wget -q -O /dev/null http://127.0.0.1:${PORT:-51821}/api/session" --interval=1m --timeout=5s --retries=3
 COPY --from=build_node_modules /app /app
 

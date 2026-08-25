@@ -35,8 +35,17 @@ module.exports = class Util {
       return false;
     }
     // Reject control characters (e.g. newlines) that could break config files.
+    return !this.hasControlChars(str);
+  }
+
+  // C0 controls and DEL must never reach generated WireGuard configuration:
+  // they can terminate or alter wg directives. Hook variables (WG_PRE_UP,
+  // WG_POST_UP, WG_PRE_DOWN, WG_POST_DOWN) are exempt at their call sites —
+  // they intentionally contain shell commands.
+  static hasControlChars(str) {
+    if (typeof str !== 'string') return false;
     // eslint-disable-next-line no-control-regex
-    return !/[\u0000-\u001f\u007f]/.test(str);
+    return /[\x00-\x1f\x7f]/.test(str);
   }
 
   // Type-strict port parsing. `Number()` alone accepts `true` → 1,
