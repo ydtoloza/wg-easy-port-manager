@@ -657,4 +657,51 @@ describe('HTTP server security', () => {
     expect(statuses.filter((status) => status === 429).length).toBeGreaterThanOrEqual(4);
     expect(statuses.filter((status) => status === 401).length).toBeLessThanOrEqual(20);
   });
+
+  describe('trusted proxy forwarded headers', () => {
+    // The mocked config designates 127.0.0.1 as TRUSTED_PROXY_IP and the
+    // test client connects from 127.0.0.1, so this suite speaks AS the proxy.
+
+    it('accepts the public host from X-Forwarded-Host when sent by the proxy', async () => {
+      const forwarded = await fetch(`${baseUrl}/api/session`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Origin: 'http://vpn.example.test',
+          'X-Forwarded-Host': 'vpn.example.test',
+          // A proxy always attributes the client IP; this also keeps the
+          // request out of the shared 127.0.0.1 rate-limit bucket.
+          'X-Forwarded-For': '203.0.113.60',
+        },
+        body: JSON.stringify({ password: 'wrong-password' }),
+      });
+      // The proxy vouched for the public host, so CSRF passed and only
+      // authentication failed.
+      expect(forwarded.status).toBe(401);
+
+      // Fail-closed control: without the forwarded host the same request is
+      // cross-origin and must never reach authentication.
+      const direct = await fetch(`${baseUrl}/api/session`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Origin: 'http://vpn.example.test',
+          'X-Forwarded-For': '203.0.113.60',
+        },
+        body: JSON.stringify({ password: 'wrong-password' }),
+      });
+      expect(direct.status).toBe(403);
+    });
+
+    it('attributes logins to the client IP supplied by the proxy', async () => {
+      // 20 failures attributed to proxied client 203.0.113.50 lock that
+      // client out while a different proxied client stays unaffected.
+      for (let i = 0; i < 20; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        expect(await postSession(baseUrl, '203.0.113.50')).toBe(401);
+      }
+      expect(await postSession(baseUrl, '203.0.113.50')).toBe(429);
+      expect(await postSession(baseUrl, '203.0.113.51')).toBe(401);
+    });
+  });
 });
