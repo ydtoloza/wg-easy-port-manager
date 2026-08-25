@@ -582,6 +582,50 @@ describe('HTTP server security', () => {
     });
   });
 
+  it('does not leak secrets through the client listing endpoint', async () => {
+    // Realistic listing payload (the shape WireGuard.getClients produces).
+    WireGuard.getClients.mockResolvedValueOnce([{
+      id: 'client1',
+      name: 'client1',
+      enabled: true,
+      address: '10.8.0.2',
+      addressV6: 'fd42:42:42::2',
+      publicKey: 'cHVibGljLWtleS1vbmx5PQ==',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      allowedIPs: ['10.8.0.2/32'],
+      portForwards: [],
+      networkPolicy: { blockedProtocols: [], customRules: [], peerAllowlist: [] },
+      downloadableConfig: true,
+      persistentKeepalive: null,
+      latestHandshakeAt: null,
+      endpoint: null,
+      online: false,
+      transferRx: null,
+      transferTx: null,
+    }]);
+
+    const response = await fetch(`${baseUrl}/api/wireguard/client`, {
+      headers: { Authorization: 'correct-password' },
+    });
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    const listing = JSON.parse(body);
+
+    // The wire contract must stay secret-free even though the underlying
+    // config holds key material, token hashes and the webhook secret.
+    expect(listing).toHaveLength(1);
+    for (const secretField of ['privateKey', 'preSharedKey', 'tokenHash', 'token', 'webhookSecret']) {
+      expect(listing[0]).not.toHaveProperty(secretField);
+    }
+    const seededSecrets = ['cHJpdmF0ZS1rZXktc2VjcmV0PQ==', 'cHJlc2hhcmVkLWtleS1zZWNyZXQ9',
+      'dG9rZW4taGFzaC1zZWNyZXQ=', 'wgpt_deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+      'webhook-secret-value'];
+    for (const secret of seededSecrets) {
+      expect(body).not.toContain(secret);
+    }
+  });
+
   describe('configuration download MIME types', () => {
     it('serves the attachment as application/octet-stream', async () => {
       WireGuard.getClient.mockResolvedValueOnce({ name: 'peer <download>' });

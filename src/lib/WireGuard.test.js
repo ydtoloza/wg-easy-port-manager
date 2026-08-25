@@ -849,6 +849,34 @@ describe('WireGuard', () => {
     });
   });
 
+  describe('secret exclusion from client listings', () => {
+    it('never returns client secrets from getClients', async () => {
+      await wg.getConfig();
+      // Seed every secret-bearing field with recognizable values.
+      const config = await wg.getConfig();
+      config.clients.client1.privateKey = KEYS.clientPrivate;
+      config.clients.client1.preSharedKey = KEYS.preShared;
+      config.clients.client1.tokenHash = 'f'.repeat(64);
+
+      const clients = await wg.getClients();
+      const serialized = JSON.stringify(clients);
+      expect(clients).toHaveLength(1);
+      for (const client of clients) {
+        expect(client.privateKey).toBeUndefined();
+        expect(client.preSharedKey).toBeUndefined();
+        expect(client.tokenHash).toBeUndefined();
+        expect(client.token).toBeUndefined();
+        expect(client.webhookSecret).toBeUndefined();
+      }
+      expect(serialized).not.toContain(KEYS.clientPrivate);
+      expect(serialized).not.toContain(KEYS.preShared);
+      expect(serialized).not.toContain('f'.repeat(64));
+      expect(serialized).not.toContain('wgpt_');
+      // Only the sanitized boolean hint remains.
+      expect(clients[0].downloadableConfig).toBe(true);
+    });
+  });
+
   describe('per-peer persistentKeepalive', () => {
     it('migrates missing values to null and honors overrides in generated configs', async () => {
       await wg.getConfig();
