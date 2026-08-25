@@ -25,6 +25,7 @@ jobs:
         working-directory: src
         run: |
           npm ci
+          npm audit --omit=dev --audit-level=high
           npm run lint
           npm run check:www-template
           npm run test:ci
