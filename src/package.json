@@ -1,9 +1,9 @@
 {
   "release": {
-    "version": "2.0.0"
+    "version": "2.1.0"
   },
   "name": "wg-easy-port-manager",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "WireGuard Easy – Port Manager fork with DNAT/port forwarding support.",
   "main": "server.js",
   "scripts": {
