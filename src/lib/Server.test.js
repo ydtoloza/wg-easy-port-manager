@@ -33,6 +33,8 @@ jest.mock('../config', () => ({
 
 jest.mock('../services/WireGuard', () => ({
   getClients: jest.fn().mockResolvedValue([]),
+  getClient: jest.fn(),
+  getClientConfiguration: jest.fn(),
   lookupPeerToken: jest.fn(),
   getPeerProfile: jest.fn().mockResolvedValue({
     id: 'client1',
@@ -577,6 +579,34 @@ describe('HTTP server security', () => {
       });
       expect(updated.status).toBe(200);
       expect(WireGuard.setWebhookConfig).toHaveBeenCalledWith({ url: 'https://example.test/hook', secret: 's' });
+    });
+  });
+
+  describe('configuration download MIME types', () => {
+    it('serves the attachment as application/octet-stream', async () => {
+      WireGuard.getClient.mockResolvedValueOnce({ name: 'peer <download>' });
+      WireGuard.getClientConfiguration.mockResolvedValueOnce('[Interface]\nPrivateKey = REPLACE_ME\n');
+
+      const download = await fetch(`${baseUrl}/api/wireguard/client/client1/configuration`, {
+        headers: { Authorization: 'correct-password' },
+      });
+      expect(download.status).toBe(200);
+      // text/plain made Firefox-based Android browsers save .conf.txt
+      // (upstream a8ba7f7); the attachment must be an opaque byte stream.
+      expect(download.headers.get('content-type')).toBe('application/octet-stream');
+      expect(download.headers.get('content-disposition'))
+        .toBe('attachment; filename="peer-download.conf"');
+    });
+
+    it('keeps the raw endpoint as text/plain', async () => {
+      WireGuard.getClientConfiguration.mockResolvedValueOnce('[Interface]\nPrivateKey = REPLACE_ME\n');
+
+      const raw = await fetch(`${baseUrl}/api/wireguard/client/client1/configuration/raw`, {
+        headers: { Authorization: 'correct-password' },
+      });
+      expect(raw.status).toBe(200);
+      expect(raw.headers.get('content-type')).toMatch(/^text\/plain/);
+      expect(await raw.text()).toBe('[Interface]\nPrivateKey = REPLACE_ME');
     });
   });
 

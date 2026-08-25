@@ -703,7 +703,7 @@ module.exports = class Server {
           .replace(/-$/, '')
           .substring(0, 32);
         setHeader(event, 'Content-Disposition', `attachment; filename="${configName || clientId}.conf"`);
-        setHeader(event, 'Content-Type', 'text/plain');
+        setHeader(event, 'Content-Type', 'application/octet-stream');
         return config;
       }))
       .get('/api/wireguard/client/:clientId/configuration/raw', defineEventHandler(async (event) => {
