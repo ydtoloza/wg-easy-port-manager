@@ -168,24 +168,37 @@ const requestViaNode = (url, init, { allowPrivate = false } = {}) => new Promise
     servername: literalFamily ? '' : target.hostname,
     ...(literalFamily ? { checkServerIdentity: (_hostname, cert) => tls.checkServerIdentity(literalHost, cert) } : {}),
   });
-  const timer = setTimeout(() => {
-    request.destroy(new WebhookError(`webhook request timed out after ${REQUEST_TIMEOUT_MS}ms`, true));
-  }, REQUEST_TIMEOUT_MS);
+  let timer;
+  let abortHandler;
   const finish = (fn) => {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
+    if (abortHandler) init.signal.removeEventListener('abort', abortHandler);
     fn();
   };
+  timer = setTimeout(() => {
+    const error = new WebhookError(`webhook request timed out after ${REQUEST_TIMEOUT_MS}ms`, true);
+    request.destroy(error);
+    finish(() => reject(error));
+  }, REQUEST_TIMEOUT_MS);
   request.on('response', (response) => {
-    response.resume(); // drain so the socket is released
-    finish(() => resolve({ status: response.statusCode }));
+    // A response is complete only after its body drains. This permits socket
+    // reuse for finite bodies while the request timer bounds endless streams.
+    response.once('end', () => finish(() => resolve({ status: response.statusCode })));
+    response.once('error', (err) => finish(() => reject(err)));
+    response.once('aborted', () => {
+      const error = new WebhookError('webhook response aborted', true);
+      finish(() => reject(error));
+    });
+    response.resume();
   });
   request.on('error', (err) => finish(() => reject(err)));
   if (init.signal) {
-    init.signal.addEventListener('abort', () => {
+    abortHandler = () => {
       request.destroy(new WebhookError('webhook request timed out', true));
-    }, { once: true });
+    };
+    init.signal.addEventListener('abort', abortHandler, { once: true });
   }
   request.end(init.body);
 });
@@ -198,6 +211,9 @@ const attemptOnce = async ({
   const target = new URL(url);
   if (!isAllowedScheme(target, allowInsecure)) {
     throw new WebhookError('webhook target must be https:// (or http:// with ALLOW_INSECURE_WEBHOOK=true)');
+  }
+  if (target.username || target.password) {
+    throw new WebhookError('webhook target must not include credentials');
   }
   // Literal-IP hosts skip the socket lookup, so they are gated here. WHATWG
   // hostnames keep their brackets for IPv6 ([::1]); strip them first.

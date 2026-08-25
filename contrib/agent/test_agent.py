@@ -142,6 +142,11 @@ def script_apply(connector, ext_port=20000, int_port=12345):
     connector.respond_json({"verdict": "ok"})
 
 
+def script_reconcile_apply(connector, ext_port=20000, int_port=12345):
+    connector.respond_json(profile(ext_port, int_port))
+    script_apply(connector, ext_port, int_port)
+
+
 class TestConfigAndHttp(unittest.TestCase):
     def test_config_requires_https_server_url_and_peer_id(self):
         for changes in (
@@ -208,7 +213,7 @@ class TestSignaturesAndPeerFiltering(unittest.TestCase):
 
     def test_signed_event_is_accepted(self):
         connector = FakeConnector()
-        script_apply(connector)
+        script_reconcile_apply(connector)
         config = make_config(WGPM_WEBHOOK_SECRET=SECRET)
         instance, _, store = make_agent(config=config, connector=connector,
                                         initial=state(ext_port=19000, int_port=12345))
@@ -220,17 +225,19 @@ class TestSignaturesAndPeerFiltering(unittest.TestCase):
 class TestEventTransactions(unittest.TestCase):
     def test_internal_port_is_applied_while_external_semantics_are_persisted(self):
         connector = FakeConnector()
-        script_apply(connector, 22000, 12000)
+        script_reconcile_apply(connector, 22000, 12000)
         adapter = FakeAdapter(current_port=9999)
         instance, _, store = make_agent(adapter=adapter, connector=connector)
         self.assertEqual(instance.handle_webhook(event_body(ext_port=22000, int_port=12000), None), 200)
         self.assertEqual(adapter.set_calls, [12000])
-        self.assertEqual(store.state, state(seq=1, ext_port=22000, int_port=12000))
+        self.assertEqual(store.state, state(
+            seq=1, ext_port=22000, int_port=12000, rule_id=RULE_ID,
+        ))
 
     def test_reannounce_failure_leaves_event_retryable(self):
         connector = FakeConnector()
-        script_apply(connector)
-        script_apply(connector)
+        script_reconcile_apply(connector)
+        script_reconcile_apply(connector)
         adapter = FakeAdapter(current_port=9999)
         adapter.fail_reannounce = 1
         instance, _, store = make_agent(adapter=adapter, connector=connector)
@@ -245,8 +252,8 @@ class TestEventTransactions(unittest.TestCase):
 
     def test_persistence_failure_does_not_advance_in_memory_state_or_dedupe(self):
         connector = FakeConnector()
-        script_apply(connector)
-        script_apply(connector)
+        script_reconcile_apply(connector)
+        script_reconcile_apply(connector)
         instance, adapter, store = make_agent(connector=connector,
                                                initial=state(ext_port=19000, int_port=12345))
         store.fail_save = 1
@@ -260,7 +267,8 @@ class TestEventTransactions(unittest.TestCase):
 
     def test_set_failure_is_retryable(self):
         connector = FakeConnector()
-        script_apply(connector)
+        connector.respond_json(profile())
+        script_reconcile_apply(connector)
         adapter = FakeAdapter(current_port=9000)
         adapter.fail_set = 1
         instance, _, store = make_agent(adapter=adapter, connector=connector)
@@ -273,7 +281,7 @@ class TestEventTransactions(unittest.TestCase):
 
     def test_successful_replay_and_stale_sequence_are_ignored(self):
         connector = FakeConnector()
-        script_apply(connector)
+        script_reconcile_apply(connector)
         instance, adapter, _ = make_agent(connector=connector,
                                            initial=state(ext_port=19000, int_port=12345))
         body = event_body(event_id="once")
@@ -320,6 +328,32 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(adapter.set_calls, [6000])
         self.assertEqual(store.state, state(seq=4, ext_port=21000, int_port=6000, rule_id="low"))
         self.assertTrue(connector.requests[-1][1].endswith("/low/probe"))
+
+    def test_non_selected_add_or_update_keeps_authoritative_lowest_rule(self):
+        rules = [
+            {"id": "low", "extPort": 21000, "intPort": 6000},
+            {"id": "high", "extPort": 25000, "intPort": 5000},
+        ]
+        for event in ("port.confirmed", "port.changed"):
+            with self.subTest(event=event):
+                connector = FakeConnector()
+                connector.respond_json(profile(rules=rules))
+                adapter = FakeAdapter(current_port=6000)
+                initial = state(seq=4, ext_port=21000, int_port=6000, rule_id="low")
+                instance, _, store = make_agent(
+                    adapter=adapter, connector=connector, initial=initial,
+                )
+                body = event_body(
+                    seq=5, ext_port=25000, int_port=5000, event=event,
+                    event_id=f"non-selected-{event}",
+                )
+                self.assertEqual(instance.handle_webhook(body, None), 200)
+                self.assertEqual(adapter.set_calls, [])
+                self.assertEqual(adapter.reannounce_calls, 0)
+                self.assertEqual(
+                    store.state,
+                    state(seq=5, ext_port=21000, int_port=6000, rule_id="low"),
+                )
 
     def test_no_drift_avoids_gratuitous_reannounce_and_keeps_seq(self):
         connector = FakeConnector()
@@ -378,6 +412,21 @@ class TestAdapters(unittest.TestCase):
         self.assertEqual(connector.requests[1][2]["cookie"], "SID=abc")
         self.assertIn(b"hashes=all", connector.requests[-1][3])
 
+    def test_qbittorrent_reauthenticates_once_and_retries_set_safely(self):
+        connector = FakeConnector()
+        adapter = agent.QbittorrentAdapter(self.config("qbittorrent"),
+                                            HttpJson("http://host", connector))
+        adapter._cookie = "SID=expired"
+        connector.respond(403)
+        connector.respond(200, {"set-cookie": "SID=fresh; Path=/"})
+        connector.respond(200)
+        connector.respond_json({"listen_port": 8000})
+        self.assertTrue(adapter.set_listen_port(8000))
+        self.assertEqual(connector.requests[0][2]["cookie"], "SID=expired")
+        self.assertIn(b"username=user", connector.requests[1][3])
+        self.assertEqual(connector.requests[2][2]["cookie"], "SID=fresh")
+        self.assertEqual(connector.requests[0][3], connector.requests[2][3])
+
     def test_transmission_basic_auth_bounded_session_retry_and_all_reannounce(self):
         connector = FakeConnector()
         adapter = agent.TransmissionAdapter(self.config("transmission"),
@@ -415,18 +464,20 @@ class TestAdapters(unittest.TestCase):
         with self.assertRaisesRegex(AgentError, "permission denied"):
             adapter.reannounce()
 
-    def test_deluge_keeps_login_cookie_and_reannounces_all_ids_in_one_argument(self):
+    def test_deluge_keeps_login_cookie_and_reannounces_session_ids_as_list(self):
         connector = FakeConnector()
         adapter = agent.DelugeAdapter(self.config("deluge"), HttpJson("http://host/deluge", connector))
         connector.respond_json({"id": 1, "result": True, "error": None},
                                headers={"set-cookie": "_session_id=abc; Path=/"})
-        connector.respond_json({"id": 2, "result": {"listen_ports": [7000, 7000]}, "error": None})
+        connector.respond_json({"id": 2, "result": 7000, "error": None})
         self.assertEqual(adapter.get_listen_port(), 7000)
         connector.respond_json({"id": 3, "result": ["t1", "t2"], "error": None})
         connector.respond_json({"id": 4, "result": None, "error": None})
         adapter.reannounce()
         self.assertEqual(connector.requests[1][2]["cookie"], "_session_id=abc")
         force = json.loads(connector.requests[-1][3])
+        session = json.loads(connector.requests[-2][3])
+        self.assertEqual(session["method"], "core.get_session_state")
         self.assertEqual(force["method"], "core.force_reannounce")
         self.assertEqual(force["params"], [["t1", "t2"]])
         self.assertEqual(connector.requests[0][1], "/deluge/json")
@@ -437,11 +488,40 @@ class TestAdapters(unittest.TestCase):
         connector.respond_json({"id": 1, "result": True, "error": None},
                                headers={"set-cookie": "_session_id=abc"})
         connector.respond_json({"id": 2, "result": None, "error": None})
-        connector.respond_json({"id": 3, "result": {"listen_ports": [7000, 7000]}, "error": None})
+        connector.respond_json({"id": 3, "result": 7000, "error": None})
         self.assertTrue(adapter.set_listen_port(7000))
         request = json.loads(connector.requests[1][3])
         self.assertEqual(request["method"], "core.set_config")
-        self.assertEqual(request["params"], [{"listen_ports": [7000, 7000]}])
+        self.assertEqual(request["params"], [{
+            "listen_ports": [7000, 7000], "random_port": False,
+        }])
+        read_back = json.loads(connector.requests[2][3])
+        self.assertEqual(read_back["method"], "core.get_listen_port")
+
+    def test_deluge_reauthenticates_once_and_retries_set_safely(self):
+        connector = FakeConnector()
+        adapter = agent.DelugeAdapter(self.config("deluge"), HttpJson("http://host", connector))
+        adapter._authed = True
+        adapter._cookie = "_session_id=expired"
+        connector.respond_json({
+            "id": 1, "result": None,
+            "error": {"code": 2, "message": "Auth level too low: 0 < 5"},
+        })
+        connector.respond_json(
+            {"id": 2, "result": True, "error": None},
+            headers={"set-cookie": "_session_id=fresh; Path=/"},
+        )
+        connector.respond_json({"id": 3, "result": None, "error": None})
+        connector.respond_json({"id": 4, "result": 7000, "error": None})
+        self.assertTrue(adapter.set_listen_port(7000))
+        methods = [json.loads(request[3])["method"] for request in connector.requests]
+        self.assertEqual(methods, [
+            "core.set_config", "auth.login", "core.set_config", "core.get_listen_port",
+        ])
+        self.assertEqual(connector.requests[0][2]["cookie"], "_session_id=expired")
+        self.assertEqual(connector.requests[2][2]["cookie"], "_session_id=fresh")
+        first_params = json.loads(connector.requests[0][3])["params"]
+        self.assertEqual(json.loads(connector.requests[2][3])["params"], first_params)
 
 
 class TestStateStore(unittest.TestCase):

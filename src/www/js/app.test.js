@@ -154,4 +154,29 @@ describe('port-forward UI state', () => {
 
     expect(probePortForward).toHaveBeenCalledTimes(1);
   });
+
+  it('does not alert for protocol-indeterminate probe results', async () => {
+    const options = loadAppOptions();
+    const state = {
+      forwardingEnabled: true,
+      clients: [{
+        ...client(),
+        portForwards: [{
+          id: 'rule1', proto: 'udp', extPort: 8080, intPort: 80,
+        }],
+      }],
+      expandedPfClients: { client1: true },
+      lastProbeAt: {},
+      api: {
+        probePortForward: jest.fn().mockResolvedValue({ verdict: 'indeterminate' }),
+      },
+      isPfExpanded: options.methods.isPfExpanded,
+      notify: jest.fn(),
+      $t: jest.fn(),
+    };
+
+    await options.methods.runAutoProbe.call(state);
+
+    expect(state.notify).not.toHaveBeenCalled();
+  });
 });

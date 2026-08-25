@@ -356,22 +356,37 @@ class QbittorrentAdapter:
             raise AgentError(f"qbittorrent login failed (HTTP {status})")
         self._cookie = headers.get("set-cookie", "").split(";")[0] or None
 
-    def get_listen_port(self):
+    def _request(self, method, path, **kwargs):
         if not self._cookie:
             self._login()
-        status, _, prefs = self.http.json("GET", "/api/v2/app/preferences", headers=self._headers())
+        for attempt in range(2):
+            response = self.http.request(
+                method, path, headers=self._headers(), **kwargs,
+            )
+            if response[0] not in (401, 403) or attempt == 1:
+                return response
+            self._cookie = None
+            self._login()
+        raise AssertionError("unreachable")
+
+    def _json(self, method, path):
+        status, headers, body = self._request(method, path)
+        try:
+            payload = json.loads(body.decode() or "null")
+        except (UnicodeDecodeError, ValueError):
+            payload = None
+        return status, headers, payload
+
+    def get_listen_port(self):
+        status, _, prefs = self._json("GET", "/api/v2/app/preferences")
         if status != 200 or not isinstance(prefs, dict) or not isinstance(prefs.get("listen_port"), int):
             raise AgentError("qbittorrent preferences read-back failed")
         return prefs["listen_port"]
 
     def set_listen_port(self, port):
-        if not self._cookie:
-            self._login()
-
         for attempt in (1, 2):
-            status, _, _ = self.http.request(
+            status, _, _ = self._request(
                 "POST", "/api/v2/app/setPreferences",
-                headers=self._headers(),
                 form={"json": json.dumps({"listen_port": port})},
             )
             if status != 200:
@@ -382,9 +397,8 @@ class QbittorrentAdapter:
         raise AgentError("qbittorrent did not adopt the new listen port after retry")
 
     def reannounce(self):
-        status, _, _ = self.http.request(
+        status, _, _ = self._request(
             "POST", "/api/v2/torrents/reannounce",
-            headers=self._headers(),
             form={"hashes": "all"},
         )
         if status != 200:
@@ -455,21 +469,42 @@ class DelugeAdapter:
         self._authed = False
         self._cookie = None
 
+    @staticmethod
+    def _auth_failed(status, payload):
+        if status in (401, 403):
+            return True
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if error is None:
+            return False
+        text = json.dumps(error, sort_keys=True).lower()
+        return any(marker in text for marker in (
+            "not authenticated", "authentication", "auth level", "session",
+        ))
+
     def _rpc(self, method, params):
-        self._rpc_id += 1
-        headers = {"cookie": self._cookie} if self._cookie else None
-        status, response_headers, payload = self.http.json(
-            "POST", "/json", headers=headers,
-            data={"id": self._rpc_id, "method": method, "params": params},
-        )
-        if status != 200 or not isinstance(payload, dict):
-            raise AgentError(f"deluge rpc {method} failed (HTTP {status})")
-        if payload.get("error") is not None:
-            raise AgentError(f"deluge rpc {method} returned an error")
-        cookie = response_headers.get("set-cookie", "").split(";", 1)[0]
-        if cookie:
-            self._cookie = cookie
-        return payload.get("result")
+        if method != "auth.login" and not self._authed:
+            self._login()
+        for attempt in range(2):
+            self._rpc_id += 1
+            headers = {"cookie": self._cookie} if self._cookie else None
+            status, response_headers, payload = self.http.json(
+                "POST", "/json", headers=headers,
+                data={"id": self._rpc_id, "method": method, "params": params},
+            )
+            cookie = response_headers.get("set-cookie", "").split(";", 1)[0]
+            if cookie:
+                self._cookie = cookie
+            if self._auth_failed(status, payload) and method != "auth.login" and attempt == 0:
+                self._authed = False
+                self._cookie = None
+                self._login()
+                continue
+            if status != 200 or not isinstance(payload, dict):
+                raise AgentError(f"deluge rpc {method} failed (HTTP {status})")
+            if payload.get("error") is not None:
+                raise AgentError(f"deluge rpc {method} returned an error")
+            return payload.get("result")
+        raise AssertionError("unreachable")
 
     def _login(self):
         result = self._rpc("auth.login", [self.password])
@@ -478,31 +513,25 @@ class DelugeAdapter:
         self._authed = True
 
     def set_listen_port(self, port):
-        if not self._authed:
-            self._login()
         for attempt in (1, 2):
-            self._rpc("core.set_config", [{"listen_ports": [port, port]}])
-            config = self._rpc("core.get_config", [])
-            if isinstance(config, dict) and config.get("listen_ports") == [port, port]:
+            self._rpc("core.set_config", [{
+                "listen_ports": [port, port], "random_port": False,
+            }])
+            if self._rpc("core.get_listen_port", []) == port:
                 return True
             log.warning("deluge read-back mismatch (attempt %d)", attempt)
         raise AgentError("deluge did not adopt the new listen port after retry")
 
     def get_listen_port(self):
-        if not self._authed:
-            self._login()
-        config = self._rpc("core.get_config", [])
-        ports = config.get("listen_ports") if isinstance(config, dict) else None
-        if not isinstance(ports, list) or not ports or not isinstance(ports[0], int):
-            raise AgentError("deluge core.get_config omitted listen_ports")
-        return ports[0]
+        port = self._rpc("core.get_listen_port", [])
+        if not isinstance(port, int):
+            raise AgentError("deluge core.get_listen_port omitted the listen port")
+        return port
 
     def reannounce(self):
-        if not self._authed:
-            self._login()
-        torrent_ids = self._rpc("core.get_torrents_list", [])
+        torrent_ids = self._rpc("core.get_session_state", [])
         if not isinstance(torrent_ids, list):
-            log.warning("deluge returned no torrent list; skipping reannounce")
+            log.warning("deluge returned no session state; skipping reannounce")
             return
         if torrent_ids:
             self._rpc("core.force_reannounce", [torrent_ids])
@@ -589,24 +618,17 @@ class Agent:
             if seq <= self.state["seq"]:
                 log.info("dropping event seq=%d at or below state seq=%d", seq, self.state["seq"])
                 return 200
-            if seq > self.state["seq"] + 1:
-                log.info("seq gap %d -> %d: reconciling before applying", self.state["seq"], seq)
-                try:
-                    self.reconcile()
-                except AgentError as err:
-                    log.error("gap reconcile failed: %s", err)
-
-            if event == "port.deleted":
-                # Only authoritative profile state can choose a replacement.
-                self.reconcile(commit_seq=seq)
-                self._remember(event_id)
-                return 200
-
-            ext_port = payload.get("extPort")
-            int_port = payload.get("intPort")
-            if not self._valid_port(ext_port) or not self._valid_port(int_port):
+            if event != "port.deleted" and (
+                    not self._valid_port(payload.get("extPort"))
+                    or not self._valid_port(payload.get("intPort"))):
                 return 400
-            self.apply_rule(ext_port, int_port, seq=seq)
+            if seq > self.state["seq"] + 1:
+                log.info("seq gap %d -> %d: reconciling authoritative profile",
+                         self.state["seq"], seq)
+
+            # An event describes a changed rule, not necessarily the selected
+            # rule. The profile is authoritative for lowest-extPort selection.
+            self.reconcile(commit_seq=seq)
             self._remember(event_id)
             return 200
 

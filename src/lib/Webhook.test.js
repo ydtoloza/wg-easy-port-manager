@@ -8,7 +8,7 @@ const EventEmitter = require('node:events');
 const https = require('node:https');
 const tls = require('node:tls');
 const {
-  signPayload, deliver, isBlockedAddress, RETRY_DELAYS_MS,
+  signPayload, deliver, isBlockedAddress, RETRY_DELAYS_MS, REQUEST_TIMEOUT_MS,
 } = require('./Webhook');
 
 const okResponse = () => new Response('{}', { status: 200 });
@@ -52,6 +52,15 @@ describe('Webhook', () => {
       { fetchImpl, delay: async () => {} },
     );
     expect(allowed).toBe(true);
+  });
+
+  it('rejects embedded URL credentials before transport', async () => {
+    const fetchImpl = jest.fn(async () => okResponse());
+    expect(await deliver(
+      { url: 'https://user:password@example.test/hook', secret: 's', body: '{}' },
+      { fetchImpl, delay: async () => {} },
+    )).toBe(false);
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('does not retry redirects', async () => {
@@ -169,6 +178,43 @@ describe('Webhook', () => {
     expect(high).toEqual(RETRY_DELAYS_MS.map((ms) => Math.round(ms * 1.2)));
   });
 
+  it('destroys a response whose body never ends before retrying', async () => {
+    jest.useFakeTimers();
+    let calls = 0;
+    const requests = [];
+    const requestSpy = jest.spyOn(https, 'request').mockImplementation(() => {
+      calls += 1;
+      const request = new EventEmitter();
+      request.destroy = jest.fn((err) => request.emit('error', err));
+      request.end = () => {
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        response.resume = () => {
+          if (calls > 1) response.emit('end');
+        };
+        request.emit('response', response);
+      };
+      requests.push(request);
+      return request;
+    });
+    try {
+      const delivery = deliver(
+        {
+          url: 'https://8.8.8.8/hook', secret: 's', body: '{}', allowPrivate: true,
+        },
+        { delay: async () => {} },
+      );
+      await jest.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS);
+
+      await expect(delivery).resolves.toBe(true);
+      expect(requestSpy).toHaveBeenCalledTimes(2);
+      expect(requests[0].destroy).toHaveBeenCalledWith(expect.objectContaining({ retryable: true }));
+    } finally {
+      requestSpy.mockRestore();
+      jest.useRealTimers();
+    }
+  });
+
   describe('connect-time SSRF gate', () => {
     it.each([
       ['127.0.0.1', true], ['127.200.1.1', true],
@@ -258,7 +304,10 @@ describe('Webhook', () => {
             if (err) return fake.emit('error', err);
             fake.connectedAddress = address;
             fake.connectedFamily = family;
-            return fake.emit('response', { statusCode: 200, resume: () => {} });
+            const response = new EventEmitter();
+            response.statusCode = 200;
+            response.resume = () => response.emit('end');
+            return fake.emit('response', response);
           });
         };
         fake.destroy = () => {};
@@ -289,7 +338,12 @@ describe('Webhook', () => {
     it('suppresses SNI for HTTPS IPv6 literals and checks the unbracketed certificate IP', async () => {
       const requestSpy = jest.spyOn(https, 'request').mockImplementation(() => {
         const fake = new EventEmitter();
-        fake.end = () => process.nextTick(() => fake.emit('response', { statusCode: 200, resume: () => {} }));
+        fake.end = () => process.nextTick(() => {
+          const response = new EventEmitter();
+          response.statusCode = 200;
+          response.resume = () => response.emit('end');
+          fake.emit('response', response);
+        });
         fake.destroy = () => {};
         return fake;
       });

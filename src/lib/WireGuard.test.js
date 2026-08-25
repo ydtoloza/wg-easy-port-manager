@@ -467,6 +467,22 @@ describe('WireGuard', () => {
       expect(verdict).toMatchObject({ rulePresent: true, tunnelUp: true, verdict: 'unreachable' });
     });
 
+    it('does not TCP-probe UDP-only forwards and returns an indeterminate verdict', async () => {
+      await wg.getConfig();
+      wg.__config.clients.client1.portForwards[0].proto = 'udp';
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('nft -j list table')) return nftTable(false);
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(10);
+        return '';
+      });
+      const tcpConnect = jest.spyOn(wg, '__tcpConnect');
+
+      const verdict = await wg.probePortForward({ clientId: 'client1', rule: '0' });
+
+      expect(tcpConnect).not.toHaveBeenCalled();
+      expect(verdict).toMatchObject({ tcpConnectable: null, verdict: 'indeterminate' });
+    });
+
     it('labels hairpin connects honestly as dnat-local', async () => {
       const wg4 = new (require('./WireGuard'))(); // eslint-disable-line global-require
       await wg4.getConfig();
@@ -898,6 +914,32 @@ describe('WireGuard', () => {
       expect(response.webhookSecret).toBeUndefined();
       expect(JSON.stringify(response)).not.toContain('supersecret-value');
       expect(response.host).toBe('10.0.0.1');
+    });
+
+    it('preserves active webhook state when an unrelated settings transaction commits', async () => {
+      await wg.getConfig();
+      await wg.setWebhookConfig({ url: 'https://example.test/hook', secret: 'secret' });
+
+      await wg.updateServerConfig({ host: '10.0.0.2' });
+
+      expect(await wg.getWebhookConfig()).toEqual({
+        configured: true, url: 'https://example.test/hook',
+      });
+    });
+
+    it('preserves active webhook state when an unrelated settings transaction rolls back', async () => {
+      await wg.getConfig();
+      await wg.setWebhookConfig({ url: 'https://example.test/hook', secret: 'secret' });
+      Util.execFile.mockImplementation(async (command) => {
+        if (command === 'nft') throw new Error('nft apply failed');
+        return KEYS.clientPublic;
+      });
+
+      await expect(wg.updateServerConfig({ host: '10.0.0.2' })).rejects.toThrow('nft apply failed');
+
+      expect(await wg.getWebhookConfig()).toEqual({
+        configured: true, url: 'https://example.test/hook',
+      });
     });
 
     it('keeps the recovery journal when the disk rollback fails', async () => {
@@ -1681,6 +1723,19 @@ describe('WireGuard', () => {
         .rejects.toMatchObject({ statusCode: 400 });
       await expect(wg.setWebhookConfig({ url: 'ftp://example.test/hook', secret: 's' }))
         .rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects embedded credentials and never reflects them from legacy state', async () => {
+      await wg.getConfig();
+      await expect(wg.setWebhookConfig({
+        url: 'https://user:password@example.test/hook', secret: 's',
+      })).rejects.toMatchObject({ statusCode: 400 });
+
+      wg.__webhookConfig = { url: 'https://user:password@example.test/hook', secret: 's' };
+      const status = await wg.getWebhookConfig();
+      expect(status).toEqual({ configured: false, url: null });
+      expect(JSON.stringify(status)).not.toContain('user');
+      expect(JSON.stringify(status)).not.toContain('password');
     });
   });
 });

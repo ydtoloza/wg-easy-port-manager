@@ -339,9 +339,6 @@ module.exports = class WireGuard {
     await this.__syncDirectory();
     this.__settingsRecoveryPending = false;
     this.__settingsRecoveryConfig = null;
-    this.__webhookConfig = null;
-    this.__eventSeq = null;
-    this.__probeState = new Map(); // key: `${clientId}:${ruleKey}` -> { lastAt, inFlight }
   }
 
   async __buildConfig() {
@@ -1256,8 +1253,13 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     try {
       const raw = await fs.readFile(path.join(WG_PATH, 'webhook.json'), 'utf8');
       const parsed = JSON.parse(raw);
+      const target = isPlainObject(parsed) && typeof parsed.url === 'string'
+        ? new URL(parsed.url)
+        : null;
       this.__webhookConfig = isPlainObject(parsed)
         && typeof parsed.url === 'string'
+        && !target.username
+        && !target.password
         && (parsed.secret === undefined || typeof parsed.secret === 'string')
         ? { url: parsed.url, secret: parsed.secret ?? '' }
         : null;
@@ -1271,9 +1273,16 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
   async getWebhookConfig() {
     await this.getConfig();
+    let url = null;
+    try {
+      const target = this.__webhookConfig && new URL(this.__webhookConfig.url);
+      if (target && !target.username && !target.password) url = target.toString();
+    } catch {
+      // Invalid legacy sidecars remain disabled and are never reflected.
+    }
     return {
-      configured: !!(this.__webhookConfig && this.__webhookConfig.url),
-      url: (this.__webhookConfig && this.__webhookConfig.url) || null,
+      configured: !!url,
+      url,
     };
   }
 
@@ -1288,6 +1297,9 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
           parsed = new URL(url);
         } catch {
           throw new ServerError('Invalid webhook url', 400);
+        }
+        if (parsed.username || parsed.password) {
+          throw new ServerError('Webhook url must not include credentials', 400);
         }
         if (parsed.protocol !== 'https:' && !(ALLOW_INSECURE_WEBHOOK && parsed.protocol === 'http:')) {
           throw new ServerError('Webhook url must be https:// (or http:// with ALLOW_INSECURE_WEBHOOK=true)', 400);
@@ -2001,10 +2013,14 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         debug(`Probe: could not read wg dump: ${err.message}`);
       }
 
-      const tcpConnectable = await this.__tcpConnect(this.__serverSettings.host, snapshot.extPort);
+      const tcpConnectable = snapshot.proto === 'udp'
+        ? null
+        : await this.__tcpConnect(this.__serverSettings.host, snapshot.extPort);
 
       let verdict;
-      if (!isPresent) {
+      if (snapshot.proto === 'udp') {
+        verdict = 'indeterminate';
+      } else if (!isPresent) {
         verdict = tcpConnectable ? 'dnat-local' : 'rule-missing';
       } else if (!tunnelUp) {
         verdict = tcpConnectable ? 'dnat-local' : 'tunnel-down';

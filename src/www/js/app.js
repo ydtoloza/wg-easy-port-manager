@@ -704,7 +704,8 @@ new Vue({
           this.lastProbeAt[key] = now;
           try {
             const result = await this.api.probePortForward({ clientId: client.id, ruleId: rule.id });
-            if (result && result.verdict && result.verdict !== 'ok' && result.verdict !== 'dnat-local') {
+            if (result && result.verdict
+              && !['ok', 'dnat-local', 'indeterminate'].includes(result.verdict)) {
               this.notify(this.$t('networkPolicy.probeProblem', {
                 client: client.name, proto: rule.proto, port: rule.extPort, verdict: result.verdict,
               }), 'error', 8000);

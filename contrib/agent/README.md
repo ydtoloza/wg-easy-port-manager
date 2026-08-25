@@ -72,7 +72,7 @@ tunnel or a reverse proxy unless you know why not).
 ```sh
 sudo install -m 644 wgpm-agent.service /etc/systemd/system/wgpm-agent.service
 sudo useradd --system --home-dir /var/lib/wgpm-agent --shell /usr/sbin/nologin wgpm-agent
-sudo install -d -m 700 /opt/wgpm-agent
+sudo install -d -m 0750 -o root -g wgpm-agent /opt/wgpm-agent
 sudo install -m 755 agent.py /opt/wgpm-agent/agent.py
 
 sudo install -m 600 -o root -g root wgpm-agent.env.example /etc/wgpm-agent.env
@@ -116,10 +116,13 @@ probes reachability and exits:
   also confirm that the token resolves to that peer. Matching events carry a
   per-peer `seq` plus `eventId`; replays and stale sequences are dropped and
   the in-memory seen set is capped at 256 entries.
-- **Retry-safe**: sequence and dedupe state commit only after client read-back,
-  a best-effort probe attempt, successful all-torrent reannounce and atomic
-  persistence. A failed webhook returns HTTP 500 and remains safe for
+- **At-least-once and retry-safe**: sequence and dedupe state commit only
+  after client read-back, a best-effort probe attempt, successful all-torrent
+  reannounce and atomic persistence. A failed webhook returns HTTP 500 for
   at-least-once redelivery.
+  Client set and reannounce operations are safe to repeat, and can run more
+  than once when a failure occurs after the client accepted an operation but
+  before state commits.
 - **Correct port semantics**: `extPort` identifies the public rule and probe;
   the torrent client's listen port is always the corresponding `intPort`.
   State persists both values plus `ruleId` atomically (file fsync, rename,
@@ -127,9 +130,10 @@ probes reachability and exits:
 - **Change-only**: the client's actual listen port is read on every reconcile.
   Drift is repaired and reannounced; an already-correct client is not changed
   or gratuitously reannounced.
-- **Reconcile safety net**: every `WGPM_POLL_SECONDS`, and immediately on a
-  detected seq gap, the agent polls its profile and converges to the internal
-  port associated with the lowest external forward. Polls never invent or
+- **Reconcile safety net**: every matching webhook and every
+  `WGPM_POLL_SECONDS`, the agent polls its profile and converges to the internal
+  port associated with the lowest external forward. Events for non-selected
+  rules only advance sequence state. Polls never invent or
   advance server sequence numbers. Transient HTTP/socket failures are logged
   and retried on the next interval. Keep polling enabled as a safety net for
   missed events and client-side drift.
@@ -165,7 +169,8 @@ Your tracker **passkey and announce URLs do not change** when the external
 port changes — nothing breaks at announce-URL level. But external peers
 cached your old `ip:port` pair, so **every torrent must reannounce before
 the tracker (and other peers) see the new port**. The agent reannounces all
-torrents exactly once per real port change; until a tracker-side announce
+torrents at least once per observed port change; delivery retries can safely
+repeat a reannounce before durable state commits. Until a tracker-side announce
 interval or the agent's reannounce completes, incoming connections may
 still target the old port.
 
