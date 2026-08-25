@@ -100,7 +100,7 @@ new Vue({
 
     // Port-forwarding kill switch (live from server config) and the
     // debounced auto-probe bookkeeping.
-    forwardingEnabled: true,
+    forwardingEnabled: false,
     autoProbeTimer: null,
     lastPfSignature: null,
     lastProbeAt: {},
@@ -228,7 +228,9 @@ new Vue({
       return !!this.expandedPfClients[clientId];
     },
     togglePfExpanded(clientId) {
-      this.$set(this.expandedPfClients, clientId, !this.expandedPfClients[clientId]);
+      const expanded = !this.expandedPfClients[clientId];
+      this.$set(this.expandedPfClients, clientId, expanded);
+      if (expanded) this.scheduleAutoProbe();
     },
     isPortConflicting(client) {
       const pf = this.newPf[client.id];
@@ -250,9 +252,8 @@ new Vue({
         this.api.getServerConfig().catch(() => null),
       ]);
       if (generation !== this.refreshGeneration) return;
-      if (serverConfig && typeof serverConfig.forwardingEnabled === 'boolean') {
-        this.forwardingEnabled = serverConfig.forwardingEnabled;
-      }
+      const forwardingChanged = this.forwardingEnabled !== (serverConfig?.forwardingEnabled === true);
+      this.forwardingEnabled = serverConfig?.forwardingEnabled === true;
       this.clients = clients.map((client) => {
         if (!this.clientsPersist[client.id]) {
           this.clientsPersist[client.id] = {};
@@ -318,7 +319,7 @@ new Vue({
         client.enabled,
         (client.portForwards || []).map((rule) => [rule.id, rule.proto, rule.extPort, rule.intPort]),
       ]));
-      if (pfSignature !== this.lastPfSignature) {
+      if (forwardingChanged || pfSignature !== this.lastPfSignature) {
         this.lastPfSignature = pfSignature;
         this.scheduleAutoProbe();
       }
@@ -552,6 +553,7 @@ new Vue({
       document.body.removeChild(el);
     },
     addPortForward(client) {
+      if (!this.forwardingEnabled) return;
       const pf = this.newPf[client.id];
       if (!pf || !pf.extPort || !pf.intPort) return;
 
@@ -585,10 +587,11 @@ new Vue({
         .finally(() => this.refresh().catch(console.error));
     },
     removePortForward(client, index) {
+      if (!this.forwardingEnabled) return;
       this.pfDelete = { client, index, rule: client.portForwards[index] };
     },
     confirmRemovePortForward() {
-      if (!this.pfDelete) return;
+      if (!this.forwardingEnabled || !this.pfDelete) return;
       const { client, rule } = this.pfDelete;
       if (!rule || !rule.id) return;
       this.api.removePortForward({ clientId: client.id, ruleId: rule.id })
@@ -599,6 +602,7 @@ new Vue({
         });
     },
     editPortForward(client, index) {
+      if (!this.forwardingEnabled) return;
       this.editingPfClientId = client.id;
       this.editingPfIndex = index;
       this.editingPfRule = { ...client.portForwards[index] };
@@ -609,6 +613,7 @@ new Vue({
       this.editingPfRule = {};
     },
     updatePortForward(client) {
+      if (!this.forwardingEnabled) return;
       if (!this.editingPfRule || !this.editingPfRule.extPort || !this.editingPfRule.intPort) return;
       if (!this.editingPfRule.id) return;
 
@@ -665,9 +670,9 @@ new Vue({
       this.api.updateServerConfig(this.serverConfigEdit)
         .then((result) => {
           this.serverConfig = result;
-          if (result && typeof result.forwardingEnabled === 'boolean') {
-            this.forwardingEnabled = result.forwardingEnabled;
-          }
+          const forwardingChanged = this.forwardingEnabled !== (result?.forwardingEnabled === true);
+          this.forwardingEnabled = result?.forwardingEnabled === true;
+          if (forwardingChanged) this.scheduleAutoProbe();
           this.showServerConfig = false;
           this.serverConfigEdit = null;
           this.notify('Configuración del servidor guardada.', 'success');
@@ -700,7 +705,7 @@ new Vue({
           try {
             const result = await this.api.probePortForward({ clientId: client.id, ruleId: rule.id });
             if (result && result.verdict && result.verdict !== 'ok' && result.verdict !== 'dnat-local') {
-              this.notify(this.$t('probeProblem', {
+              this.notify(this.$t('networkPolicy.probeProblem', {
                 client: client.name, proto: rule.proto, port: rule.extPort, verdict: result.verdict,
               }), 'error', 8000);
             }
