@@ -905,10 +905,7 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
             client.endpoint = endpoint && endpoint !== '(none)' ? endpoint : null;
             client.transferRx = Number(transferRx);
             client.transferTx = Number(transferTx);
-            // int-or-null so the API field is typed, not a raw dump string.
-            client.persistentKeepalive = /^\d+$/.test(String(persistentKeepalive ?? ''))
-              ? Number(persistentKeepalive)
-              : null;
+            client.persistentKeepalive = persistentKeepalive;
           });
       } catch (err) {
         debug(`Warning: Could not fetch wireguard dump: ${err.message}`);
@@ -1936,13 +1933,11 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     });
   }
 
-  // Client-over-global keepalive resolution for reachability windows. A
-  // per-peer override (Feature 2) lengthens the online window 3x that value;
-  // unset (null) falls back to the global setting, and 0/NaN (keepalive
-  // disabled) falls back to the 3x180s baseline.
+  // Client-over-global keepalive resolution for reachability windows. Values
+  // above the fallback cannot make stale handshakes look fresh indefinitely.
   __effectiveKeepalive(storedKeepalive) {
     const resolved = storedKeepalive != null ? storedKeepalive : this.__serverSettings.persistentKeepalive;
-    return Number(resolved) || 180;
+    return Math.min(Number(resolved) || 180, 180);
   }
 
   __peerTunnelUp(client) {

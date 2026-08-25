@@ -440,21 +440,18 @@ describe('WireGuard', () => {
       expect(verdict).toMatchObject({ rulePresent: true, tunnelUp: false, verdict: 'tunnel-down' });
     });
 
-    it('feeds the per-peer keepalive override into the probe tunnel verdict', async () => {
+    it('caps a large per-peer keepalive in the probe tunnel verdict', async () => {
       const wg2b = new (require('./WireGuard'))(); // eslint-disable-line global-require
       await wg2b.getConfig();
-      await wg2b.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 3600 });
+      await wg2b.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 65535 });
       Util.exec.mockImplementation(async (cmd) => {
         if (typeof cmd === 'string' && cmd.includes('nft -j list table')) return nftTable(true);
-        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(3600);
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(7200);
         return '';
       });
       jest.spyOn(wg2b, '__tcpConnect').mockResolvedValue(false);
       const verdict = await wg2b.probePortForward({ clientId: 'client1', rule: '0' });
-      // The same 3600s-old handshake as the tunnel-down case above, but the
-      // per-peer 3600s override widens the window to 3h: the tunnel counts as
-      // up and the honest verdict becomes unreachable, not tunnel-down.
-      expect(verdict).toMatchObject({ tunnelUp: true, verdict: 'unreachable' });
+      expect(verdict).toMatchObject({ tunnelUp: false, verdict: 'tunnel-down' });
     });
 
     it('derives unreachable when rule and tunnel are up but TCP fails', async () => {
@@ -662,19 +659,49 @@ describe('WireGuard', () => {
       expect(clients[0].online).toBe(true);
     });
 
-    it('honors a per-peer keepalive override in the online window', async () => {
+    it('honors a per-peer keepalive override below the freshness cap', async () => {
       await wg.getConfig();
-      await wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 3600 });
+      await wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 120 });
       Util.exec.mockImplementation(async (cmd) => {
         if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
-          return `server-line\n${dumpLine({ handshakeSecondsAgo: 400 })}`;
+          return `server-line\n${dumpLine({ handshakeSecondsAgo: 300 })}`;
         }
         return '';
       });
       const clients = await wg.getClients();
-      // Global keepalive is 25s (75s window); the 3600s override widens the
-      // window to 3h, so a 400s-old handshake is still online.
+      // Global keepalive is 25s (75s window), while this override gives 360s.
       expect(clients[0].online).toBe(true);
+    });
+
+    it('uses a strict capped freshness boundary', async () => {
+      await wg.getConfig();
+      await wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 65535 });
+      const now = 2_000_000_000_000;
+      const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(now);
+      let handshakeSecondsAgo = 539;
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
+          return `server-line\n${dumpLine({ handshakeSecondsAgo })}`;
+        }
+        return '';
+      });
+      expect((await wg.getClients())[0].online).toBe(true);
+      handshakeSecondsAgo = 540;
+      expect((await wg.getClients())[0].online).toBe(false);
+      nowSpy.mockRestore();
+    });
+
+    it('caps a large per-peer keepalive for multi-hour-old handshakes', async () => {
+      await wg.getConfig();
+      await wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 65535 });
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
+          return `server-line\n${dumpLine({ handshakeSecondsAgo: 7200 })}`;
+        }
+        return '';
+      });
+      const clients = await wg.getClients();
+      expect(clients[0].online).toBe(false);
     });
 
     it('keeps the global window for peers without an override', async () => {
@@ -689,8 +716,7 @@ describe('WireGuard', () => {
       const clients = await wg.getClients();
       // No override: the global 25s setting (75s window) governs.
       expect(clients[0].online).toBe(false);
-      // and the API keepalive field is typed int-or-null from the dump
-      expect(clients[0].persistentKeepalive).toBe(0);
+      expect(clients[0].persistentKeepalive).toBe('0');
     });
 
     it('treats no-handshake and (none) endpoint as offline/null', async () => {
