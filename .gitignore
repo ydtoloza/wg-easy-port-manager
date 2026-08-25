@@ -11,6 +11,8 @@
 /src/node_modules/
 node_modules/
 npm-debug.log*
+__pycache__/
+*.py[cod]
 
 # OS & editors
 .DS_Store
