@@ -400,8 +400,9 @@ describe('HTTP server security', () => {
       expect(added.status).toBe(200);
     });
 
-    it('rejects traversal-shaped peer paths explicitly', async () => {
+    it('rejects malformed peer paths, including encoded and terminal dot segments', async () => {
       WireGuard.lookupPeerToken.mockResolvedValue('client1');
+      WireGuard.lookupPeerToken.mockClear();
       const { port } = new URL(baseUrl);
       // fetch()/URL normalize dot segments client-side, so send raw paths.
       const rawStatus = (rawPath) => new Promise((resolve, reject) => {
@@ -418,10 +419,75 @@ describe('HTTP server security', () => {
         request.on('error', reject);
         request.end();
       });
-      expect(await rawStatus('/api/peer/me/../me')).toBe(400);
-      expect(await rawStatus('/api/peer/me//port-forward')).toBe(400);
+      const malformedPaths = [
+        '/api/peer/me/../me',
+        '/api/peer/me/.',
+        '/api/peer/me/..',
+        '/api/peer/me/%2e',
+        '/api/peer/me/%2E%2e/port-forward',
+        '/api/peer/me/%2f../port-forward',
+        '/api/peer/me//port-forward',
+        '/api/peer/me/%not-an-escape',
+        '/api%2fpeer%2fme/%not-an-escape',
+      ];
+      for (const path of malformedPaths) {
+        // eslint-disable-next-line no-await-in-loop
+        expect(await rawStatus(path)).toBe(400);
+      }
+      expect(WireGuard.lookupPeerToken).not.toHaveBeenCalled();
       // sanity: the normal shape still authenticates
       expect(await rawStatus('/api/peer/me')).toBe(200);
+    });
+
+    it('does not let in-flight peer-token checks consume admin auth slots', async () => {
+      const pendingPeerChecks = [];
+      WireGuard.lookupPeerToken.mockImplementation(() => new Promise((resolve) => pendingPeerChecks.push(resolve)));
+      const requests = Array.from({ length: 64 }, (_, i) => fetch(`${baseUrl}/api/peer/me`, {
+        headers: {
+          Authorization: `Bearer wgpt_${i.toString(16).padStart(64, '0')}`,
+          'X-Forwarded-For': `203.0.113.${Math.floor(i / 16) + 1}`,
+        },
+      }));
+      const waitFor = async (predicate, what) => {
+        for (let i = 0; i < 400 && !predicate(); i += 1) {
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        if (!predicate()) throw new Error(`timed out waiting for ${what}`);
+      };
+
+      globalThis.__deferPasswordCompares = true;
+      globalThis.__pendingPasswordCompares = [];
+      try {
+        await waitFor(() => pendingPeerChecks.length === 64, 'peer-token checks to start');
+
+        const sameIp = await fetch(`${baseUrl}/api/peer/me`, {
+          headers: {
+            Authorization: `Bearer wgpt_${'40'.padStart(64, '0')}`,
+            'X-Forwarded-For': '203.0.113.1',
+          },
+        });
+        expect(sameIp.status).toBe(429);
+
+        requests.push(fetch(`${baseUrl}/api/peer/me`, {
+          headers: {
+            Authorization: `Bearer wgpt_${'41'.padStart(64, '0')}`,
+            'X-Forwarded-For': '203.0.113.5',
+          },
+        }));
+        await waitFor(() => pendingPeerChecks.length === 65, 'peer check from another IP to start');
+
+        const admin = postSession(baseUrl, '198.51.100.90');
+        await waitFor(() => globalThis.__pendingPasswordCompares.length === 1, 'admin password check to start');
+        globalThis.__pendingPasswordCompares[0](false);
+        expect(await admin).toBe(401);
+      } finally {
+        for (const resolve of pendingPeerChecks.splice(0)) resolve(null);
+        for (const resolve of globalThis.__pendingPasswordCompares.splice(0)) resolve(false);
+        await Promise.all(requests);
+        WireGuard.lookupPeerToken.mockResolvedValue(null);
+        globalThis.__deferPasswordCompares = false;
+      }
     });
 
     it('isolates peer-token buckets from admin lockout counters', async () => {

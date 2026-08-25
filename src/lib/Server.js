@@ -55,6 +55,8 @@ const MAX_LOGIN_BUCKETS = 10000;
 // slots and lock out every other admin. The total cap only bounds CPU.
 const MAX_ACTIVE_PASSWORD_CHECKS_PER_IP = 8;
 const MAX_ACTIVE_PASSWORD_CHECKS_TOTAL = 64;
+const MAX_ACTIVE_PEER_TOKEN_CHECKS_PER_IP = 16;
+const MAX_ACTIVE_PEER_TOKEN_CHECKS_TOTAL = 128;
 const SESSION_COOKIE_NAME = 'connect.sid';
 
 // In-memory login rate limiter (key: client IP)
@@ -64,6 +66,8 @@ const loginAttempts = new Map();
 // oldest-first eviction, nor consume the admin table's capacity.
 const peerTokenAttempts = new Map();
 let activePasswordChecksTotal = 0;
+let activePeerTokenChecksTotal = 0;
+const activePeerTokenChecksByIp = new Map();
 
 const getAttemptEntry = (table, key) => {
   const now = Date.now();
@@ -75,7 +79,7 @@ const getAttemptEntry = (table, key) => {
   return entry || null;
 };
 
-const beginAttempt = (table, key, maxBuckets) => {
+const getOrCreateAttemptEntry = (table, key, maxBuckets) => {
   let entry = getAttemptEntry(table, key);
   if (!entry) {
     if (table.size >= maxBuckets) {
@@ -84,6 +88,11 @@ const beginAttempt = (table, key, maxBuckets) => {
     entry = { failures: 0, pending: 0, resetAt: Date.now() + LOGIN_WINDOW_MS };
     table.set(key, entry);
   }
+  return entry;
+};
+
+const beginPasswordCheck = (key) => {
+  const entry = getOrCreateAttemptEntry(loginAttempts, key, MAX_LOGIN_BUCKETS);
   if (entry.failures + entry.pending >= LOGIN_MAX_ATTEMPTS) return false;
   if (entry.pending >= MAX_ACTIVE_PASSWORD_CHECKS_PER_IP) return false;
   if (activePasswordChecksTotal >= MAX_ACTIVE_PASSWORD_CHECKS_TOTAL) return false;
@@ -92,21 +101,42 @@ const beginAttempt = (table, key, maxBuckets) => {
   return true;
 };
 
-const completeAttempt = (table, key, valid) => {
+const completePasswordCheck = (key, valid) => {
   activePasswordChecksTotal = Math.max(0, activePasswordChecksTotal - 1);
-  const entry = table.get(key);
+  const entry = loginAttempts.get(key);
   if (!entry) return;
   entry.pending = Math.max(0, entry.pending - 1);
   if (valid) entry.failures = 0;
   else entry.failures += 1;
-  if (entry.pending === 0 && entry.failures === 0) table.delete(key);
+  if (entry.pending === 0 && entry.failures === 0) loginAttempts.delete(key);
 };
 
-const beginPasswordCheck = (key) => beginAttempt(loginAttempts, key, MAX_LOGIN_BUCKETS);
-const completePasswordCheck = (key, valid) => completeAttempt(loginAttempts, key, valid);
 const MAX_PEER_TOKEN_BUCKETS = 10000;
-const beginPeerTokenCheck = (key) => beginAttempt(peerTokenAttempts, key, MAX_PEER_TOKEN_BUCKETS);
-const completePeerTokenCheck = (key, valid) => completeAttempt(peerTokenAttempts, key, valid);
+const beginPeerTokenCheck = (key, ip) => {
+  const entry = getOrCreateAttemptEntry(peerTokenAttempts, key, MAX_PEER_TOKEN_BUCKETS);
+  const activeForIp = activePeerTokenChecksByIp.get(ip) || 0;
+  if (entry.failures + entry.pending >= LOGIN_MAX_ATTEMPTS) return false;
+  if (activeForIp >= MAX_ACTIVE_PEER_TOKEN_CHECKS_PER_IP) return false;
+  if (activePeerTokenChecksTotal >= MAX_ACTIVE_PEER_TOKEN_CHECKS_TOTAL) return false;
+  entry.pending += 1;
+  activePeerTokenChecksByIp.set(ip, activeForIp + 1);
+  activePeerTokenChecksTotal += 1;
+  return true;
+};
+
+const completePeerTokenCheck = (key, ip, valid) => {
+  activePeerTokenChecksTotal = Math.max(0, activePeerTokenChecksTotal - 1);
+  const activeForIp = Math.max(0, (activePeerTokenChecksByIp.get(ip) || 0) - 1);
+  if (activeForIp === 0) activePeerTokenChecksByIp.delete(ip);
+  else activePeerTokenChecksByIp.set(ip, activeForIp);
+
+  const entry = peerTokenAttempts.get(key);
+  if (!entry) return;
+  entry.pending = Math.max(0, entry.pending - 1);
+  if (valid) entry.failures = 0;
+  else entry.failures += 1;
+  if (entry.pending === 0 && entry.failures === 0) peerTokenAttempts.delete(key);
+};
 
 setInterval(() => {
   const now = Date.now();
@@ -129,6 +159,30 @@ const getClientIp = (req) => {
     if (isIP(candidate)) return candidate;
   }
   return peer;
+};
+
+const classifyPeerPath = (url) => {
+  const rawPathname = url.split('?')[0];
+  const asciiDecodedPathname = rawPathname.replace(/%([0-9a-f]{2})/gi, (escape, hex) => {
+    const value = Number.parseInt(hex, 16);
+    return value < 128 ? String.fromCharCode(value) : escape;
+  });
+  let pathname;
+  try {
+    pathname = decodeURIComponent(rawPathname);
+  } catch {
+    return {
+      isPeerPath: asciiDecodedPathname === '/api/peer/me'
+        || asciiDecodedPathname.startsWith('/api/peer/me/')
+        || asciiDecodedPathname.startsWith('/api/peer/'),
+      malformed: true,
+    };
+  }
+
+  const isPeerPath = pathname === '/api/peer/me' || pathname.startsWith('/api/peer/me/');
+  if (!isPeerPath) return { isPeerPath: false, malformed: false };
+  const hasDotSegment = pathname.split('/').some((segment) => segment === '.' || segment === '..');
+  return { isPeerPath: true, malformed: hasDotSegment || pathname.includes('//') };
 };
 
 // Count bytes while streaming so oversized bodies are never fully buffered.
@@ -428,16 +482,12 @@ module.exports = class Server {
     // under it without a valid Bearer peer token is rejected here.
     app.use(
       fromNodeMiddleware(async (req, res, next) => {
-        // Query strings are not part of the route identity: matching the raw
-        // req.url broke every client that appends ?x=1 with a 401.
-        const pathname = req.url.split('?')[0];
-        const isPeerPath = pathname === '/api/peer/me' || pathname.startsWith('/api/peer/me/');
+        const { isPeerPath, malformed } = classifyPeerPath(req.url);
         if (!isPeerPath) return next();
 
-        // Defense in depth: h3 does not normalize dot segments; reject
-        // traversal-shaped paths explicitly instead of relying on route
-        // mismatches to save us.
-        if (pathname.includes('/../') || pathname.includes('//')) {
+        // Decode once for the same route identity h3 uses, but fail closed on
+        // invalid escapes and explicit dot segments before authentication.
+        if (malformed) {
           res.statusCode = 400;
           res.setHeader('Content-Type', 'application/json');
           res.end(JSON.stringify({ error: 'Invalid peer path' }));
@@ -460,7 +510,8 @@ module.exports = class Server {
         // with admin logins (success resets would enable lockout evasion)
         // nor evict admin failure counters.
         const bucket = `peer-token:${sha256Hex(`wgpt_${token}`).slice(0, 16)}`;
-        if (!beginPeerTokenCheck(bucket)) {
+        const ip = getClientIp(req);
+        if (!beginPeerTokenCheck(bucket, ip)) {
           res.statusCode = 429;
           res.setHeader('Content-Type', 'application/json');
           res.end(JSON.stringify({ error: 'Too many attempts, try again later' }));
@@ -470,7 +521,7 @@ module.exports = class Server {
         try {
           clientId = await WireGuard.lookupPeerToken(`wgpt_${token}`);
         } finally {
-          completePeerTokenCheck(bucket, clientId !== null);
+          completePeerTokenCheck(bucket, ip, clientId !== null);
         }
         if (!clientId) {
           res.statusCode = 401;
@@ -492,10 +543,9 @@ module.exports = class Server {
           return next();
         }
 
-        // Scoped peer endpoints authenticate against their own gate above
-        // (query strings stripped, same as there).
-        const pathname = req.url.split('?')[0];
-        if (pathname === '/api/peer/me' || pathname.startsWith('/api/peer/me/')) {
+        // Use the same decoded route identity as the peer-token gate so an
+        // encoded path cannot fall through into password authentication.
+        if (classifyPeerPath(req.url).isPeerPath) {
           return next();
         }
 
