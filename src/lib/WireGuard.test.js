@@ -795,6 +795,60 @@ describe('WireGuard', () => {
     });
   });
 
+  describe('QR code generation', () => {
+    const QRCode = require('qrcode'); // eslint-disable-line global-require
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it('generates ordinary configurations at the first (high) ECC level', async () => {
+      await wg.getConfig();
+      const svg = await wg.getClientQRCodeSVG({ clientId: 'client1' });
+      expect(svg).toContain('<svg');
+      expect(svg).toContain('viewBox');
+    });
+
+    it('falls back to lower ECC levels only on capacity overflow', async () => {
+      await wg.getConfig();
+      // Lowercase forces byte mode; this length overflows only H (1273
+      // bytes) and already fits at Q.
+      const config = `[Interface]\nPrivateKey = b${'b'.repeat(1400)}=\n`;
+      const attempted = [];
+      const realToString = QRCode.toString.bind(QRCode);
+      jest.spyOn(QRCode, 'toString').mockImplementation((text, opts) => {
+        attempted.push(opts.errorCorrectionLevel);
+        return realToString(text, opts);
+      });
+      jest.spyOn(wg, 'getClientConfiguration').mockResolvedValue(config);
+
+      const svg = await wg.getClientQRCodeSVG({ clientId: 'client1' });
+      expect(svg).toContain('<svg');
+      expect(attempted).toEqual(['H', 'Q']);
+    });
+
+    it('does not retry unrelated errors', async () => {
+      await wg.getConfig();
+      jest.spyOn(QRCode, 'toString').mockRejectedValue(new Error('renderer exploded'));
+
+      await expect(wg.getClientQRCodeSVG({ clientId: 'client1' }))
+        .rejects.toThrow('renderer exploded');
+      expect(QRCode.toString).toHaveBeenCalledTimes(1);
+    });
+
+    it('fails with a controlled error when every level overflows', async () => {
+      await wg.getConfig();
+      // Byte-mode content too large for even the level-L QR capacity.
+      const config = `[Interface]\nPrivateKey = c${'c'.repeat(4000)}=\n`;
+      jest.spyOn(wg, 'getClientConfiguration').mockResolvedValue(config);
+
+      await expect(wg.getClientQRCodeSVG({ clientId: 'client1' }))
+        .rejects.toThrow('Failed to generate QR code: capacity overflow at all error-correction levels');
+      // The controlled error must not embed the configuration contents.
+      await expect(wg.getClientQRCodeSVG({ clientId: 'client1' })).rejects.not.toThrow(/cccc/);
+    });
+  });
+
   describe('per-peer persistentKeepalive', () => {
     it('migrates missing values to null and honors overrides in generated configs', async () => {
       await wg.getConfig();

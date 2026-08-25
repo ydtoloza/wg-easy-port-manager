@@ -962,10 +962,25 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
   async getClientQRCodeSVG({ clientId }) {
     const config = await this.getClientConfiguration({ clientId });
-    return QRCode.toString(config, {
-      type: 'svg',
-      width: 512,
-    });
+    // Progressive error-correction fallback (upstream 5c97a8b): start at
+    // high ECC for best scannability and retry at lower levels only when
+    // the payload exceeds the QR capacity at that level. Unrelated errors
+    // rethrow immediately, and the final error never embeds the config.
+    for (const errorCorrectionLevel of ['H', 'Q', 'M', 'L']) {
+      try {
+        return await QRCode.toString(config, {
+          type: 'svg',
+          width: 512,
+          errorCorrectionLevel,
+        });
+      } catch (err) {
+        if (!(err instanceof Error && err.message === 'The amount of data is too big to be stored in a QR Code')) {
+          throw err;
+        }
+        // Capacity overflow: retry with the next lower level.
+      }
+    }
+    throw new Error('Failed to generate QR code: capacity overflow at all error-correction levels');
   }
 
   async createClient({ name }) {
