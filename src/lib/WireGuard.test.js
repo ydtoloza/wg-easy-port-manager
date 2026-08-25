@@ -768,6 +768,31 @@ describe('WireGuard', () => {
       expect(clients[0].endpoint).toBeNull();
       expect(clients[0].latestHandshakeAt).toBeNull();
     });
+
+    it('merges matched entries linearly and ignores unknown dump peers', async () => {
+      await wg.getConfig();
+      const unknownPeer = [
+        KEYS.client2Public, KEYS.preShared, '203.0.113.10:51820', '10.8.0.9/32',
+        String(Math.floor(Date.now() / 1000) - 10), '5', '6', '25',
+      ].join('\t');
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
+          return `server-line\n${dumpLine({ handshakeSecondsAgo: 10 })}\n${unknownPeer}`;
+        }
+        return '';
+      });
+      const clients = await wg.getClients();
+      // The unknown public key contributes nothing: same array, same shape,
+      // no phantom client.
+      expect(clients).toHaveLength(1);
+      expect(clients[0].id).toBe('client1');
+      // The matched entry is fully populated from its dump line.
+      expect(clients[0].online).toBe(true);
+      expect(clients[0].endpoint).toBe('203.0.113.9:51820');
+      expect(clients[0].transferRx).toBe(1000);
+      expect(clients[0].transferTx).toBe(2000);
+      expect(clients[0].persistentKeepalive).toBe('0');
+    });
   });
 
   describe('per-peer persistentKeepalive', () => {

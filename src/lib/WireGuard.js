@@ -877,6 +877,9 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
         const dump = await Util.exec('wg show wg0 dump', {
           log: false,
         });
+        // Linear merge (upstream 52fb584): index clients by public key once
+        // instead of rescanning the array for every dump entry.
+        const clientsByPublicKey = new Map(clients.map((client) => [client.publicKey, client]));
         dump
           .trim()
           .split('\n')
@@ -893,7 +896,7 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
               persistentKeepalive,
             ] = line.split('\t');
 
-            const client = clients.find((c) => c.publicKey === publicKey);
+            const client = clientsByPublicKey.get(publicKey);
             if (!client) return;
 
             client.latestHandshakeAt = latestHandshakeAt === '0'
