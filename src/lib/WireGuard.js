@@ -41,6 +41,7 @@ const {
   WG_NFT_MASQUERADE,
   WG_SEED_TUNING,
   ALLOW_INSECURE_WEBHOOK,
+  ALLOW_PRIVATE_WEBHOOK,
 } = require('../config');
 
 const WIREGUARD_KEY_RE = /^[A-Za-z0-9+/]{43}=$/;
@@ -338,9 +339,6 @@ module.exports = class WireGuard {
     await this.__syncDirectory();
     this.__settingsRecoveryPending = false;
     this.__settingsRecoveryConfig = null;
-    this.__webhookConfig = null;
-    this.__eventSeq = null;
-    this.__probeState = new Map(); // key: `${clientId}:${ruleKey}` -> { lastAt, inFlight }
   }
 
   async __buildConfig() {
@@ -841,30 +839,38 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
     // half-applied (or later rolled-back) in-memory state.
     return this.__withMutation(async () => {
       const config = await this.getConfig();
-      const clients = Object.entries(config.clients).map(([clientId, client]) => ({
-        id: clientId,
-        name: client.name,
-        enabled: client.enabled,
-        address: client.address,
-        publicKey: client.publicKey,
-        createdAt: new Date(client.createdAt),
-        updatedAt: new Date(client.updatedAt),
-        allowedIPs: client.allowedIPs || [`${client.address}/32`, (this.__serverSettings.enableIpv6 && client.addressV6 ? `${client.addressV6}/128` : null)].filter(Boolean),
-        addressV6: client.addressV6,
-        portForwards: Array.isArray(client.portForwards)
-          ? client.portForwards.map((rule) => ({ ...rule }))
-          : [],
-        networkPolicy: this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false }),
-        downloadableConfig: 'privateKey' in client && client.privateKey != null,
-        persistentKeepalive: null,
-        latestHandshakeAt: null,
-        endpoint: null,
-        // A handshake within 3x the effective keepalive (or 3x 180s when no
-        // keepalive is configured) means the peer is reachable right now.
-        online: false,
-        transferRx: null,
-        transferTx: null,
-      }));
+      // Stored per-peer overrides, snapshotted before dump parsing: the wg
+      // dump reports the SERVER-side keepalive (typically 0), not the value
+      // the peer itself was told to use, so the online window must resolve
+      // from this snapshot.
+      const storedKeepalives = new Map();
+      const clients = Object.entries(config.clients).map(([clientId, client]) => {
+        storedKeepalives.set(clientId, client.persistentKeepalive ?? null);
+        return {
+          id: clientId,
+          name: client.name,
+          enabled: client.enabled,
+          address: client.address,
+          publicKey: client.publicKey,
+          createdAt: new Date(client.createdAt),
+          updatedAt: new Date(client.updatedAt),
+          allowedIPs: client.allowedIPs || [`${client.address}/32`, (this.__serverSettings.enableIpv6 && client.addressV6 ? `${client.addressV6}/128` : null)].filter(Boolean),
+          addressV6: client.addressV6,
+          portForwards: Array.isArray(client.portForwards)
+            ? client.portForwards.map((rule) => ({ ...rule }))
+            : [],
+          networkPolicy: this.__normalizeNetworkPolicy(client.networkPolicy, { strict: false }),
+          downloadableConfig: 'privateKey' in client && client.privateKey != null,
+          persistentKeepalive: null,
+          latestHandshakeAt: null,
+          endpoint: null,
+          // A handshake within 3x the effective keepalive (or 3x 180s when no
+          // keepalive is configured) means the peer is reachable right now.
+          online: false,
+          transferRx: null,
+          transferTx: null,
+        };
+      });
 
       // Loop WireGuard status
       try {
@@ -905,7 +911,7 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
       const now = Date.now();
       for (const client of clients) {
         if (!client.latestHandshakeAt) continue;
-        const effectiveKeepalive = Number(this.__serverSettings.persistentKeepalive) || 180;
+        const effectiveKeepalive = this.__effectiveKeepalive(storedKeepalives.get(client.id));
         const onlineWindowMs = 3 * effectiveKeepalive * 1000;
         client.online = (now - client.latestHandshakeAt.getTime()) < onlineWindowMs;
       }
@@ -1176,39 +1182,46 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
   // Constant-time lookup: every client's stored hash is compared (no early
   // exit), with timingSafeEqual over equal-length buffers. Returns the owning
-  // clientId or null.
+  // clientId or null. Snapshot read behind the mutation queue (same family as
+  // getClients): a lookup must never observe half-applied or rolled-back
+  // state — e.g. a revoke racing this very check.
   async lookupPeerToken(token) {
     if (typeof token !== 'string' || !/^wgpt_[0-9a-f]{64}$/.test(token)) return null;
     const presented = Buffer.from(sha256Hex(token), 'hex');
-    const config = await this.getConfig();
-    let match = null;
-    for (const client of Object.values(config.clients)) {
-      if (!TOKEN_HASH_RE.test(client.tokenHash || '')) continue;
-      const stored = Buffer.from(client.tokenHash, 'hex');
-      if (presented.length === stored.length && crypto.timingSafeEqual(presented, stored)) {
-        match = client.id;
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      let match = null;
+      for (const client of Object.values(config.clients)) {
+        if (!TOKEN_HASH_RE.test(client.tokenHash || '')) continue;
+        const stored = Buffer.from(client.tokenHash, 'hex');
+        if (presented.length === stored.length && crypto.timingSafeEqual(presented, stored)) {
+          match = client.id;
+        }
       }
-    }
-    return match;
+      return match;
+    });
   }
 
   // Dedicated serializer for /api/peer/me — NEVER spread the raw client
   // (privateKey/preSharedKey/tokenHash must not leak to token holders).
+  // Snapshot read behind the mutation queue, like getClients.
   async getPeerProfile({ clientId }) {
-    const config = await this.getConfig();
-    const client = config.clients[clientId];
-    if (!client) throw new ServerError(`Client Not Found: ${clientId}`, 404);
-    return {
-      id: client.id,
-      name: client.name,
-      address: client.address,
-      addressV6: client.addressV6,
-      portForwards: (Array.isArray(client.portForwards) ? client.portForwards : [])
-        .map((rule) => ({ ...rule })),
-      permissions: {
-        selfManagePorts: client.selfManagePorts === true,
-      },
-    };
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      const client = config.clients[clientId];
+      if (!client) throw new ServerError(`Client Not Found: ${clientId}`, 404);
+      return {
+        id: client.id,
+        name: client.name,
+        address: client.address,
+        addressV6: client.addressV6,
+        portForwards: (Array.isArray(client.portForwards) ? client.portForwards : [])
+          .map((rule) => ({ ...rule })),
+        permissions: {
+          selfManagePorts: client.selfManagePorts === true,
+        },
+      };
+    });
   }
 
   async setClientSelfManagePorts({ clientId, enabled }) {
@@ -1240,8 +1253,13 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     try {
       const raw = await fs.readFile(path.join(WG_PATH, 'webhook.json'), 'utf8');
       const parsed = JSON.parse(raw);
+      const target = isPlainObject(parsed) && typeof parsed.url === 'string'
+        ? new URL(parsed.url)
+        : null;
       this.__webhookConfig = isPlainObject(parsed)
         && typeof parsed.url === 'string'
+        && !target.username
+        && !target.password
         && (parsed.secret === undefined || typeof parsed.secret === 'string')
         ? { url: parsed.url, secret: parsed.secret ?? '' }
         : null;
@@ -1255,9 +1273,16 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
   async getWebhookConfig() {
     await this.getConfig();
+    let url = null;
+    try {
+      const target = this.__webhookConfig && new URL(this.__webhookConfig.url);
+      if (target && !target.username && !target.password) url = target.toString();
+    } catch {
+      // Invalid legacy sidecars remain disabled and are never reflected.
+    }
     return {
-      configured: !!(this.__webhookConfig && this.__webhookConfig.url),
-      url: (this.__webhookConfig && this.__webhookConfig.url) || null,
+      configured: !!url,
+      url,
     };
   }
 
@@ -1272,6 +1297,9 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
           parsed = new URL(url);
         } catch {
           throw new ServerError('Invalid webhook url', 400);
+        }
+        if (parsed.username || parsed.password) {
+          throw new ServerError('Webhook url must not include credentials', 400);
         }
         if (parsed.protocol !== 'https:' && !(ALLOW_INSECURE_WEBHOOK && parsed.protocol === 'http:')) {
           throw new ServerError('Webhook url must be https:// (or http:// with ALLOW_INSECURE_WEBHOOK=true)', 400);
@@ -1329,7 +1357,11 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     };
     Webhook.deliver(
       {
-        url: webhook.url, secret: webhook.secret, body: JSON.stringify(payload), allowInsecure: !!ALLOW_INSECURE_WEBHOOK,
+        url: webhook.url,
+        secret: webhook.secret,
+        body: JSON.stringify(payload),
+        allowInsecure: !!ALLOW_INSECURE_WEBHOOK,
+        allowPrivate: !!ALLOW_PRIVATE_WEBHOOK,
       },
     ).then((delivered) => {
       if (!delivered) debug(`webhook event ${payload.event} seq=${seq} dropped after retries`);
@@ -1574,8 +1606,17 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       throw err;
     }
 
-    // Single funnel for port events: only reached on the success path.
-    if (event) await this.__emitPortEvent(event);
+    // Single funnel for port events: only reached on the success path. The
+    // events sidecar is auxiliary bookkeeping: a failure here must never
+    // surface as a request error after DNAT+config already committed (a
+    // client retry would then hit a 409), so it is debug-logged and swallowed.
+    if (event) {
+      try {
+        await this.__emitPortEvent(event);
+      } catch (err) {
+        debug(`webhook emit skipped: ${err.message}`);
+      }
+    }
   }
 
   async __transactionalDnatChange(mutate, rollback, context = 'dnat-change', options = {}) {
@@ -1904,10 +1945,16 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     });
   }
 
+  // Client-over-global keepalive resolution for reachability windows. Values
+  // above the fallback cannot make stale handshakes look fresh indefinitely.
+  __effectiveKeepalive(storedKeepalive) {
+    const resolved = storedKeepalive != null ? storedKeepalive : this.__serverSettings.persistentKeepalive;
+    return Math.min(Number(resolved) || 180, 180);
+  }
+
   __peerTunnelUp(client) {
     const now = Date.now();
-    const effectiveKeepalive = Number(this.__serverSettings.persistentKeepalive) || 180;
-    const onlineWindowMs = 3 * effectiveKeepalive * 1000;
+    const onlineWindowMs = 3 * this.__effectiveKeepalive(client.storedKeepalive ?? null) * 1000;
     return now - client.latestHandshakeAt.getTime() < onlineWindowMs;
   }
 
@@ -1957,17 +2004,24 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
           .find((line) => line.split('\t')[0] === client.publicKey);
         const handshake = peerLine ? Number(peerLine.split('\t')[4]) : 0;
         if (handshake > 0) {
-          tunnelUp = this.__peerTunnelUp({ latestHandshakeAt: new Date(handshake * 1000) });
+          tunnelUp = this.__peerTunnelUp({
+            latestHandshakeAt: new Date(handshake * 1000),
+            storedKeepalive: client.persistentKeepalive,
+          });
         }
       } catch (err) {
         debug(`Probe: could not read wg dump: ${err.message}`);
       }
 
-      const tcpConnectable = await this.__tcpConnect(this.__serverSettings.host, snapshot.extPort);
+      const tcpConnectable = snapshot.proto === 'udp'
+        ? null
+        : await this.__tcpConnect(this.__serverSettings.host, snapshot.extPort);
 
       let verdict;
       if (!isPresent) {
         verdict = tcpConnectable ? 'dnat-local' : 'rule-missing';
+      } else if (snapshot.proto === 'udp') {
+        verdict = 'indeterminate';
       } else if (!tunnelUp) {
         verdict = tcpConnectable ? 'dnat-local' : 'tunnel-down';
       } else {
@@ -1993,8 +2047,26 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     }
   }
 
-  async addPortForward(clientId, proto, extPort, intPort) {
-    return this.__withMutation(() => this.__addPortForward(clientId, proto, extPort, intPort));
+  // Internal, queue-context-only guard: enforces selfManagePorts from the
+  // state the queued operation is about to mutate. The route-level pre-check
+  // happens outside the queue; a revoke landing between that check and this
+  // execution must still reject (TOCTOU closure). Never call the public
+  // getPeerProfile here — wrappers re-entering __withMutation are rejected.
+  __assertSelfManagePorts(clientId) {
+    const client = this.__config ? this.__config.clients[clientId] : null;
+    if (!client || client.selfManagePorts !== true) {
+      throw new ServerError('Self port management is disabled for this peer', 403);
+    }
+  }
+
+  async addPortForward(clientId, proto, extPort, intPort, { requireSelfManagePorts = false } = {}) {
+    return this.__withMutation(async () => {
+      if (requireSelfManagePorts) {
+        await this.getConfig();
+        this.__assertSelfManagePorts(clientId);
+      }
+      return this.__addPortForward(clientId, proto, extPort, intPort);
+    });
   }
 
   // Stable-id addressing: resolve the rule id to its index INSIDE the queued
@@ -2184,31 +2256,54 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         client.portForwards.splice(index, 0, ruleToRemove);
       },
       'remove-port-forward',
+      {
+        event: {
+          type: 'port.deleted',
+          clientId,
+          proto: ruleToRemove.proto,
+          extPort: ruleToRemove.extPort,
+          intPort: ruleToRemove.intPort,
+        },
+      },
     );
   }
 
   // Resolve a rule reference (stable id or legacy numeric index) to its index
   // INSIDE the queued operation, so sibling mutations cannot shift it.
-  async removePortForwardByRuleId(clientId, ruleId) {
-    return this.__withMutation(async () => this.__removePortForward(clientId, this.__resolveRuleIndex(clientId, ruleId)));
+  async removePortForwardByRuleId(clientId, ruleId, { requireSelfManagePorts = false } = {}) {
+    return this.__withMutation(async () => {
+      if (requireSelfManagePorts) {
+        await this.getConfig();
+        this.__assertSelfManagePorts(clientId);
+      }
+      return this.__removePortForward(clientId, this.__resolveRuleIndex(clientId, ruleId));
+    });
   }
 
-  async updatePortForwardByRuleId(clientId, ruleId, proto, extPort, intPort) {
-    return this.__withMutation(async () => this.__updatePortForward(
-      clientId,
-      this.__resolveRuleIndex(clientId, ruleId),
-      proto,
-      extPort,
-      intPort,
-    ));
+  async updatePortForwardByRuleId(clientId, ruleId, proto, extPort, intPort, { requireSelfManagePorts = false } = {}) {
+    return this.__withMutation(async () => {
+      if (requireSelfManagePorts) {
+        await this.getConfig();
+        this.__assertSelfManagePorts(clientId);
+      }
+      return this.__updatePortForward(
+        clientId,
+        this.__resolveRuleIndex(clientId, ruleId),
+        proto,
+        extPort,
+        intPort,
+      );
+    });
   }
 
+  // Resolve a rule id to its index INSIDE the queued operation, so sibling
+  // mutations cannot shift it. Id-only by design: this serves the peer-facing
+  // ByRuleId methods, where a digit string must never degrade into positional
+  // addressing (routes pre-check Util.isValidRuleId; the admin legacy index
+  // routes go through removePortForward/updatePortForward instead).
   __resolveRuleIndex(clientId, ruleId) {
     const client = this.__config ? this.__config.clients[clientId] : null;
     const rules = client && Array.isArray(client.portForwards) ? client.portForwards : [];
-    if (/^\d+$/.test(String(ruleId))) {
-      return Number(ruleId);
-    }
     const index = rules.findIndex((rule) => rule && rule.id === ruleId);
     if (index === -1) throw new ServerError('Port forward rule not found', 404);
     return index;

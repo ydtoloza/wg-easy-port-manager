@@ -441,7 +441,11 @@
 
               <!-- Port Forwards Section -->
               <div class="border-t border-gray-100 dark:border-neutral-600 bg-gray-50/50 dark:bg-neutral-800/30">
-                <div class="flex items-center justify-between px-4 py-3 cursor-pointer select-none hover:bg-gray-50 dark:hover:bg-neutral-700/50 transition-colors" @click="togglePfExpanded(client.id)">
+                <button type="button"
+                  class="flex items-center justify-between w-full px-4 py-3 text-left select-none hover:bg-gray-50 dark:hover:bg-neutral-700/50 transition-colors"
+                  :aria-expanded="isPfExpanded(client.id) ? 'true' : 'false'"
+                  :aria-controls="'port-forwards-' + client.id"
+                  @click="togglePfExpanded(client.id)">
                   <div class="flex items-center gap-3">
                     <div class="p-1.5 rounded-md bg-gray-100 dark:bg-neutral-700 text-gray-500 dark:text-neutral-400">
                       <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -454,11 +458,20 @@
                   <svg class="w-4 h-4 text-gray-400 dark:text-neutral-500 transition-transform duration-200" :class="{ 'rotate-180': isPfExpanded(client.id) }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
                   </svg>
-                </div>
+                </button>
 
-                <div v-show="isPfExpanded(client.id)" class="px-4 pb-4">
+                <div v-show="isPfExpanded(client.id)" :id="'port-forwards-' + client.id" class="px-4 pb-4">
+                  <!-- Kill-switch banner: rules stay visible but inactive -->
+                  <div v-if="!forwardingEnabled"
+                    class="mb-3 flex items-start gap-2 px-3 py-2 rounded-lg border border-amber-300/70 dark:border-amber-700/50 bg-amber-50 dark:bg-amber-900/20 text-xs font-medium text-amber-700 dark:text-amber-400">
+                    <svg class="w-4 h-4 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                    </svg>
+                    <span>{{$t("networkPolicy.forwardingDisabledBanner")}}</span>
+                  </div>
                   <!-- Existing Rules -->
-                  <div class="space-y-2 mb-4" v-if="client.portForwards && client.portForwards.length > 0">
+                  <div class="space-y-2 mb-4" v-if="client.portForwards && client.portForwards.length > 0"
+                    :class="{ 'opacity-50': !forwardingEnabled }" :aria-disabled="!forwardingEnabled">
                     <div class="grid grid-cols-[auto_1fr_auto_1fr_auto] gap-2 items-center px-3 py-2 text-xs font-medium text-gray-500 dark:text-neutral-400 uppercase tracking-wider">
                       <span>Protocol</span>
                       <span>External Port</span>
@@ -482,30 +495,30 @@
                         <span class="font-mono text-sm text-gray-800 dark:text-neutral-200">{{ rule.extPort }}</span>
                         <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3" /></svg>
                         <span class="font-mono text-sm text-gray-800 dark:text-neutral-200">{{ rule.intPort }}</span>
-                        <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity justify-end">
-                          <button @click="editPortForward(client, index)" class="p-1.5 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30 rounded-md transition-colors" title="Edit">
+                        <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity justify-end">
+                          <button type="button" @click="editPortForward(client, index)" :disabled="!forwardingEnabled" class="p-1.5 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30 disabled:cursor-not-allowed rounded-md transition-colors" title="Edit">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
                           </button>
-                          <button @click="removePortForward(client, index)" class="p-1.5 text-gray-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-md transition-colors" title="Delete">
+                          <button type="button" @click="removePortForward(client, index)" :disabled="!forwardingEnabled" class="p-1.5 text-gray-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30 disabled:cursor-not-allowed rounded-md transition-colors" title="Delete">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
                           </button>
                         </div>
                       </template>
                       <!-- Edit Mode -->
                       <template v-else>
-                        <select v-model="editingPfRule.proto" class="text-xs font-bold text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-300 dark:border-neutral-500 rounded-md px-2 py-1.5 focus:ring-2 focus:ring-red-800 outline-none">
+                        <select v-model="editingPfRule.proto" :disabled="!forwardingEnabled" class="text-xs font-bold text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-300 dark:border-neutral-500 rounded-md px-2 py-1.5 focus:ring-2 focus:ring-red-800 disabled:cursor-not-allowed outline-none">
                           <option value="tcp" class="bg-white dark:bg-neutral-800">TCP</option>
                           <option value="udp" class="bg-white dark:bg-neutral-800">UDP</option>
                           <option value="both" class="bg-white dark:bg-neutral-800">TCP + UDP</option>
                         </select>
-                        <input v-model.number="editingPfRule.extPort" type="number" class="font-mono text-sm text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-300 dark:border-neutral-500 rounded-md px-2 py-1.5 focus:ring-2 focus:ring-red-800 outline-none w-full" />
+                        <input v-model.number="editingPfRule.extPort" type="number" :disabled="!forwardingEnabled" class="font-mono text-sm text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-300 dark:border-neutral-500 rounded-md px-2 py-1.5 focus:ring-2 focus:ring-red-800 disabled:cursor-not-allowed outline-none w-full" />
                         <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3" /></svg>
-                        <input v-model.number="editingPfRule.intPort" type="number" class="font-mono text-sm text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-300 dark:border-neutral-500 rounded-md px-2 py-1.5 focus:ring-2 focus:ring-red-800 outline-none w-full" />
+                        <input v-model.number="editingPfRule.intPort" type="number" :disabled="!forwardingEnabled" class="font-mono text-sm text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-300 dark:border-neutral-500 rounded-md px-2 py-1.5 focus:ring-2 focus:ring-red-800 disabled:cursor-not-allowed outline-none w-full" />
                         <div class="flex items-center gap-1 justify-end">
-                          <button @click="updatePortForward(client)" class="p-1.5 text-green-600 hover:bg-green-50 dark:hover:bg-green-900/30 rounded-md transition-colors" title="Save">
+                          <button type="button" @click="updatePortForward(client)" :disabled="!forwardingEnabled" class="p-1.5 text-green-600 hover:bg-green-50 dark:hover:bg-green-900/30 disabled:opacity-50 disabled:cursor-not-allowed rounded-md transition-colors" title="Save">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg>
                           </button>
-                          <button @click="cancelEditPortForward()" class="p-1.5 text-gray-500 hover:bg-gray-100 dark:hover:bg-neutral-600 rounded-md transition-colors" title="Cancel">
+                          <button type="button" @click="cancelEditPortForward()" class="p-1.5 text-gray-500 hover:bg-gray-100 dark:hover:bg-neutral-600 rounded-md transition-colors" title="Cancel">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
                           </button>
                         </div>
@@ -514,17 +527,18 @@
                   </div>
 
                   <!-- Add New Rule -->
-                  <div class="bg-white dark:bg-neutral-700/50 p-3 rounded-lg border border-dashed border-gray-300 dark:border-neutral-600">
+                  <div class="bg-white dark:bg-neutral-700/50 p-3 rounded-lg border border-dashed border-gray-300 dark:border-neutral-600"
+                    :class="{ 'opacity-50': !forwardingEnabled }" :aria-disabled="!forwardingEnabled">
                     <div class="flex flex-wrap sm:flex-nowrap items-center gap-2">
-                      <select v-model="newPf[client.id].proto" class="text-xs font-bold text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 outline-none flex-shrink-0">
+                      <select v-model="newPf[client.id].proto" :disabled="!forwardingEnabled" class="text-xs font-bold text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 disabled:cursor-not-allowed outline-none flex-shrink-0">
                         <option value="tcp" class="bg-white dark:bg-neutral-800">TCP</option>
                         <option value="udp" class="bg-white dark:bg-neutral-800">UDP</option>
                         <option value="both" class="bg-white dark:bg-neutral-800">TCP + UDP</option>
                       </select>
-                      <input v-model.number="newPf[client.id].extPort" type="number" placeholder="External Port (e.g. 8080)" @input="pfError = null" :class="{'border-red-500 ring-2 ring-red-500/20': isPortConflicting(client)}" class="text-sm font-mono text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 outline-none flex-grow min-w-[100px]" />
+                      <input v-model.number="newPf[client.id].extPort" type="number" :disabled="!forwardingEnabled" placeholder="External Port (e.g. 8080)" @input="pfError = null" :class="{'border-red-500 ring-2 ring-red-500/20': isPortConflicting(client)}" class="text-sm font-mono text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 disabled:cursor-not-allowed outline-none flex-grow min-w-[100px]" />
                       <svg class="w-4 h-4 text-gray-400 flex-shrink-0 hidden sm:block" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3" /></svg>
-                      <input v-model.number="newPf[client.id].intPort" type="number" placeholder="Internal Port (e.g. 80)" class="text-sm font-mono text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 outline-none flex-grow min-w-[100px]" />
-                      <button @click="addPortForward(client)" class="flex items-center justify-center gap-2 bg-red-800 hover:bg-red-700 text-white font-medium text-sm px-4 py-2 rounded-md shadow-sm transition-colors flex-shrink-0 w-full sm:w-auto mt-2 sm:mt-0">
+                      <input v-model.number="newPf[client.id].intPort" type="number" :disabled="!forwardingEnabled" placeholder="Internal Port (e.g. 80)" class="text-sm font-mono text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 disabled:cursor-not-allowed outline-none flex-grow min-w-[100px]" />
+                      <button type="button" @click="addPortForward(client)" :disabled="!forwardingEnabled" class="flex items-center justify-center gap-2 bg-red-800 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium text-sm px-4 py-2 rounded-md shadow-sm transition-colors flex-shrink-0 w-full sm:w-auto mt-2 sm:mt-0">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>
                         Add Rule
                       </button>
@@ -925,8 +939,8 @@
                 </div>
               </div>
               <div class="bg-gray-50 dark:bg-neutral-600 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
-                <button type="button" @click="confirmRemovePortForward()"
-                  class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-red-600 dark:bg-red-600 text-base font-medium text-white dark:text-white hover:bg-red-700 dark:hover:bg-red-700 focus:outline-none sm:ml-3 sm:w-auto sm:text-sm transition-colors">
+                <button type="button" @click="confirmRemovePortForward()" :disabled="!forwardingEnabled"
+                  class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-red-600 dark:bg-red-600 text-base font-medium text-white dark:text-white hover:bg-red-700 dark:hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none sm:ml-3 sm:w-auto sm:text-sm transition-colors">
                   Eliminar Regla
                 </button>
                 <button type="button" @click="pfDelete = null"
@@ -1012,6 +1026,13 @@
                           <input type="number" v-model="serverConfigEdit.persistentKeepalive"
                             class="rounded p-2 border-2 dark:bg-neutral-600 dark:text-neutral-200 border-gray-100 dark:border-neutral-500 focus:border-red-800 dark:focus:border-red-700 outline-none w-full text-sm" />
                         </div>
+                      </div>
+                      <div>
+                        <label class="flex items-center gap-2 block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider cursor-pointer">
+                          <input type="checkbox" v-model="serverConfigEdit.forwardingEnabled" class="rounded text-red-800 focus:ring-red-800 border-gray-300 dark:border-neutral-600 dark:bg-neutral-700" />
+                          {{$t("networkPolicy.forwardingEnabled")}}
+                        </label>
+                        <p class="mt-1 ml-6 text-xs font-normal normal-case tracking-normal text-gray-400 dark:text-neutral-500">{{$t("networkPolicy.forwardingEnabledHint")}}</p>
                       </div>
                       <div>
                         <label class="block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider">Network Device</label>
@@ -1107,7 +1128,7 @@
   <script src="./js/vendor/timeago.full.min.js"></script>
   <script src="./js/api.js"></script>
   <script src="./js/i18n.js"></script>
-  <script src="./js/app-template.generated.js?v=d50d40411463"></script>
+  <script src="./js/app-template.generated.js?v=93eb0d6ac431"></script>
   <script src="./js/app.js?v=5"></script>
 </body>
 

@@ -376,13 +376,13 @@ describe('WireGuard', () => {
   });
 
   describe('port-forward reachability probe', () => {
-    const nftTable = (present) => JSON.stringify({
+    const nftTable = (present, proto = 'tcp') => JSON.stringify({
       nftables: present ? [{
         rule: {
           family: 'ip',
           chain: 'prerouting',
           expr: [
-            { match: { left: { payload: { protocol: 'tcp', field: 'dport' } }, op: 'eq', right: 2000 } },
+            { match: { left: { payload: { protocol: proto, field: 'dport' } }, op: 'eq', right: 2000 } },
             { dnat: { family: 'ip', addr: '10.8.0.2', port: 2000 } },
           ],
         },
@@ -440,6 +440,20 @@ describe('WireGuard', () => {
       expect(verdict).toMatchObject({ rulePresent: true, tunnelUp: false, verdict: 'tunnel-down' });
     });
 
+    it('caps a large per-peer keepalive in the probe tunnel verdict', async () => {
+      const wg2b = new (require('./WireGuard'))(); // eslint-disable-line global-require
+      await wg2b.getConfig();
+      await wg2b.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 65535 });
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('nft -j list table')) return nftTable(true);
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(7200);
+        return '';
+      });
+      jest.spyOn(wg2b, '__tcpConnect').mockResolvedValue(false);
+      const verdict = await wg2b.probePortForward({ clientId: 'client1', rule: '0' });
+      expect(verdict).toMatchObject({ tunnelUp: false, verdict: 'tunnel-down' });
+    });
+
     it('derives unreachable when rule and tunnel are up but TCP fails', async () => {
       const wg3 = new (require('./WireGuard'))(); // eslint-disable-line global-require
       await wg3.getConfig();
@@ -451,6 +465,38 @@ describe('WireGuard', () => {
       jest.spyOn(wg3, '__tcpConnect').mockResolvedValue(false);
       const verdict = await wg3.probePortForward({ clientId: 'client1', rule: '0' });
       expect(verdict).toMatchObject({ rulePresent: true, tunnelUp: true, verdict: 'unreachable' });
+    });
+
+    it('does not TCP-probe UDP-only forwards and returns an indeterminate verdict', async () => {
+      await wg.getConfig();
+      wg.__config.clients.client1.portForwards[0].proto = 'udp';
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('nft -j list table')) return nftTable(true, 'udp');
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(10);
+        return '';
+      });
+      const tcpConnect = jest.spyOn(wg, '__tcpConnect');
+
+      const verdict = await wg.probePortForward({ clientId: 'client1', rule: '0' });
+
+      expect(tcpConnect).not.toHaveBeenCalled();
+      expect(verdict).toMatchObject({ rulePresent: true, tcpConnectable: null, verdict: 'indeterminate' });
+    });
+
+    it('reports a missing UDP-only DNAT rule without attempting a TCP probe', async () => {
+      await wg.getConfig();
+      wg.__config.clients.client1.portForwards[0].proto = 'udp';
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('nft -j list table')) return nftTable(false);
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(10);
+        return '';
+      });
+      const tcpConnect = jest.spyOn(wg, '__tcpConnect');
+
+      const verdict = await wg.probePortForward({ clientId: 'client1', rule: '0' });
+
+      expect(tcpConnect).not.toHaveBeenCalled();
+      expect(verdict).toMatchObject({ rulePresent: false, tcpConnectable: null, verdict: 'rule-missing' });
     });
 
     it('labels hairpin connects honestly as dnat-local', async () => {
@@ -561,6 +607,31 @@ describe('WireGuard', () => {
       expect(ruleset).not.toContain('dnat to');
     });
 
+    it('emits no DNAT when restoring a config while the switch is seeded off', async () => {
+      fs.readFile.mockImplementation(async (filename) => {
+        const name = String(filename);
+        if (name.endsWith('server-settings.json')) {
+          return JSON.stringify({ forwardingEnabled: false });
+        }
+        if (name.includes('server-settings')) {
+          const err = new Error('not found');
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return JSON.stringify(makeConfig());
+      });
+      const WireGuardClass = require('./WireGuard'); // eslint-disable-line global-require
+      const restoring = new WireGuardClass();
+      await restoring.getConfig();
+
+      await restoring.restoreConfiguration(JSON.stringify(makeConfig()));
+
+      const ruleset = Util.execFile.mock.calls.findLast((call) => call[0] === 'nft')[2].input;
+      expect(ruleset).not.toContain('dnat to');
+      // The restore path preserves the forwarding config for when it returns.
+      expect((await restoring.getConfig()).clients.client1.portForwards).toHaveLength(1);
+    });
+
     it('rejects non-boolean values', async () => {
       await expect(wg.updateServerConfig({ forwardingEnabled: 'yes' }))
         .rejects.toMatchObject({ statusCode: 400 });
@@ -618,6 +689,66 @@ describe('WireGuard', () => {
       const clients = await wg.getClients();
       // 400s ago is inside the 540s fallback window.
       expect(clients[0].online).toBe(true);
+    });
+
+    it('honors a per-peer keepalive override below the freshness cap', async () => {
+      await wg.getConfig();
+      await wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 120 });
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
+          return `server-line\n${dumpLine({ handshakeSecondsAgo: 300 })}`;
+        }
+        return '';
+      });
+      const clients = await wg.getClients();
+      // Global keepalive is 25s (75s window), while this override gives 360s.
+      expect(clients[0].online).toBe(true);
+    });
+
+    it('uses a strict capped freshness boundary', async () => {
+      await wg.getConfig();
+      await wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 65535 });
+      const now = 2_000_000_000_000;
+      const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(now);
+      let handshakeSecondsAgo = 539;
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
+          return `server-line\n${dumpLine({ handshakeSecondsAgo })}`;
+        }
+        return '';
+      });
+      expect((await wg.getClients())[0].online).toBe(true);
+      handshakeSecondsAgo = 540;
+      expect((await wg.getClients())[0].online).toBe(false);
+      nowSpy.mockRestore();
+    });
+
+    it('caps a large per-peer keepalive for multi-hour-old handshakes', async () => {
+      await wg.getConfig();
+      await wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: 65535 });
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
+          return `server-line\n${dumpLine({ handshakeSecondsAgo: 7200 })}`;
+        }
+        return '';
+      });
+      const clients = await wg.getClients();
+      expect(clients[0].online).toBe(false);
+    });
+
+    it('keeps the global window for peers without an override', async () => {
+      await wg.getConfig();
+      await wg.updateClientKeepalive({ clientId: 'client1', persistentKeepalive: null });
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) {
+          return `server-line\n${dumpLine({ handshakeSecondsAgo: 400 })}`;
+        }
+        return '';
+      });
+      const clients = await wg.getClients();
+      // No override: the global 25s setting (75s window) governs.
+      expect(clients[0].online).toBe(false);
+      expect(clients[0].persistentKeepalive).toBe('0');
     });
 
     it('treats no-handshake and (none) endpoint as offline/null', async () => {
@@ -799,6 +930,32 @@ describe('WireGuard', () => {
       expect(response.webhookSecret).toBeUndefined();
       expect(JSON.stringify(response)).not.toContain('supersecret-value');
       expect(response.host).toBe('10.0.0.1');
+    });
+
+    it('preserves active webhook state when an unrelated settings transaction commits', async () => {
+      await wg.getConfig();
+      await wg.setWebhookConfig({ url: 'https://example.test/hook', secret: 'secret' });
+
+      await wg.updateServerConfig({ host: '10.0.0.2' });
+
+      expect(await wg.getWebhookConfig()).toEqual({
+        configured: true, url: 'https://example.test/hook',
+      });
+    });
+
+    it('preserves active webhook state when an unrelated settings transaction rolls back', async () => {
+      await wg.getConfig();
+      await wg.setWebhookConfig({ url: 'https://example.test/hook', secret: 'secret' });
+      Util.execFile.mockImplementation(async (command) => {
+        if (command === 'nft') throw new Error('nft apply failed');
+        return KEYS.clientPublic;
+      });
+
+      await expect(wg.updateServerConfig({ host: '10.0.0.2' })).rejects.toThrow('nft apply failed');
+
+      expect(await wg.getWebhookConfig()).toEqual({
+        configured: true, url: 'https://example.test/hook',
+      });
     });
 
     it('keeps the recovery journal when the disk rollback fails', async () => {
@@ -1146,6 +1303,36 @@ describe('WireGuard', () => {
       const clients = await clientsPromise;
       expect(clients.find((client) => client.id === 'client1').name).toBe('client1');
     });
+
+    it('serves peer profiles and token lookups only after in-flight mutations settle', async () => {
+      await wg.getConfig();
+      const { token } = await wg.issueClientToken({ clientId: 'client1' });
+      let rejectSync;
+      const gate = new Promise((_, reject) => {
+        rejectSync = reject;
+      });
+      Util.exec.mockImplementationOnce(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('wg syncconf')) return gate;
+        return '';
+      });
+
+      // Memory holds 'renamed' while the commit stalls at wg syncconf.
+      const update = wg.updateClientName({ clientId: 'client1', name: 'renamed' });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      const profilePromise = wg.getPeerProfile({ clientId: 'client1' });
+      const lookupPromise = wg.lookupPeerToken(token);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // The commit fails and rolls back; both reads must observe the
+      // committed state, never the mid-mutation name.
+      rejectSync(new Error('sync failed'));
+      await update.catch(() => {});
+      const profile = await profilePromise;
+      expect(profile.name).toBe('client1');
+      expect(profile.portForwards).toHaveLength(1);
+      expect(await lookupPromise).toBe('client1');
+    });
   });
 
   describe('stable port-forward ids', () => {
@@ -1217,6 +1404,17 @@ describe('WireGuard', () => {
 
     it('rejects malformed rule ids before touching the queue', async () => {
       await expect(wg.removePortForwardById('client1', 'zzz')).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('never resolves digit strings positionally on the peer ByRuleId methods', async () => {
+      await wg.getConfig();
+      // "0" is not a rule id: it must miss, not edit/delete index 0.
+      await expect(wg.updatePortForwardByRuleId('client1', '0', 'tcp', 3000, 3000))
+        .rejects.toMatchObject({ statusCode: 404 });
+      await expect(wg.removePortForwardByRuleId('client1', '0'))
+        .rejects.toMatchObject({ statusCode: 404 });
+      const config = await wg.getConfig();
+      expect(config.clients.client1.portForwards[0].extPort).toBe(2000);
     });
   });
 
@@ -1348,6 +1546,30 @@ describe('WireGuard', () => {
         .rejects.toMatchObject({ statusCode: 400 });
     });
 
+    it('re-checks selfManagePorts inside the queued mutation (revoke in flight)', async () => {
+      await wg.getConfig();
+      await wg.setClientSelfManagePorts({ clientId: 'client1', enabled: true });
+      // The route-level pre-check passes on this snapshot...
+      const profile = await wg.getPeerProfile({ clientId: 'client1' });
+      expect(profile.permissions.selfManagePorts).toBe(true);
+
+      // ...then the admin revokes before the queued wrapper executes.
+      await wg.setClientSelfManagePorts({ clientId: 'client1', enabled: false });
+      await expect(wg.addPortForward('client1', 'tcp', 3000, 3000, { requireSelfManagePorts: true }))
+        .rejects.toMatchObject({ statusCode: 403 });
+
+      const ruleId = (await wg.getConfig()).clients.client1.portForwards[0].id;
+      await expect(wg.updatePortForwardByRuleId('client1', ruleId, 'tcp', 3000, 3000, { requireSelfManagePorts: true }))
+        .rejects.toMatchObject({ statusCode: 403 });
+      await expect(wg.removePortForwardByRuleId('client1', ruleId, { requireSelfManagePorts: true }))
+        .rejects.toMatchObject({ statusCode: 403 });
+      expect((await wg.getConfig()).clients.client1.portForwards).toHaveLength(1);
+
+      // The admin path stays ungated by the peer flag.
+      await expect(wg.addPortForward('client1', 'tcp', 3001, 3001))
+        .resolves.toMatchObject({ extPort: 3001 });
+    });
+
     it('migrates selfManagePorts to false and validates hashes on restore', async () => {
       await wg.getConfig();
       expect((await wg.getConfig()).clients.client1.selfManagePorts).toBe(false);
@@ -1438,6 +1660,56 @@ describe('WireGuard', () => {
       expect(config.clients.client1.portForwards).toHaveLength(2);
     });
 
+    it('swallows event-sidecar failures after the commit', async () => {
+      await wg.getConfig();
+      await wg.setWebhookConfig({ url: 'https://example.test/hook', secret: 's' });
+      Webhook.deliver.mockResolvedValue(true);
+      const writeAtomic = jest.spyOn(wg, '__writeAtomic').mockImplementation(async (filename, contents) => {
+        if (filename === 'wg0-events.json') throw new Error('events sidecar unwritable');
+        store[filename] = contents;
+      });
+
+      try {
+        // DNAT+config already committed: the caller must see success, not a
+        // raw fs rejection (a retry would then hit a 409).
+        await expect(wg.addPortForward('client1', 'tcp', 3000, 3000)).resolves.toMatchObject({ extPort: 3000 });
+        const config = await wg.getConfig();
+        expect(config.clients.client1.portForwards).toHaveLength(2);
+        // the seq never persisted, so delivery could not have started
+        expect(Webhook.deliver).not.toHaveBeenCalled();
+      } finally {
+        writeAtomic.mockRestore();
+      }
+    });
+
+    it('emits port.deleted when a forward is removed', async () => {
+      await wg.getConfig();
+      await wg.setWebhookConfig({ url: 'https://example.test/hook', secret: 's3cret' });
+      Webhook.deliver.mockImplementation(async (config) => {
+        deliveries.push(config);
+        return true;
+      });
+
+      const config = await wg.getConfig();
+      const ruleId = config.clients.client1.portForwards[0].id;
+      await wg.removePortForwardById('client1', ruleId);
+
+      expect(deliveries).toHaveLength(1);
+      const deleted = JSON.parse(deliveries[0].body);
+      expect(deleted).toMatchObject({
+        v: 1,
+        event: 'port.deleted',
+        peerId: 'client1',
+        seq: 1,
+        proto: 'tcp',
+        extPort: 2000,
+        intPort: 2000,
+      });
+      expect(deleted.previousExtPort).toBeNull();
+      expect(JSON.parse(store['wg0-events.json'])).toEqual({ client1: 1 });
+      expect((await wg.getConfig()).clients.client1.portForwards).toHaveLength(0);
+    });
+
     it('emits nothing when no webhook is configured', async () => {
       await wg.getConfig();
       await wg.addPortForward('client1', 'tcp', 3000, 3000);
@@ -1467,6 +1739,19 @@ describe('WireGuard', () => {
         .rejects.toMatchObject({ statusCode: 400 });
       await expect(wg.setWebhookConfig({ url: 'ftp://example.test/hook', secret: 's' }))
         .rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects embedded credentials and never reflects them from legacy state', async () => {
+      await wg.getConfig();
+      await expect(wg.setWebhookConfig({
+        url: 'https://user:password@example.test/hook', secret: 's',
+      })).rejects.toMatchObject({ statusCode: 400 });
+
+      wg.__webhookConfig = { url: 'https://user:password@example.test/hook', secret: 's' };
+      const status = await wg.getWebhookConfig();
+      expect(status).toEqual({ configured: false, url: null });
+      expect(JSON.stringify(status)).not.toContain('user');
+      expect(JSON.stringify(status)).not.toContain('password');
     });
   });
 });

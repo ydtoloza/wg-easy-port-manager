@@ -54,6 +54,10 @@ const messages = { // eslint-disable-line no-unused-vars
       save: 'Apply policy',
       saving: 'Applying...',
       saved: 'Network policy applied.',
+      forwardingEnabled: 'Port forwarding (external access)',
+      forwardingEnabledHint: 'Kill switch: while off, no DNAT rules are emitted. Stored forwards are preserved but unreachable from the internet.',
+      forwardingDisabledBanner: 'Port forwarding is globally disabled (kill switch). Rules are preserved and will work again once re-enabled.',
+      probeProblem: 'Reachability probe: {client} {proto}/{port} → {verdict}',
     },
   },
   ua: {
@@ -354,6 +358,10 @@ const messages = { // eslint-disable-line no-unused-vars
       save: 'Aplicar política',
       saving: 'Aplicando...',
       saved: 'Política de red aplicada.',
+      forwardingEnabled: 'Reenvío de puertos (acceso externo)',
+      forwardingEnabledHint: 'Interruptor de emergencia: mientras esté desactivado no se emiten reglas DNAT. Los reenvíos se conservan pero quedan inaccesibles desde internet.',
+      forwardingDisabledBanner: 'El reenvío de puertos está deshabilitado globalmente (interruptor de emergencia). Las reglas se conservan y volverán a funcionar al reactivarlo.',
+      probeProblem: 'Sonda de alcance: {client} {proto}/{port} → {verdict}',
     },
   },
   ko: {

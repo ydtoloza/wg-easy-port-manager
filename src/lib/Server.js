@@ -55,31 +55,44 @@ const MAX_LOGIN_BUCKETS = 10000;
 // slots and lock out every other admin. The total cap only bounds CPU.
 const MAX_ACTIVE_PASSWORD_CHECKS_PER_IP = 8;
 const MAX_ACTIVE_PASSWORD_CHECKS_TOTAL = 64;
+const MAX_ACTIVE_PEER_TOKEN_CHECKS_PER_IP = 16;
+const MAX_ACTIVE_PEER_TOKEN_CHECKS_TOTAL = 128;
 const SESSION_COOKIE_NAME = 'connect.sid';
 
 // In-memory login rate limiter (key: client IP)
 const loginAttempts = new Map();
+// Dedicated peer-token table: flooding random wgpt_ tokens must not evict
+// admin-IP failure counters (lockout-counter evasion) from the shared
+// oldest-first eviction, nor consume the admin table's capacity.
+const peerTokenAttempts = new Map();
 let activePasswordChecksTotal = 0;
+let activePeerTokenChecksTotal = 0;
+const activePeerTokenChecksByIp = new Map();
 
-const getLoginAttempt = (key) => {
+const getAttemptEntry = (table, key) => {
   const now = Date.now();
-  const entry = loginAttempts.get(key);
+  const entry = table.get(key);
   if (entry && entry.resetAt <= now) {
-    loginAttempts.delete(key);
+    table.delete(key);
     return null;
   }
   return entry || null;
 };
 
-const beginPasswordCheck = (key) => {
-  let entry = getLoginAttempt(key);
+const getOrCreateAttemptEntry = (table, key, maxBuckets) => {
+  let entry = getAttemptEntry(table, key);
   if (!entry) {
-    if (loginAttempts.size >= MAX_LOGIN_BUCKETS) {
-      loginAttempts.delete(loginAttempts.keys().next().value);
+    if (table.size >= maxBuckets) {
+      table.delete(table.keys().next().value);
     }
     entry = { failures: 0, pending: 0, resetAt: Date.now() + LOGIN_WINDOW_MS };
-    loginAttempts.set(key, entry);
+    table.set(key, entry);
   }
+  return entry;
+};
+
+const beginPasswordCheck = (key) => {
+  const entry = getOrCreateAttemptEntry(loginAttempts, key, MAX_LOGIN_BUCKETS);
   if (entry.failures + entry.pending >= LOGIN_MAX_ATTEMPTS) return false;
   if (entry.pending >= MAX_ACTIVE_PASSWORD_CHECKS_PER_IP) return false;
   if (activePasswordChecksTotal >= MAX_ACTIVE_PASSWORD_CHECKS_TOTAL) return false;
@@ -98,11 +111,40 @@ const completePasswordCheck = (key, valid) => {
   if (entry.pending === 0 && entry.failures === 0) loginAttempts.delete(key);
 };
 
+const MAX_PEER_TOKEN_BUCKETS = 10000;
+const beginPeerTokenCheck = (key, ip) => {
+  const entry = getOrCreateAttemptEntry(peerTokenAttempts, key, MAX_PEER_TOKEN_BUCKETS);
+  const activeForIp = activePeerTokenChecksByIp.get(ip) || 0;
+  if (entry.failures + entry.pending >= LOGIN_MAX_ATTEMPTS) return false;
+  if (activeForIp >= MAX_ACTIVE_PEER_TOKEN_CHECKS_PER_IP) return false;
+  if (activePeerTokenChecksTotal >= MAX_ACTIVE_PEER_TOKEN_CHECKS_TOTAL) return false;
+  entry.pending += 1;
+  activePeerTokenChecksByIp.set(ip, activeForIp + 1);
+  activePeerTokenChecksTotal += 1;
+  return true;
+};
+
+const completePeerTokenCheck = (key, ip, valid) => {
+  activePeerTokenChecksTotal = Math.max(0, activePeerTokenChecksTotal - 1);
+  const activeForIp = Math.max(0, (activePeerTokenChecksByIp.get(ip) || 0) - 1);
+  if (activeForIp === 0) activePeerTokenChecksByIp.delete(ip);
+  else activePeerTokenChecksByIp.set(ip, activeForIp);
+
+  const entry = peerTokenAttempts.get(key);
+  if (!entry) return;
+  entry.pending = Math.max(0, entry.pending - 1);
+  if (valid) entry.failures = 0;
+  else entry.failures += 1;
+  if (entry.pending === 0 && entry.failures === 0) peerTokenAttempts.delete(key);
+};
+
 setInterval(() => {
   const now = Date.now();
-  for (const [key, entry] of loginAttempts) {
-    if (entry.resetAt <= now) {
-      loginAttempts.delete(key);
+  for (const table of [loginAttempts, peerTokenAttempts]) {
+    for (const [key, entry] of table) {
+      if (entry.resetAt <= now) {
+        table.delete(key);
+      }
     }
   }
 }, LOGIN_WINDOW_MS).unref();
@@ -117,6 +159,30 @@ const getClientIp = (req) => {
     if (isIP(candidate)) return candidate;
   }
   return peer;
+};
+
+const classifyPeerPath = (url) => {
+  const rawPathname = url.split('?')[0];
+  const asciiDecodedPathname = rawPathname.replace(/%([0-9a-f]{2})/gi, (escape, hex) => {
+    const value = Number.parseInt(hex, 16);
+    return value < 128 ? String.fromCharCode(value) : escape;
+  });
+  let pathname;
+  try {
+    pathname = decodeURIComponent(rawPathname);
+  } catch {
+    return {
+      isPeerPath: asciiDecodedPathname === '/api/peer/me'
+        || asciiDecodedPathname.startsWith('/api/peer/me/')
+        || asciiDecodedPathname.startsWith('/api/peer/'),
+      malformed: true,
+    };
+  }
+
+  const isPeerPath = pathname === '/api/peer/me' || pathname.startsWith('/api/peer/me/');
+  if (!isPeerPath) return { isPeerPath: false, malformed: false };
+  const hasDotSegment = pathname.split('/').some((segment) => segment === '.' || segment === '..');
+  return { isPeerPath: true, malformed: hasDotSegment || pathname.includes('//') };
 };
 
 // Count bytes while streaming so oversized bodies are never fully buffered.
@@ -416,8 +482,17 @@ module.exports = class Server {
     // under it without a valid Bearer peer token is rejected here.
     app.use(
       fromNodeMiddleware(async (req, res, next) => {
-        const isPeerPath = req.url === '/api/peer/me' || req.url.startsWith('/api/peer/me/');
+        const { isPeerPath, malformed } = classifyPeerPath(req.url);
         if (!isPeerPath) return next();
+
+        // Decode once for the same route identity h3 uses, but fail closed on
+        // invalid escapes and explicit dot segments before authentication.
+        if (malformed) {
+          res.statusCode = 400;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: 'Invalid peer path' }));
+          return;
+        }
 
         const auth = req.headers['authorization'];
         const token = typeof auth === 'string' && auth.startsWith('Bearer wgpt_')
@@ -430,11 +505,13 @@ module.exports = class Server {
           return;
         }
 
-        // Separate rate-limit buckets keyed by token-hash prefix: these must
-        // not share buckets with admin logins (success resets shared counters
-        // and would enable lockout evasion).
+        // Separate rate-limit buckets keyed by token-hash prefix: these live
+        // in a dedicated table so token floods can neither share buckets
+        // with admin logins (success resets would enable lockout evasion)
+        // nor evict admin failure counters.
         const bucket = `peer-token:${sha256Hex(`wgpt_${token}`).slice(0, 16)}`;
-        if (!beginPasswordCheck(bucket)) {
+        const ip = getClientIp(req);
+        if (!beginPeerTokenCheck(bucket, ip)) {
           res.statusCode = 429;
           res.setHeader('Content-Type', 'application/json');
           res.end(JSON.stringify({ error: 'Too many attempts, try again later' }));
@@ -444,7 +521,7 @@ module.exports = class Server {
         try {
           clientId = await WireGuard.lookupPeerToken(`wgpt_${token}`);
         } finally {
-          completePasswordCheck(bucket, clientId !== null);
+          completePeerTokenCheck(bucket, ip, clientId !== null);
         }
         if (!clientId) {
           res.statusCode = 401;
@@ -466,8 +543,9 @@ module.exports = class Server {
           return next();
         }
 
-        // Scoped peer endpoints authenticate against their own gate above.
-        if (req.url === '/api/peer/me' || req.url.startsWith('/api/peer/me/')) {
+        // Use the same decoded route identity as the peer-token gate so an
+        // encoded path cannot fall through into password authentication.
+        if (classifyPeerPath(req.url).isPeerPath) {
           return next();
         }
 
@@ -521,28 +599,19 @@ module.exports = class Server {
       }
     };
 
-    const parsePeerPortBody = (body) => {
-      if (!body || !['tcp', 'udp', 'both'].includes(body.proto)) {
-        throw createError({ status: 400, message: 'proto must be tcp, udp or both' });
-      }
-      const extPort = Number(body.extPort);
-      const intPort = Number(body.intPort);
-      if (!Number.isInteger(extPort) || !Number.isInteger(intPort)
-        || extPort < 1 || extPort > 65535 || intPort < 1 || intPort > 65535) {
-        throw createError({ status: 400, message: 'Invalid ports' });
-      }
-      return { proto: body.proto, extPort, intPort };
-    };
-
+    // Peer bodies reuse the shared type-strict parser: Number() alone would
+    // let "0x10" claim port 16 and true claim port 1.
     peerRouter
       .get('/api/peer/me', defineEventHandler((event) => {
         return WireGuard.getPeerProfile({ clientId: event.node.req.wgpmPeerClientId });
       }))
       .get('/api/peer/me/port-forward/:indexOrId/probe', defineEventHandler(async (event) => {
+        // UUID-only on the peer path: a digit string would fall through to
+        // positional addressing on an id-addressed surface (the admin probe
+        // route keeps legacy index support).
         const rule = getRouterParam(event, 'indexOrId');
-        if (!/^\d+$/.test(rule)
-          && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rule)) {
-          throw createError({ status: 400, message: 'Invalid rule id or index' });
+        if (!Util.isValidRuleId(rule)) {
+          throw createError({ status: 400, message: 'Invalid rule id' });
         }
         // Transitional: active once the reachability-probe feature merges.
         if (typeof WireGuard.probePortForward !== 'function') {
@@ -553,23 +622,32 @@ module.exports = class Server {
       .post('/api/peer/me/port-forward', defineEventHandler(async (event) => {
         const clientId = event.node.req.wgpmPeerClientId;
         await requireSelfManagePorts(clientId);
-        const { proto, extPort, intPort } = parsePeerPortBody(await readBodyLimited(event));
-        await WireGuard.addPortForward(clientId, proto, extPort, intPort);
+        const { proto, extPort, intPort } = parsePortForwardBody(await readBodyLimited(event));
+        // The queued wrapper re-checks selfManagePorts: a revoke landing
+        // between the pre-check above and the mutation's execution must
+        // still reject (TOCTOU).
+        await WireGuard.addPortForward(clientId, proto, extPort, intPort, { requireSelfManagePorts: true });
         return { success: true };
       }))
       .put('/api/peer/me/port-forward/id/:ruleId', defineEventHandler(async (event) => {
         const clientId = event.node.req.wgpmPeerClientId;
         await requireSelfManagePorts(clientId);
         const ruleId = getRouterParam(event, 'ruleId');
-        const { proto, extPort, intPort } = parsePeerPortBody(await readBodyLimited(event));
-        await WireGuard.updatePortForwardByRuleId(clientId, ruleId, proto, extPort, intPort);
+        if (!Util.isValidRuleId(ruleId)) {
+          throw createError({ status: 400, message: 'Invalid rule id' });
+        }
+        const { proto, extPort, intPort } = parsePortForwardBody(await readBodyLimited(event));
+        await WireGuard.updatePortForwardByRuleId(clientId, ruleId, proto, extPort, intPort, { requireSelfManagePorts: true });
         return { success: true };
       }))
       .delete('/api/peer/me/port-forward/id/:ruleId', defineEventHandler(async (event) => {
         const clientId = event.node.req.wgpmPeerClientId;
         await requireSelfManagePorts(clientId);
         const ruleId = getRouterParam(event, 'ruleId');
-        await WireGuard.removePortForwardByRuleId(clientId, ruleId);
+        if (!Util.isValidRuleId(ruleId)) {
+          throw createError({ status: 400, message: 'Invalid rule id' });
+        }
+        await WireGuard.removePortForwardByRuleId(clientId, ruleId, { requireSelfManagePorts: true });
         return { success: true };
       }));
 

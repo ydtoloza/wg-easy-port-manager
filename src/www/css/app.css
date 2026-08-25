@@ -754,6 +754,10 @@ video {
   margin-left: 1.25rem;
 }
 
+.ml-6 {
+  margin-left: 1.5rem;
+}
+
 .ml-auto {
   margin-left: auto;
 }
@@ -1197,6 +1201,10 @@ video {
   border-color: rgb(253 230 138 / var(--tw-border-opacity));
 }
 
+.border-amber-300\/70 {
+  border-color: rgb(252 211 77 / 0.7);
+}
+
 .border-blue-500\/40 {
   border-color: rgb(59 130 246 / 0.4);
 }
@@ -1222,6 +1230,11 @@ video {
 
 .border-green-500\/40 {
   border-color: rgb(34 197 94 / 0.4);
+}
+
+.border-neutral-600 {
+  --tw-border-opacity: 1;
+  border-color: rgb(82 82 82 / var(--tw-border-opacity));
 }
 
 .border-red-200 {
@@ -1520,12 +1533,20 @@ video {
   font-weight: 500;
 }
 
+.font-normal {
+  font-weight: 400;
+}
+
 .font-semibold {
   font-weight: 600;
 }
 
 .uppercase {
   text-transform: uppercase;
+}
+
+.normal-case {
+  text-transform: none;
 }
 
 .leading-6 {
@@ -1544,8 +1565,17 @@ video {
   line-height: 1.375;
 }
 
+.tracking-normal {
+  letter-spacing: 0em;
+}
+
 .tracking-wider {
   letter-spacing: 0.05em;
+}
+
+.text-amber-700 {
+  --tw-text-opacity: 1;
+  color: rgb(180 83 9 / var(--tw-text-opacity));
 }
 
 .text-amber-900 {
@@ -1846,6 +1876,10 @@ video {
   border-bottom-width: 0px;
 }
 
+.focus-within\:opacity-100:focus-within {
+  opacity: 1;
+}
+
 .hover\:cursor-pointer:hover {
   cursor: pointer;
 }
@@ -1967,6 +2001,10 @@ video {
 .focus\:ring-red-800:focus {
   --tw-ring-opacity: 1;
   --tw-ring-color: rgb(153 27 27 / var(--tw-ring-opacity));
+}
+
+.disabled\:cursor-not-allowed:disabled {
+  cursor: not-allowed;
 }
 
 .disabled\:opacity-50:disabled {
@@ -2195,6 +2233,10 @@ video {
   }
 }
 
+.dark\:border-amber-700\/50:where(.dark, .dark *) {
+  border-color: rgb(180 83 9 / 0.5);
+}
+
 .dark\:border-amber-800\/50:where(.dark, .dark *) {
   border-color: rgb(146 64 14 / 0.5);
 }
@@ -2321,6 +2363,11 @@ video {
 .dark\:text-amber-200:where(.dark, .dark *) {
   --tw-text-opacity: 1;
   color: rgb(253 230 138 / var(--tw-text-opacity));
+}
+
+.dark\:text-amber-400:where(.dark, .dark *) {
+  --tw-text-opacity: 1;
+  color: rgb(251 191 36 / var(--tw-text-opacity));
 }
 
 .dark\:text-blue-300:where(.dark, .dark *) {

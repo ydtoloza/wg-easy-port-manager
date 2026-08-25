@@ -308,7 +308,7 @@ describe('HTTP server security', () => {
         body: JSON.stringify({ proto: 'tcp', extPort: 3000, intPort: 3000 }),
       });
       expect(allowed.status).toBe(200);
-      expect(WireGuard.addPortForward).toHaveBeenCalledWith('client1', 'tcp', 3000, 3000);
+      expect(WireGuard.addPortForward).toHaveBeenCalledWith('client1', 'tcp', 3000, 3000, { requireSelfManagePorts: true });
     });
 
     it('scopes byId mutations to the pinned peer', async () => {
@@ -320,25 +320,213 @@ describe('HTTP server security', () => {
         body: JSON.stringify({ proto: 'tcp', extPort: 3001, intPort: 3000 }),
       });
       expect(updated.status).toBe(200);
-      expect(WireGuard.updatePortForwardByRuleId).toHaveBeenCalledWith('client1', ruleId, 'tcp', 3001, 3000);
+      expect(WireGuard.updatePortForwardByRuleId).toHaveBeenCalledWith('client1', ruleId, 'tcp', 3001, 3000, { requireSelfManagePorts: true });
 
       const removed = await fetch(`${baseUrl}/api/peer/me/port-forward/id/${ruleId}`, {
         method: 'DELETE',
         headers: { Authorization: peerToken },
       });
       expect(removed.status).toBe(200);
-      expect(WireGuard.removePortForwardByRuleId).toHaveBeenCalledWith('client1', ruleId);
+      expect(WireGuard.removePortForwardByRuleId).toHaveBeenCalledWith('client1', ruleId, { requireSelfManagePorts: true });
     });
 
     it('serves the peer probe route now that the probe feature merged', async () => {
       WireGuard.lookupPeerToken.mockResolvedValue('client1');
-      const response = await fetch(`${baseUrl}/api/peer/me/port-forward/0/probe`, {
+      const ruleId = '11111111-2222-3333-4444-555555555555';
+      const response = await fetch(`${baseUrl}/api/peer/me/port-forward/${ruleId}/probe`, {
         headers: { Authorization: peerToken },
       });
       expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({ verdict: 'ok' });
-      expect(WireGuard.probePortForward).toHaveBeenCalledWith({ clientId: 'client1', rule: '0' });
+      expect(WireGuard.probePortForward).toHaveBeenCalledWith({ clientId: 'client1', rule: ruleId });
     });
+
+    it('rejects coercible-but-invalid ports strictly on peer routes', async () => {
+      WireGuard.lookupPeerToken.mockResolvedValue('client1');
+      for (const bad of [true, '0x10', '5e2', 0, 65536]) {
+        const response = await fetch(`${baseUrl}/api/peer/me/port-forward`, {
+          method: 'POST',
+          headers: { Authorization: peerToken, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ proto: 'tcp', extPort: bad, intPort: 80 }),
+        });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({ statusCode: 400, error: 'Invalid ports' });
+      }
+      expect(WireGuard.addPortForward).not.toHaveBeenCalledWith('client1', 'tcp', 16, 80);
+      expect(WireGuard.addPortForward).not.toHaveBeenCalledWith('client1', 'tcp', 1, 80);
+    });
+
+    it('rejects digit-string rule ids on the peer id routes instead of addressing by index', async () => {
+      WireGuard.lookupPeerToken.mockResolvedValue('client1');
+      WireGuard.updatePortForwardByRuleId.mockClear();
+      WireGuard.removePortForwardByRuleId.mockClear();
+
+      const updated = await fetch(`${baseUrl}/api/peer/me/port-forward/id/0`, {
+        method: 'PUT',
+        headers: { Authorization: peerToken, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proto: 'tcp', extPort: 3000, intPort: 3000 }),
+      });
+      expect(updated.status).toBe(400);
+      expect(WireGuard.updatePortForwardByRuleId).not.toHaveBeenCalled();
+
+      const removed = await fetch(`${baseUrl}/api/peer/me/port-forward/id/1`, {
+        method: 'DELETE',
+        headers: { Authorization: peerToken },
+      });
+      expect(removed.status).toBe(400);
+      expect(WireGuard.removePortForwardByRuleId).not.toHaveBeenCalled();
+    });
+
+    it('rejects numeric ids on the peer probe route', async () => {
+      WireGuard.lookupPeerToken.mockResolvedValue('client1');
+      WireGuard.probePortForward.mockClear();
+      const response = await fetch(`${baseUrl}/api/peer/me/port-forward/0/probe`, {
+        headers: { Authorization: peerToken },
+      });
+      expect(response.status).toBe(400);
+      expect(WireGuard.probePortForward).not.toHaveBeenCalled();
+    });
+
+    it('accepts query strings on peer endpoints', async () => {
+      WireGuard.lookupPeerToken.mockResolvedValue('client1');
+      const profile = await fetch(`${baseUrl}/api/peer/me?x=1`, { headers: { Authorization: peerToken } });
+      expect(profile.status).toBe(200);
+
+      const added = await fetch(`${baseUrl}/api/peer/me/port-forward?src=cron`, {
+        method: 'POST',
+        headers: { Authorization: peerToken, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proto: 'tcp', extPort: 3000, intPort: 3000 }),
+      });
+      expect(added.status).toBe(200);
+    });
+
+    it('rejects malformed peer paths, including encoded and terminal dot segments', async () => {
+      WireGuard.lookupPeerToken.mockResolvedValue('client1');
+      WireGuard.lookupPeerToken.mockClear();
+      const { port } = new URL(baseUrl);
+      // fetch()/URL normalize dot segments client-side, so send raw paths.
+      const rawStatus = (rawPath) => new Promise((resolve, reject) => {
+        const request = http.request({
+          host: '127.0.0.1',
+          port,
+          path: rawPath,
+          method: 'GET',
+          headers: { Authorization: peerToken },
+        }, (response) => {
+          response.resume();
+          resolve(response.statusCode);
+        });
+        request.on('error', reject);
+        request.end();
+      });
+      const malformedPaths = [
+        '/api/peer/me/../me',
+        '/api/peer/me/.',
+        '/api/peer/me/..',
+        '/api/peer/me/%2e',
+        '/api/peer/me/%2E%2e/port-forward',
+        '/api/peer/me/%2f../port-forward',
+        '/api/peer/me//port-forward',
+        '/api/peer/me/%not-an-escape',
+        '/api%2fpeer%2fme/%not-an-escape',
+      ];
+      for (const path of malformedPaths) {
+        // eslint-disable-next-line no-await-in-loop
+        expect(await rawStatus(path)).toBe(400);
+      }
+      expect(WireGuard.lookupPeerToken).not.toHaveBeenCalled();
+      // sanity: the normal shape still authenticates
+      expect(await rawStatus('/api/peer/me')).toBe(200);
+    });
+
+    it('does not let in-flight peer-token checks consume admin auth slots', async () => {
+      const pendingPeerChecks = [];
+      WireGuard.lookupPeerToken.mockImplementation(() => new Promise((resolve) => pendingPeerChecks.push(resolve)));
+      const requests = Array.from({ length: 64 }, (_, i) => fetch(`${baseUrl}/api/peer/me`, {
+        headers: {
+          Authorization: `Bearer wgpt_${i.toString(16).padStart(64, '0')}`,
+          'X-Forwarded-For': `203.0.113.${Math.floor(i / 16) + 1}`,
+        },
+      }));
+      const waitFor = async (predicate, what) => {
+        for (let i = 0; i < 400 && !predicate(); i += 1) {
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        if (!predicate()) throw new Error(`timed out waiting for ${what}`);
+      };
+
+      globalThis.__deferPasswordCompares = true;
+      globalThis.__pendingPasswordCompares = [];
+      try {
+        await waitFor(() => pendingPeerChecks.length === 64, 'peer-token checks to start');
+
+        const sameIp = await fetch(`${baseUrl}/api/peer/me`, {
+          headers: {
+            Authorization: `Bearer wgpt_${'40'.padStart(64, '0')}`,
+            'X-Forwarded-For': '203.0.113.1',
+          },
+        });
+        expect(sameIp.status).toBe(429);
+
+        requests.push(fetch(`${baseUrl}/api/peer/me`, {
+          headers: {
+            Authorization: `Bearer wgpt_${'41'.padStart(64, '0')}`,
+            'X-Forwarded-For': '203.0.113.5',
+          },
+        }));
+        await waitFor(() => pendingPeerChecks.length === 65, 'peer check from another IP to start');
+
+        const admin = postSession(baseUrl, '198.51.100.90');
+        await waitFor(() => globalThis.__pendingPasswordCompares.length === 1, 'admin password check to start');
+        globalThis.__pendingPasswordCompares[0](false);
+        expect(await admin).toBe(401);
+      } finally {
+        for (const resolve of pendingPeerChecks.splice(0)) resolve(null);
+        for (const resolve of globalThis.__pendingPasswordCompares.splice(0)) resolve(false);
+        await Promise.all(requests);
+        WireGuard.lookupPeerToken.mockResolvedValue(null);
+        globalThis.__deferPasswordCompares = false;
+      }
+    });
+
+    it('isolates peer-token buckets from admin lockout counters', async () => {
+      // 20 failed admin logins lock this IP out (the 21st is a 429).
+      const adminIp = '198.51.100.77';
+      for (let i = 0; i < 20; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        expect(await postSession(baseUrl, adminIp)).toBe(401);
+      }
+
+      // Flood MORE buckets than the peer table cap with random tokens.
+      WireGuard.lookupPeerToken.mockResolvedValue(null);
+      const { port } = new URL(baseUrl);
+      const agent = new http.Agent({ keepAlive: true, maxSockets: 32 });
+      const peerStatus = (token) => new Promise((resolve, reject) => {
+        const request = http.request({
+          host: '127.0.0.1',
+          port,
+          path: '/api/peer/me',
+          method: 'GET',
+          agent,
+          headers: { Authorization: `Bearer ${token}` },
+        }, (response) => {
+          response.resume();
+          resolve(response.statusCode);
+        });
+        request.on('error', reject);
+        request.end();
+      });
+      const flood = Array.from({ length: 10050 }, (_, i) => peerStatus(`${i.toString(16).padStart(64, '0')}`));
+      const statuses = await Promise.all(flood);
+      agent.destroy();
+      expect(statuses.every((status) => status === 401 || status === 429)).toBe(true);
+
+      WireGuard.lookupPeerToken.mockResolvedValue('client1');
+      // The admin IP must STILL be locked out: its failure counter survived
+      // the flood instead of being evicted from a shared table.
+      expect(await postSession(baseUrl, adminIp)).toBe(429);
+    }, 60000);
   });
 
   describe('token and webhook admin routes', () => {

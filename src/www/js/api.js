@@ -254,4 +254,11 @@ class API {
     });
   }
 
+  async probePortForward({ clientId, ruleId }) {
+    return this.call({
+      method: 'get',
+      path: `/wireguard/client/${encodeURIComponent(clientId)}/port-forward/${encodeURIComponent(ruleId)}/probe`,
+    });
+  }
+
 }

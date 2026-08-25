@@ -98,6 +98,13 @@ new Vue({
     serverConfigEdit: null,
     serverConfigSaving: false,
 
+    // Port-forwarding kill switch (live from server config) and the
+    // debounced auto-probe bookkeeping.
+    forwardingEnabled: false,
+    autoProbeTimer: null,
+    lastPfSignature: null,
+    lastProbeAt: {},
+
     uiTrafficStats: false,
 
     uiChartType: 0,
@@ -221,7 +228,9 @@ new Vue({
       return !!this.expandedPfClients[clientId];
     },
     togglePfExpanded(clientId) {
-      this.$set(this.expandedPfClients, clientId, !this.expandedPfClients[clientId]);
+      const expanded = !this.expandedPfClients[clientId];
+      this.$set(this.expandedPfClients, clientId, expanded);
+      if (expanded) this.scheduleAutoProbe();
     },
     isPortConflicting(client) {
       const pf = this.newPf[client.id];
@@ -238,8 +247,13 @@ new Vue({
       if (!this.authenticated) return;
 
       const generation = ++this.refreshGeneration;
-      const clients = await this.api.getClients();
+      const [clients, serverConfig] = await Promise.all([
+        this.api.getClients(),
+        this.api.getServerConfig().catch(() => null),
+      ]);
       if (generation !== this.refreshGeneration) return;
+      const forwardingChanged = this.forwardingEnabled !== (serverConfig?.forwardingEnabled === true);
+      this.forwardingEnabled = serverConfig?.forwardingEnabled === true;
       this.clients = clients.map((client) => {
         if (!this.clientsPersist[client.id]) {
           this.clientsPersist[client.id] = {};
@@ -297,6 +311,18 @@ new Vue({
 
         return client;
       });
+
+      // Re-arm the debounced auto-probe whenever the observed forwarding
+      // structure changes (mutations land through refresh()).
+      const pfSignature = JSON.stringify(this.clients.map((client) => [
+        client.id,
+        client.enabled,
+        (client.portForwards || []).map((rule) => [rule.id, rule.proto, rule.extPort, rule.intPort]),
+      ]));
+      if (forwardingChanged || pfSignature !== this.lastPfSignature) {
+        this.lastPfSignature = pfSignature;
+        this.scheduleAutoProbe();
+      }
     },
     login(e) {
       e.preventDefault();
@@ -527,6 +553,7 @@ new Vue({
       document.body.removeChild(el);
     },
     addPortForward(client) {
+      if (!this.forwardingEnabled) return;
       const pf = this.newPf[client.id];
       if (!pf || !pf.extPort || !pf.intPort) return;
 
@@ -560,10 +587,11 @@ new Vue({
         .finally(() => this.refresh().catch(console.error));
     },
     removePortForward(client, index) {
+      if (!this.forwardingEnabled) return;
       this.pfDelete = { client, index, rule: client.portForwards[index] };
     },
     confirmRemovePortForward() {
-      if (!this.pfDelete) return;
+      if (!this.forwardingEnabled || !this.pfDelete) return;
       const { client, rule } = this.pfDelete;
       if (!rule || !rule.id) return;
       this.api.removePortForward({ clientId: client.id, ruleId: rule.id })
@@ -574,6 +602,7 @@ new Vue({
         });
     },
     editPortForward(client, index) {
+      if (!this.forwardingEnabled) return;
       this.editingPfClientId = client.id;
       this.editingPfIndex = index;
       this.editingPfRule = { ...client.portForwards[index] };
@@ -584,6 +613,7 @@ new Vue({
       this.editingPfRule = {};
     },
     updatePortForward(client) {
+      if (!this.forwardingEnabled) return;
       if (!this.editingPfRule || !this.editingPfRule.extPort || !this.editingPfRule.intPort) return;
       if (!this.editingPfRule.id) return;
 
@@ -640,14 +670,52 @@ new Vue({
       this.api.updateServerConfig(this.serverConfigEdit)
         .then((result) => {
           this.serverConfig = result;
+          const forwardingChanged = this.forwardingEnabled !== (result?.forwardingEnabled === true);
+          this.forwardingEnabled = result?.forwardingEnabled === true;
+          if (forwardingChanged) this.scheduleAutoProbe();
           this.showServerConfig = false;
           this.serverConfigEdit = null;
           this.notify('Configuración del servidor guardada.', 'success');
+          this.refresh().catch(console.error);
         })
         .catch((err) => this.notify(err.message || err.toString()))
         .finally(() => {
           this.serverConfigSaving = false;
         });
+    },
+    // ── Debounced auto-probe (trailing edge, re-armed not stacked) ────────
+    scheduleAutoProbe() {
+      clearTimeout(this.autoProbeTimer);
+      // No point probing while the kill switch is on: DNAT is not emitted,
+      // every verdict would be rule-missing/dnat-local noise.
+      if (!this.forwardingEnabled) return;
+      this.autoProbeTimer = setTimeout(() => this.runAutoProbe().catch(console.error), 2000);
+    },
+    async runAutoProbe() {
+      if (!this.forwardingEnabled || !this.clients) return;
+      const now = Date.now();
+      for (const client of this.clients) {
+        if (!client.enabled || !this.isPfExpanded(client.id)) continue;
+        for (const rule of client.portForwards || []) {
+          if (!rule || !rule.id) continue;
+          const key = `${client.id}:${rule.id}`;
+          // Mirror the server's 30s per-rule rate limit client-side.
+          if (now - (this.lastProbeAt[key] || 0) < 30000) continue;
+          this.lastProbeAt[key] = now;
+          try {
+            const result = await this.api.probePortForward({ clientId: client.id, ruleId: rule.id });
+            if (result && result.verdict
+              && !['ok', 'dnat-local', 'indeterminate'].includes(result.verdict)) {
+              this.notify(this.$t('networkPolicy.probeProblem', {
+                client: client.name, proto: rule.proto, port: rule.extPort, verdict: result.verdict,
+              }), 'error', 8000);
+            }
+          } catch (err) {
+            // 429 rate limits and transient failures are expected; stay quiet.
+            console.error(err);
+          }
+        }
+      }
     },
     toggleTheme() {
       const themes = ['light', 'dark', 'auto'];
@@ -733,6 +801,7 @@ new Vue({
   },
   beforeDestroy() {
     clearTimeout(this.pollTimer);
+    clearTimeout(this.autoProbeTimer);
     document.removeEventListener('visibilitychange', this.handleVisibilityChange);
     this.prefersDarkScheme.removeListener(this.handlePrefersChange);
   },
