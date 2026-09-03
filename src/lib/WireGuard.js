@@ -290,6 +290,10 @@ module.exports = class WireGuard {
   }
 
   async __syncDirectory() {
+    // Directory fsync is unsupported on Windows/macOS (EPERM). It is only a
+    // durability hint; the atomic rename above is what guarantees crash
+    // consistency, so non-Linux dev servers degrade gracefully here.
+    if (process.platform !== 'linux') return;
     const directory = await fs.open(WG_PATH, 'r');
     try {
       await directory.sync();

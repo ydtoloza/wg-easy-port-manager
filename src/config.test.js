@@ -13,6 +13,8 @@ const managedVariables = [
   'TRUSTED_PROXY_IP',
   'UI_TRAFFIC_STATS',
   'UI_CHART_TYPE',
+  'TRAFFIC_POLL_MS',
+  'TRAFFIC_SAMPLES',
 ];
 const originalEnvironment = { ...process.env };
 

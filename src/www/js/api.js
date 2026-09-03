@@ -261,4 +261,25 @@ class API {
     });
   }
 
+  async getTrafficRealtime() {
+    return this.call({
+      method: 'get',
+      path: '/traffic/realtime',
+    });
+  }
+
+  async getTrafficHistory(range = '2m') {
+    return this.call({
+      method: 'get',
+      path: `/traffic/history?range=${encodeURIComponent(range)}`,
+    });
+  }
+
+  async getTrafficSummary() {
+    return this.call({
+      method: 'get',
+      path: '/traffic/summary',
+    });
+  }
+
 }

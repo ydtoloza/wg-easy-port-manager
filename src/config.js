@@ -67,6 +67,10 @@ module.exports.UI_TRAFFIC_STATS = isTrue(process.env.UI_TRAFFIC_STATS);
 module.exports.UI_CHART_TYPE = [0, 1, 2, 3].includes(Number(process.env.UI_CHART_TYPE))
   ? Number(process.env.UI_CHART_TYPE)
   : 0;
+// Traffic dashboard sampler (Plex-style panels + network-dashboard realtime).
+// Clamped in lib/TrafficStats: 500-10000ms poll, 30-600 samples.
+module.exports.TRAFFIC_POLL_MS = Number(process.env.TRAFFIC_POLL_MS) || 1000;
+module.exports.TRAFFIC_SAMPLES = Number(process.env.TRAFFIC_SAMPLES) || 120;
 
 module.exports.validateEnvironment = () => {
   if (module.exports.PASSWORD) {

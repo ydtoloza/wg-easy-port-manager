@@ -14,7 +14,8 @@
     "check:www-template": "node scripts/build-www-template.js --check",
     "buildcss": "npx tailwindcss -i ./www/src/css/app.css -o ./www/css/app.css",
     "test": "jest",
-    "test:ci": "jest --runInBand"
+    "test:ci": "jest --runInBand",
+    "smoke:traffic": "node scripts/traffic-smoke.js"
   },
   "author": "ydtoloza",
   "license": "CC BY-NC-SA 4.0",

@@ -107,6 +107,17 @@ new Vue({
 
     uiTrafficStats: false,
 
+    // Traffic dashboard (Plex-style ANCHO DE BANDA / CPU / RAM + peaks).
+    // Realtime sampler lives server-side in lib/TrafficStats.js; here we
+    // only poll it and shape ApexCharts series. Chart data survives reloads
+    // via localStorage, like ydtoloza/network-dashboard does.
+    traffic: null,
+    trafficSummary: null,
+    trafficRange: localStorage.getItem('trafficRange') || 'realtime',
+    trafficScope: 'all',
+    trafficPollCount: 0,
+    uiShowTraffic: localStorage.getItem('uiShowTraffic') !== '0',
+
     uiChartType: 0,
     uiShowCharts: localStorage.getItem('uiShowCharts') === '1',
     uiTheme: localStorage.theme || 'auto',
@@ -753,12 +764,72 @@ new Vue({
       this.polling = true;
       try {
         await this.refresh({ updateCharts: this.chartsEnabled });
+        await this.refreshTraffic().catch((err) => console.error(err));
       } catch (err) {
         console.error(err);
       } finally {
         this.polling = false;
         this.schedulePoll();
       }
+    },
+    async refreshTraffic() {
+      if (!this.authenticated || !this.uiShowTraffic) return;
+      let realtime = null;
+      try {
+        realtime = await this.api.getTrafficRealtime();
+      } catch (err) {
+        console.error(err);
+        return;
+      }
+      this.traffic = realtime;
+      this.trafficPollCount += 1;
+      // Summary (totals + peaks) is cheap but only needed every ~10 polls.
+      if (this.trafficPollCount % 10 === 1) {
+        this.api.getTrafficSummary().then((s) => {
+          this.trafficSummary = s;
+        }).catch((err) => console.error(err));
+      }
+      // Persist the rolling window so the chart survives reloads.
+      try {
+        const hist = (realtime.history && realtime.history.wg0) || [];
+        if (hist.length) localStorage.setItem('wgTrafficHistory', JSON.stringify(hist.slice(-120)));
+      } catch (err) {
+        console.error(err);
+      }
+    },
+    setTrafficRange(range) {
+      this.trafficRange = range;
+      try {
+        localStorage.setItem('trafficRange', range);
+      } catch (err) {
+        console.error(err);
+      }
+      if (range !== 'realtime') {
+        this.api.getTrafficHistory(range === 'live' ? '2m' : range)
+          .then((h) => {
+            if (this.traffic) this.traffic.history = { wg0: h.wg0 || [] };
+          })
+          .catch((err) => console.error(err));
+      } else {
+        this.refreshTraffic().catch((err) => console.error(err));
+      }
+    },
+    toggleTraffic() {
+      this.uiShowTraffic = !this.uiShowTraffic;
+      try {
+        localStorage.setItem('uiShowTraffic', this.uiShowTraffic ? '1' : '0');
+      } catch (err) {
+        console.error(err);
+      }
+      if (this.uiShowTraffic) this.refreshTraffic().catch((err) => console.error(err));
+    },
+    fmtSpeed(bps) {
+      if (bps === null || bps === undefined || Number.isNaN(Number(bps))) return '-';
+      return `${bytes(Number(bps), 1)}/s`;
+    },
+    fmtBytes(total) {
+      if (total === null || total === undefined || Number.isNaN(Number(total))) return '-';
+      return bytes(Number(total), 1);
     },
     handleVisibilityChange() {
       if (document.hidden) clearTimeout(this.pollTimer);
@@ -782,6 +853,29 @@ new Vue({
       this.requiresPassword = session.requiresPassword;
       if (this.authenticated) {
         await this.refresh({ updateCharts: this.chartsEnabled });
+        // Paint instantly from the persisted window, then replace with live.
+        try {
+          const cached = JSON.parse(localStorage.getItem('wgTrafficHistory') || 'null');
+          if (Array.isArray(cached) && cached.length) {
+            this.traffic = {
+              history: { wg0: cached },
+              interfaces: [],
+              peers: [],
+              cpu: {
+                system: 0, process: 0, history: [], procHistory: [],
+              },
+              mem: {
+                system: 0, process: 0, history: [], procHistory: [],
+              },
+              peaks: {
+                rxSpeed: 0, txSpeed: 0, cpu: 0, mem: 0,
+              },
+            };
+          }
+        } catch (err) {
+          console.error(err);
+        }
+        await this.refreshTraffic().catch((err) => console.error(err));
         this.schedulePoll();
       }
     },
@@ -837,6 +931,124 @@ new Vue({
       opts.chart.type = this.chartTypeConfig.type || false;
       opts.stroke.width = this.chartTypeConfig.strokeWidth;
       return opts;
+    },
+    // ── Traffic dashboard (Plex-style) ──────────────────────────────
+    trafficBw() {
+      const hist = (this.traffic && this.traffic.history && this.traffic.history.wg0) || [];
+      return hist;
+    },
+    trafficBwSeries() {
+      return [
+        { name: 'REMOTO (RX)', data: this.trafficBw.map((s) => Math.round(s.rx || 0)) },
+        { name: 'LOCAL (TX)', data: this.trafficBw.map((s) => Math.round(s.tx || 0)) },
+      ];
+    },
+    trafficCpuSeries() {
+      const cpu = (this.traffic && this.traffic.cpu) || {};
+      return [
+        { name: 'SISTEMA', data: (cpu.history || []).map((s) => Number((s.v || 0).toFixed(2))) },
+        { name: 'WG-EASY', data: (cpu.procHistory || []).map((s) => Number((s.v || 0).toFixed(2))) },
+      ];
+    },
+    trafficMemSeries() {
+      const mem = (this.traffic && this.traffic.mem) || {};
+      return [
+        { name: 'SISTEMA', data: (mem.history || []).map((s) => Number((s.v || 0).toFixed(2))) },
+        { name: 'WG-EASY', data: (mem.procHistory || []).map((s) => Number((s.v || 0).toFixed(2))) },
+      ];
+    },
+    trafficPanelOptions() {
+      const dark = this.theme === 'dark';
+      return {
+        chart: {
+          background: 'transparent',
+          toolbar: { show: false },
+          animations: { enabled: false },
+          zoom: { enabled: false },
+        },
+        colors: ['#3b82f6', '#f59e0b'],
+        stroke: { curve: 'smooth', width: 2 },
+        fill: {
+          type: 'gradient',
+          gradient: {
+            shadeIntensity: 0.4, opacityFrom: 0.35, opacityTo: 0.02, stops: [0, 100],
+          },
+        },
+        dataLabels: { enabled: false },
+        grid: {
+          show: true,
+          borderColor: dark ? '#525252' : '#e5e7eb',
+          strokeDashArray: 0,
+          xaxis: { lines: { show: false } },
+          padding: {
+            left: 8, right: 8, top: 0, bottom: 0,
+          },
+        },
+        xaxis: {
+          labels: { show: false },
+          axisTicks: { show: false },
+          axisBorder: { show: false },
+          tooltip: { enabled: false },
+        },
+        yaxis: {
+          min: 0,
+          labels: {
+            show: true,
+            style: { colors: dark ? '#9ca3af' : '#6b7280', fontSize: '10px' },
+            formatter: (v) => bytes(v, 0),
+          },
+        },
+        tooltip: {
+          enabled: true,
+          theme: dark ? 'dark' : 'light',
+          y: { formatter: (v) => `${bytes(v, 1)}/s` },
+        },
+        legend: { show: false },
+      };
+    },
+    trafficPctOptions() {
+      const base = this.trafficPanelOptions;
+      return {
+        ...base,
+        yaxis: {
+          min: 0,
+          max: 100,
+          labels: {
+            show: true,
+            style: { colors: this.theme === 'dark' ? '#9ca3af' : '#6b7280', fontSize: '10px' },
+            formatter: (v) => `${Math.round(v)}%`,
+          },
+        },
+        tooltip: {
+          enabled: true,
+          theme: this.theme === 'dark' ? 'dark' : 'light',
+          y: { formatter: (v) => `${Number(v).toFixed(2)}%` },
+        },
+      };
+    },
+    trafficCpuOptions() {
+      return { ...this.trafficPctOptions, colors: ['#f43f5e', '#86efac'] };
+    },
+    trafficMemOptions() {
+      return { ...this.trafficPctOptions, colors: ['#c084fc', '#2dd4bf'] };
+    },
+    trafficAvg() {
+      const hist = this.trafficBw;
+      if (!hist.length) return { rx: 0, tx: 0 };
+      return {
+        rx: hist.reduce((a, s) => a + (s.rx || 0), 0) / hist.length,
+        tx: hist.reduce((a, s) => a + (s.tx || 0), 0) / hist.length,
+      };
+    },
+    trafficPeak() {
+      if (!this.trafficBw.length) return { rx: 0, tx: 0 };
+      return {
+        rx: Math.max(...this.trafficBw.map((s) => s.rx || 0)),
+        tx: Math.max(...this.trafficBw.map((s) => s.tx || 0)),
+      };
+    },
+    trafficPeakMax() {
+      return Math.max(this.trafficPeak.rx, this.trafficPeak.tx);
     },
     updateCharts() {
       return this.chartsEnabled;

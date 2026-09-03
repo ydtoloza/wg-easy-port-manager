@@ -71,7 +71,38 @@ jest.mock('../services/WireGuard', () => ({
   }),
 }));
 
+jest.mock('../services/TrafficStats', () => ({
+  start: jest.fn(),
+  tick: jest.fn().mockResolvedValue(),
+  getRealtime: jest.fn().mockReturnValue({
+    generatedAt: 0,
+    pollMs: 1000,
+    interfaces: [{
+      name: 'wg0', rxSpeed: 100, txSpeed: 50, avgRx: 90, avgTx: 45, peakRx: 120, peakTx: 60, timestamp: 0,
+    }],
+    peers: [],
+    totals: { rxSpeed: 100, txSpeed: 50 },
+    history: { wg0: [{ t: 0, rx: 100, tx: 50 }] },
+    cpu: {
+      system: 2, process: 0.1, history: [], procHistory: [],
+    },
+    mem: {
+      system: 15, process: 5, history: [], procHistory: [],
+    },
+    peaks: {
+      rxSpeed: 120, txSpeed: 60, cpu: 3, mem: 16,
+    },
+  }),
+  getHistory: jest.fn().mockReturnValue({
+    range: '2m', wg0: [], cpu: [], procCpu: [], mem: [], procMem: [],
+  }),
+  getSummary: jest.fn().mockReturnValue({
+    generatedAt: 0, uptimeMs: 1, totals: { rxBytes: 1, txBytes: 1 }, avgRx: 1, avgTx: 1, peaks: {}, samples: 1,
+  }),
+}));
+
 const WireGuard = require('../services/WireGuard');
+const TrafficStats = require('../services/TrafficStats');
 const Server = require('./Server');
 
 const postSession = (baseUrl, forwardedFor) => new Promise((resolve, reject) => {
@@ -656,5 +687,34 @@ describe('HTTP server security', () => {
     const statuses = responses.map((response) => response.status);
     expect(statuses.filter((status) => status === 429).length).toBeGreaterThanOrEqual(4);
     expect(statuses.filter((status) => status === 401).length).toBeLessThanOrEqual(20);
+  });
+
+  it('serves traffic realtime/history/summary behind admin auth', async () => {
+    const anon = await fetch(`${baseUrl}/api/traffic/realtime`);
+    expect(anon.status).toBe(401);
+
+    const realtime = await fetch(`${baseUrl}/api/traffic/realtime`, {
+      headers: { Authorization: 'correct-password' },
+    });
+    expect(realtime.status).toBe(200);
+    expect(await realtime.json()).toMatchObject({ pollMs: 1000 });
+    expect(TrafficStats.getRealtime).toHaveBeenCalled();
+
+    const history = await fetch(`${baseUrl}/api/traffic/history?range=1h`, {
+      headers: { Authorization: 'correct-password' },
+    });
+    expect(history.status).toBe(200);
+    expect(TrafficStats.getHistory).toHaveBeenCalledWith('1h');
+
+    const badRange = await fetch(`${baseUrl}/api/traffic/history?range=99y`, {
+      headers: { Authorization: 'correct-password' },
+    });
+    expect(badRange.status).toBe(400);
+
+    const summary = await fetch(`${baseUrl}/api/traffic/summary`, {
+      headers: { Authorization: 'correct-password' },
+    });
+    expect(summary.status).toBe(200);
+    expect(TrafficStats.getSummary).toHaveBeenCalled();
   });
 });

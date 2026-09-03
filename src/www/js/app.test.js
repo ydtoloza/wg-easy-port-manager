@@ -6,6 +6,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
+const localStorageMock = {
+  getItem: jest.fn(() => null),
+  setItem: jest.fn(),
+  theme: 'auto',
+};
+
 function loadAppOptions() {
   let options;
   const context = {
@@ -20,10 +26,7 @@ function loadAppOptions() {
     clearTimeout,
     console,
     document: {},
-    localStorage: {
-      getItem: jest.fn(() => null),
-      theme: 'auto',
-    },
+    localStorage: localStorageMock,
     messages: {},
     setTimeout,
     timeago: {},
@@ -178,5 +181,44 @@ describe('port-forward UI state', () => {
     await options.methods.runAutoProbe.call(state);
 
     expect(state.notify).not.toHaveBeenCalled();
+  });
+});
+
+describe('traffic side panel', () => {
+  it('shows the panel by default and toggles with persistence', () => {
+    const options = loadAppOptions();
+    expect(options.data.uiShowTraffic).toBe(true);
+
+    localStorageMock.setItem.mockClear();
+    const state = {
+      uiShowTraffic: true,
+      refreshTraffic: jest.fn().mockResolvedValue(),
+    };
+    options.methods.toggleTraffic.call(state);
+    expect(state.uiShowTraffic).toBe(false);
+    expect(localStorageMock.setItem).toHaveBeenCalledWith('uiShowTraffic', '0');
+    expect(state.refreshTraffic).not.toHaveBeenCalled();
+  });
+
+  it('builds bandwidth series, peaks and totals text', () => {
+    const options = loadAppOptions();
+    const bw = [{ t: 1, rx: 1000, tx: 500 }, { t: 2, rx: 3000, tx: 1500 }];
+    const state = {
+      traffic: { history: { wg0: bw } },
+      trafficBw: bw,
+      trafficSummary: null,
+    };
+    expect(options.computed.trafficBw.call(state)).toHaveLength(2);
+    expect(options.computed.trafficBwSeries.call(state)).toEqual([
+      { name: 'REMOTO (RX)', data: [1000, 3000] },
+      { name: 'LOCAL (TX)', data: [500, 1500] },
+    ]);
+    const peak = options.computed.trafficPeak.call(state);
+    expect(peak).toEqual({ rx: 3000, tx: 1500 });
+    expect(options.computed.trafficPeakMax.call({ ...state, trafficPeak: peak })).toBe(3000);
+    expect(options.methods.fmtBytes()).toBe('-');
+    expect(options.methods.fmtBytes(0)).toBe('0 B');
+    expect(options.methods.fmtBytes(1536)).toBe('1.5 KB');
+    expect(options.methods.fmtSpeed(1500)).toBe('1.5 KB/s');
   });
 });

@@ -26,6 +26,7 @@ const {
 } = require('h3');
 
 const WireGuard = require('../services/WireGuard');
+const TrafficStats = require('../services/TrafficStats');
 const Util = require('./Util');
 
 const {
@@ -899,6 +900,27 @@ module.exports = class Server {
       .put('/api/wireguard/webhook-config', defineEventHandler(async (event) => {
         const { url, secret } = await readBodyLimited(event);
         return WireGuard.setWebhookConfig({ url, secret });
+      }))
+      // Traffic dashboard (Plex-style panels, network-dashboard realtime).
+      // Admin-only: mounted under /api/wireguard so the session/Basic-auth
+      // gate above applies. Peer tokens never reach these routes.
+      .get('/api/traffic/realtime', defineEventHandler(async () => {
+        TrafficStats.start();
+        await TrafficStats.tick().catch(() => {});
+        return TrafficStats.getRealtime();
+      }))
+      .get('/api/traffic/history', defineEventHandler(async (event) => {
+        TrafficStats.start();
+        const url = new URL(event.node.req.url, 'http://localhost');
+        const range = url.searchParams.get('range') || '2m';
+        if (!['2m', '1h', '24h', '30d'].includes(range)) {
+          throw createError({ status: 400, message: 'Invalid range' });
+        }
+        return TrafficStats.getHistory(range);
+      }))
+      .get('/api/traffic/summary', defineEventHandler(async () => {
+        TrafficStats.start();
+        return TrafficStats.getSummary();
       }));
 
     const safePathJoin = (base, target) => {
