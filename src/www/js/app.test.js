@@ -185,19 +185,38 @@ describe('port-forward UI state', () => {
 });
 
 describe('traffic side panel', () => {
-  it('shows the panel by default and toggles with persistence', () => {
+  it('hides the panel by default and toggles with persistence', () => {
     const options = loadAppOptions();
-    expect(options.data.uiShowTraffic).toBe(true);
+    expect(options.data.uiShowTraffic).toBe(false);
 
     localStorageMock.setItem.mockClear();
     const state = {
-      uiShowTraffic: true,
+      uiShowTraffic: false,
       refreshTraffic: jest.fn().mockResolvedValue(),
     };
     options.methods.toggleTraffic.call(state);
-    expect(state.uiShowTraffic).toBe(false);
-    expect(localStorageMock.setItem).toHaveBeenCalledWith('uiShowTraffic', '0');
-    expect(state.refreshTraffic).not.toHaveBeenCalled();
+    expect(state.uiShowTraffic).toBe(true);
+    expect(localStorageMock.setItem).toHaveBeenCalledWith('uiShowTraffic', '1');
+    expect(state.refreshTraffic).toHaveBeenCalledTimes(1);
+  });
+
+  it('auto-shows the panel when UI_TRAFFIC_STATS is on and no pref stored', async () => {
+    const options = loadAppOptions();
+    const state = {
+      ...options.data,
+      api: {
+        getSession: jest.fn().mockResolvedValue({ authenticated: false, requiresPassword: true }),
+        getUiTrafficStats: jest.fn().mockResolvedValue(true),
+        getChartType: jest.fn().mockResolvedValue(0),
+        getLang: jest.fn().mockResolvedValue(null),
+      },
+      refresh: jest.fn().mockResolvedValue(),
+      schedulePoll: jest.fn(),
+    };
+    await options.methods.initialize.call(state);
+    expect(state.uiTrafficStats).toBe(true);
+    expect(state.uiShowTraffic).toBe(true);
+    expect(state.refresh).not.toHaveBeenCalled();
   });
 
   it('builds bandwidth series, peaks and totals text', () => {

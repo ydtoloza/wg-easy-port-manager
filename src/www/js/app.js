@@ -116,7 +116,10 @@ new Vue({
     trafficRange: localStorage.getItem('trafficRange') || 'realtime',
     trafficScope: 'all',
     trafficPollCount: 0,
-    uiShowTraffic: localStorage.getItem('uiShowTraffic') !== '0',
+    // Opt-in: the panel stays hidden until UI_TRAFFIC_STATS=true or the
+    // user toggles it (persisted). Production with default flags keeps the
+    // exact previous layout (max-w-3xl, single column).
+    uiShowTraffic: localStorage.getItem('uiShowTraffic') === '1',
 
     uiChartType: 0,
     uiShowCharts: localStorage.getItem('uiShowCharts') === '1',
@@ -843,6 +846,9 @@ new Vue({
         this.api.getLang().catch(() => null),
       ]);
       this.uiTrafficStats = trafficStats === true || trafficStats === 1 || trafficStats === '1' || trafficStats === 'true';
+      if (localStorage.getItem('uiShowTraffic') === null && this.uiTrafficStats) {
+        this.uiShowTraffic = true;
+      }
       const chartType = Number.parseInt(chartTypeRaw, 10);
       this.uiChartType = Number.isInteger(chartType) && UI_CHART_TYPES[chartType] ? chartType : 0;
       if (lang && lang !== localStorage.getItem('lang') && i18n.availableLocales.includes(lang)) {
