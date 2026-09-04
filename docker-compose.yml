@@ -16,6 +16,10 @@ services:
       WG_MTU: ${WG_MTU:-1420}
       WG_NFT_MASQUERADE: ${WG_NFT_MASQUERADE:-true}
       WG_SEED_TUNING: ${WG_SEED_TUNING:-true}
+      UI_TRAFFIC_STATS: ${UI_TRAFFIC_STATS:-false}
+      UI_CHART_TYPE: ${UI_CHART_TYPE:-0}
+      TRAFFIC_POLL_MS: ${TRAFFIC_POLL_MS:-1000}
+      TRAFFIC_SAMPLES: ${TRAFFIC_SAMPLES:-120}
 
     volumes:
       - etc_wireguard:/etc/wireguard
