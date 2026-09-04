@@ -973,11 +973,12 @@ new Vue({
           zoom: { enabled: false },
         },
         colors: ['#3b82f6', '#f59e0b'],
-        stroke: { curve: 'smooth', width: 2 },
+        stroke: { curve: 'smooth', width: 3 },
+        markers: { size: 0, hover: { size: 4 } },
         fill: {
           type: 'gradient',
           gradient: {
-            shadeIntensity: 0.4, opacityFrom: 0.35, opacityTo: 0.02, stops: [0, 100],
+            shadeIntensity: 0.6, opacityFrom: 0.55, opacityTo: 0.08, stops: [0, 100],
           },
         },
         dataLabels: { enabled: false },
@@ -1000,7 +1001,7 @@ new Vue({
           min: 0,
           labels: {
             show: true,
-            style: { colors: dark ? '#9ca3af' : '#6b7280', fontSize: '10px' },
+            style: { colors: dark ? '#d1d5db' : '#4b5563', fontSize: '10px' },
             formatter: (v) => bytes(v, 0),
           },
         },
@@ -1021,7 +1022,7 @@ new Vue({
           max: 100,
           labels: {
             show: true,
-            style: { colors: this.theme === 'dark' ? '#9ca3af' : '#6b7280', fontSize: '10px' },
+            style: { colors: this.theme === 'dark' ? '#d1d5db' : '#4b5563', fontSize: '10px' },
             formatter: (v) => `${Math.round(v)}%`,
           },
         },
@@ -1033,10 +1034,13 @@ new Vue({
       };
     },
     trafficCpuOptions() {
-      return { ...this.trafficPctOptions, colors: ['#f43f5e', '#86efac'] };
+      // Brighter strokes in dark mode so thin lines don't wash out.
+      const dark = this.theme === 'dark';
+      return { ...this.trafficPctOptions, colors: dark ? ['#fb7185', '#6ee7b7'] : ['#e11d48', '#16a34a'] };
     },
     trafficMemOptions() {
-      return { ...this.trafficPctOptions, colors: ['#c084fc', '#2dd4bf'] };
+      const dark = this.theme === 'dark';
+      return { ...this.trafficPctOptions, colors: dark ? ['#d8b4fe', '#5eead4'] : ['#9333ea', '#0d9488'] };
     },
     trafficAvg() {
       const hist = this.trafficBw;
