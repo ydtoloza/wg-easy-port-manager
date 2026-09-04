@@ -968,19 +968,17 @@ new Vue({
       return {
         chart: {
           background: 'transparent',
+          type: 'line',
           toolbar: { show: false },
           animations: { enabled: false },
           zoom: { enabled: false },
         },
         colors: ['#3b82f6', '#f59e0b'],
-        stroke: { curve: 'smooth', width: 3 },
+        // First series solid, second dashed: instant TX/RX distinction even
+        // at a glance or in grayscale.
+        stroke: { curve: 'smooth', width: 3, dashArray: [0, 7] },
         markers: { size: 0, hover: { size: 4 } },
-        fill: {
-          type: 'gradient',
-          gradient: {
-            shadeIntensity: 0.6, opacityFrom: 0.55, opacityTo: 0.08, stops: [0, 100],
-          },
-        },
+        fill: { opacity: 0 },
         dataLabels: { enabled: false },
         grid: {
           show: true,

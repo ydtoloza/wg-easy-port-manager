@@ -13,8 +13,10 @@ const extractFromExpr = (rule) => {
 
   let pendingDport = null;
   for (const expr of rule.expr) {
+    // Real `nft -j` output uses op '==' (fixtures also cover 'eq' and the
+    // op-less shape). Anything else (ranges, sets) is not a single dport.
     if (expr.match && isPayloadDport(expr.match.left)
-      && (expr.match.op === undefined || expr.match.op === 'eq')) {
+      && (expr.match.op === undefined || expr.match.op === 'eq' || expr.match.op === '==')) {
       pendingDport = {
         protocol: expr.match.left.payload.protocol,
         port: Number(expr.match.right),

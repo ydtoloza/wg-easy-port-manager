@@ -4,10 +4,10 @@
 
 const { parseDnatRules, rulePresent } = require('./NftRules');
 
-const dport = (protocol, port) => ({
+const dport = (protocol, port, op = 'eq') => ({
   match: {
     left: { payload: { protocol, field: 'dport' } },
-    op: 'eq',
+    op,
     right: port,
   },
 });
@@ -34,6 +34,25 @@ describe('NftRules', () => {
     expect(parseDnatRules('not json')).toEqual([]);
     expect(parseDnatRules({ nftables: null })).toEqual([]);
     expect(parseDnatRules(null)).toEqual([]);
+  });
+
+  it("parses the real nft -j shape (op '==')", () => {
+    // Ground truth from production (nft 1.1.5): match uses '=='.
+    const json = table([
+      [dport('tcp', 6884, '=='), dnat('10.8.0.5', 6884)],
+      [dport('udp', 6884, '=='), dnat('10.8.0.5', 6884)],
+    ]);
+    expect(parseDnatRules(json)).toEqual([
+      {
+        protocol: 'tcp', dport: 6884, addr: '10.8.0.5', port: 6884,
+      },
+      {
+        protocol: 'udp', dport: 6884, addr: '10.8.0.5', port: 6884,
+      },
+    ]);
+    expect(rulePresent(parseDnatRules(json), {
+      proto: 'both', extPort: 6884, intPort: 6884, peerIP: '10.8.0.5',
+    })).toBe(true);
   });
 
   it('ignores rules without both a dport match and a dnat target', () => {
