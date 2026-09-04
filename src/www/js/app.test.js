@@ -264,8 +264,8 @@ describe('traffic side panel', () => {
     };
     expect(options.computed.trafficBw.call(state)).toHaveLength(2);
     expect(options.computed.trafficBwSeries.call(state)).toEqual([
-      { name: 'REMOTO (RX)', data: [1000, 3000] },
-      { name: 'LOCAL (TX)', data: [500, 1500] },
+      { name: 'REMOTO (RX)', data: [{ x: 1, y: 1000 }, { x: 2, y: 3000 }] },
+      { name: 'LOCAL (TX)', data: [{ x: 1, y: 500 }, { x: 2, y: 1500 }] },
     ]);
     const peak = options.computed.trafficPeak.call(state);
     expect(peak).toEqual({ rx: 3000, tx: 1500 });
@@ -295,7 +295,7 @@ describe('traffic side panel', () => {
     };
     expect(options.computed.trafficBw.call(state)).toEqual(snapshot.wg0);
     expect(options.computed.trafficAvg.call({ ...state, trafficBw: snapshot.wg0 })).toEqual({ rx: 7000, tx: 700 });
-    expect(options.computed.trafficCpuSeries.call(state)[0].data).toEqual([50]);
+    expect(options.computed.trafficCpuSeries.call(state)[0].data).toEqual([{ x: 1, y: 50 }]);
 
     state.trafficRange = 'realtime';
     expect(options.computed.trafficBw.call(state)).toEqual([{ t: 2, rx: 100, tx: 10 }]);

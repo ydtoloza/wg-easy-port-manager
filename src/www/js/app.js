@@ -991,9 +991,10 @@ new Vue({
       return hist;
     },
     trafficBwSeries() {
+      // x/y pairs so the tooltip shows the hour instead of the point index.
       return [
-        { name: 'REMOTO (RX)', data: this.trafficBw.map((s) => Math.round(s.rx || 0)) },
-        { name: 'LOCAL (TX)', data: this.trafficBw.map((s) => Math.round(s.tx || 0)) },
+        { name: 'REMOTO (RX)', data: this.trafficBw.map((s) => ({ x: s.t, y: Math.round(s.rx || 0) })) },
+        { name: 'LOCAL (TX)', data: this.trafficBw.map((s) => ({ x: s.t, y: Math.round(s.tx || 0) })) },
       ];
     },
     trafficCpuSeries() {
@@ -1003,9 +1004,10 @@ new Vue({
       const proc = ranged && ranged.procCpu && ranged.procCpu.length
         ? ranged.procCpu
         : (cpu.procHistory || []);
+      const point = (s) => ({ x: s.t, y: Number((s.v || 0).toFixed(2)) });
       return [
-        { name: 'SISTEMA', data: hist.map((s) => Number((s.v || 0).toFixed(2))) },
-        { name: 'WG-EASY', data: proc.map((s) => Number((s.v || 0).toFixed(2))) },
+        { name: 'SISTEMA', data: hist.map(point) },
+        { name: 'WG-EASY', data: proc.map(point) },
       ];
     },
     trafficMemSeries() {
@@ -1015,9 +1017,10 @@ new Vue({
       const proc = ranged && ranged.procMem && ranged.procMem.length
         ? ranged.procMem
         : (mem.procHistory || []);
+      const point = (s) => ({ x: s.t, y: Number((s.v || 0).toFixed(2)) });
       return [
-        { name: 'SISTEMA', data: hist.map((s) => Number((s.v || 0).toFixed(2))) },
-        { name: 'WG-EASY', data: proc.map((s) => Number((s.v || 0).toFixed(2))) },
+        { name: 'SISTEMA', data: hist.map(point) },
+        { name: 'WG-EASY', data: proc.map(point) },
       ];
     },
     trafficPanelOptions() {
@@ -1047,6 +1050,7 @@ new Vue({
           },
         },
         xaxis: {
+          type: 'datetime',
           labels: { show: false },
           axisTicks: { show: false },
           axisBorder: { show: false },
@@ -1063,6 +1067,7 @@ new Vue({
         tooltip: {
           enabled: true,
           theme: dark ? 'dark' : 'light',
+          x: { format: 'dd MMM HH:mm' },
           y: { formatter: (v) => `${bytes(v, 1)}/s` },
         },
         legend: { show: false },
@@ -1084,6 +1089,7 @@ new Vue({
         tooltip: {
           enabled: true,
           theme: this.theme === 'dark' ? 'dark' : 'light',
+          x: { format: 'dd MMM HH:mm' },
           y: { formatter: (v) => `${Number(v).toFixed(2)}%` },
         },
       };
