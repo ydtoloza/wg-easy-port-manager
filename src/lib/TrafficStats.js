@@ -156,6 +156,15 @@ module.exports = class TrafficStats {
     // Persisted with peaks so "historic peak" survives restarts.
     this.peakAt = { rxSpeed: 0, txSpeed: 0 };
     this.totals = { rxBytes: 0, txBytes: 0 };
+    // Long-retention aggregates for the 1h/24h/30d views (the realtime
+    // ring above only covers ~2m). Per-minute averages (cap 1440 = 24h)
+    // roll up into per-hour averages (cap 720 = 30d). Bounded plain
+    // arrays of {t, rx, tx, cpu, pcpu, mem, pmem}; persisted with the
+    // sidecar so history survives restarts.
+    this.minuteAcc = null;
+    this.minutes = [];
+    this.hourAcc = null;
+    this.hours = [];
     this.startedAt = this.now();
     this.persistAt = 0;
   }
@@ -309,6 +318,11 @@ module.exports = class TrafficStats {
       const dt = this.lastTickAt ? (now - this.lastTickAt) / 1000 : this.pollMs / 1000;
       this.totals.rxBytes += rx * dt;
       this.totals.txBytes += tx * dt;
+      // Long-retention rollups (n counts ticks so averages stay true).
+      const acc = this.bucketFor(now);
+      acc.rx += rx;
+      acc.tx += tx;
+      acc.n += 1;
     }
   }
 
@@ -323,6 +337,67 @@ module.exports = class TrafficStats {
     appendCapped(this.procMemHistory, { t: now, v: pm }, this.cap);
     if (c > this.peaks.cpu) this.peaks.cpu = c;
     if (m > this.peaks.mem) this.peaks.mem = m;
+    const acc = this.bucketFor(now);
+    acc.cpu += c;
+    acc.pcpu += pc;
+    acc.mem += m;
+    acc.pmem += pm;
+  }
+
+  // Current per-minute accumulator, closing and rolling up finished
+  // minutes (and hours) as time advances. recordIface feeds rx/tx and
+  // recordSystem feeds the rest; both run once per tick so dividing by n
+  // yields true per-minute averages.
+  bucketFor(now) {
+    const minute = Math.floor(now / 60000) * 60000;
+    if (!this.minuteAcc || this.minuteAcc.t !== minute) {
+      if (this.minuteAcc) this.closeMinute(this.minuteAcc);
+      this.minuteAcc = {
+        t: minute, rx: 0, tx: 0, cpu: 0, pcpu: 0, mem: 0, pmem: 0, n: 0,
+      };
+    }
+    return this.minuteAcc;
+  }
+
+  closeMinute(acc) {
+    if (!acc.n) return;
+    const avg = {
+      t: acc.t,
+      rx: acc.rx / acc.n,
+      tx: acc.tx / acc.n,
+      cpu: acc.cpu / acc.n,
+      pcpu: acc.pcpu / acc.n,
+      mem: acc.mem / acc.n,
+      pmem: acc.pmem / acc.n,
+    };
+    appendCapped(this.minutes, avg, 1440);
+    const hour = Math.floor(acc.t / 3600000) * 3600000;
+    if (!this.hourAcc || this.hourAcc.t !== hour) {
+      if (this.hourAcc) this.closeHour(this.hourAcc);
+      this.hourAcc = {
+        t: hour, rx: 0, tx: 0, cpu: 0, pcpu: 0, mem: 0, pmem: 0, n: 0,
+      };
+    }
+    this.hourAcc.rx += avg.rx;
+    this.hourAcc.tx += avg.tx;
+    this.hourAcc.cpu += avg.cpu;
+    this.hourAcc.pcpu += avg.pcpu;
+    this.hourAcc.mem += avg.mem;
+    this.hourAcc.pmem += avg.pmem;
+    this.hourAcc.n += 1;
+  }
+
+  closeHour(acc) {
+    if (!acc.n) return;
+    appendCapped(this.hours, {
+      t: acc.t,
+      rx: acc.rx / acc.n,
+      tx: acc.tx / acc.n,
+      cpu: acc.cpu / acc.n,
+      pcpu: acc.pcpu / acc.n,
+      mem: acc.mem / acc.n,
+      pmem: acc.pmem / acc.n,
+    }, 720);
   }
 
   snapshotIface(name) {
@@ -379,6 +454,18 @@ module.exports = class TrafficStats {
   getHistory(range = '2m') {
     const points = RANGE_TO_POINTS[range] || this.cap;
     const slice = (arr) => (arr.length <= points ? [...arr] : arr.slice(arr.length - points));
+    if (range === '1h' || range === '24h' || range === '30d') {
+      const src = range === '30d' ? this.hours : this.minutes;
+      const window = range === '1h' ? src.slice(-60) : [...src];
+      return {
+        range,
+        wg0: window.map((s) => ({ t: s.t, rx: s.rx, tx: s.tx })),
+        cpu: window.map((s) => ({ t: s.t, v: s.cpu })),
+        procCpu: window.map((s) => ({ t: s.t, v: s.pcpu })),
+        mem: window.map((s) => ({ t: s.t, v: s.mem })),
+        procMem: window.map((s) => ({ t: s.t, v: s.pmem })),
+      };
+    }
     return {
       range,
       wg0: slice(this.ifaceHistory.get('wg0') || []),
@@ -409,7 +496,12 @@ module.exports = class TrafficStats {
     try {
       const target = path.join(this.wgPath, 'traffic-history.json');
       const payload = JSON.stringify({
-        peaks: this.peaks, peakAt: this.peakAt, totals: this.totals, savedAt: this.now(),
+        peaks: this.peaks,
+        peakAt: this.peakAt,
+        totals: this.totals,
+        minutes: this.minutes.slice(-1440),
+        hours: this.hours.slice(-720),
+        savedAt: this.now(),
       });
       const tmp = `${target}.${Date.now()}.tmp`;
       await fs.writeFile(tmp, payload, { mode: 0o600 });
@@ -428,6 +520,8 @@ module.exports = class TrafficStats {
         if (parsed.peaks) this.peaks = { ...this.peaks, ...parsed.peaks };
         if (parsed.peakAt) this.peakAt = { ...this.peakAt, ...parsed.peakAt };
         if (parsed.totals) this.totals = { ...this.totals, ...parsed.totals };
+        if (Array.isArray(parsed.minutes)) this.minutes = parsed.minutes.slice(-1440);
+        if (Array.isArray(parsed.hours)) this.hours = parsed.hours.slice(-720);
       }
     } catch {
       // missing file on first boot is normal.

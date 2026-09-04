@@ -104,6 +104,7 @@ new Vue({
     autoProbeTimer: null,
     lastPfSignature: null,
     lastProbeAt: {},
+    lastProbeVerdict: {},
 
     uiTrafficStats: false,
 
@@ -114,6 +115,12 @@ new Vue({
     traffic: null,
     trafficSummary: null,
     trafficRange: localStorage.getItem('trafficRange') || 'realtime',
+    // Snapshot for non-realtime ranges (1h/24h/30d come from the server's
+    // per-minute/per-hour rollups). refreshTraffic() keeps realtime live
+    // and re-fetches the snapshot at most every 30s without awaiting it.
+    trafficRangeData: null,
+    trafficRangeAt: 0,
+    trafficRangeFetch: null,
     trafficScope: 'all',
     trafficPollCount: 0,
     // Opt-in: the panel stays hidden until UI_TRAFFIC_STATS=true or the
@@ -718,12 +725,25 @@ new Vue({
           this.lastProbeAt[key] = now;
           try {
             const result = await this.api.probePortForward({ clientId: client.id, ruleId: rule.id });
-            if (result && result.verdict
-              && !['ok', 'dnat-local', 'indeterminate'].includes(result.verdict)) {
-              this.notify(this.$t('networkPolicy.probeProblem', {
-                client: client.name, proto: rule.proto, port: rule.extPort, verdict: result.verdict,
-              }), 'error', 8000);
+            if (!result || !result.verdict) continue;
+            // 'tunnel-down' just means the peer device is offline (phones go
+            // quiet routinely): the online dot already shows it, a toast on
+            // every cycle would be pure noise.
+            if (result.verdict === 'tunnel-down') {
+              this.lastProbeVerdict[key] = result.verdict;
+              continue;
             }
+            if (['ok', 'dnat-local', 'indeterminate'].includes(result.verdict)) {
+              this.lastProbeVerdict[key] = result.verdict;
+              continue;
+            }
+            // Notify once per verdict transition, not on every cycle, so a
+            // persistently unreachable rule shows a single toast.
+            if (this.lastProbeVerdict[key] === result.verdict) continue;
+            this.lastProbeVerdict[key] = result.verdict;
+            this.notify(this.$t('networkPolicy.probeProblem', {
+              client: client.name, proto: rule.proto, port: rule.extPort, verdict: result.verdict,
+            }), 'error', 8000);
           } catch (err) {
             // 429 rate limits and transient failures are expected; stay quiet.
             console.error(err);
@@ -792,6 +812,20 @@ new Vue({
           this.trafficSummary = s;
         }).catch((err) => console.error(err));
       }
+      // A historic range shows its own snapshot; refresh it in the
+      // background at most every 30s so the 1s poll never overwrites it.
+      if (this.trafficRange !== 'realtime' && !this.trafficRangeFetch
+        && Date.now() - this.trafficRangeAt > 30000) {
+        const range = this.trafficRange;
+        this.trafficRangeFetch = this.api.getTrafficHistory(range).then((fetched) => {
+          if (this.trafficRange === range) {
+            this.trafficRangeData = fetched;
+            this.trafficRangeAt = Date.now();
+          }
+        }).catch((err) => console.error(err)).finally(() => {
+          this.trafficRangeFetch = null;
+        });
+      }
       // Persist the rolling window so the chart survives reloads.
       try {
         const hist = (realtime.history && realtime.history.wg0) || [];
@@ -800,21 +834,27 @@ new Vue({
         console.error(err);
       }
     },
-    setTrafficRange(range) {
+    async setTrafficRange(range) {
       this.trafficRange = range;
       try {
         localStorage.setItem('trafficRange', range);
       } catch (err) {
         console.error(err);
       }
-      if (range !== 'realtime') {
-        this.api.getTrafficHistory(range === 'live' ? '2m' : range)
-          .then((h) => {
-            if (this.traffic) this.traffic.history = { wg0: h.wg0 || [] };
-          })
-          .catch((err) => console.error(err));
-      } else {
+      if (range === 'realtime') {
+        this.trafficRangeData = null;
         this.refreshTraffic().catch((err) => console.error(err));
+        return;
+      }
+      try {
+        const fetched = await this.api.getTrafficHistory(range);
+        // Ignore late responses after the user switched range again.
+        if (this.trafficRange === range) {
+          this.trafficRangeData = fetched;
+          this.trafficRangeAt = Date.now();
+        }
+      } catch (err) {
+        console.error(err);
       }
     },
     toggleTraffic() {
@@ -939,7 +979,14 @@ new Vue({
       return opts;
     },
     // ── Traffic dashboard (Plex-style) ──────────────────────────────
+    // trafficBw is the DISPLAYED window: the range snapshot when a
+    // historic range is active, otherwise the realtime rolling window.
+    // Averages/peaks below therefore describe what the chart shows.
     trafficBw() {
+      if (this.trafficRange !== 'realtime' && this.trafficRangeData
+        && Array.isArray(this.trafficRangeData.wg0) && this.trafficRangeData.wg0.length) {
+        return this.trafficRangeData.wg0;
+      }
       const hist = (this.traffic && this.traffic.history && this.traffic.history.wg0) || [];
       return hist;
     },
@@ -950,17 +997,27 @@ new Vue({
       ];
     },
     trafficCpuSeries() {
+      const ranged = this.trafficRange !== 'realtime' && this.trafficRangeData;
       const cpu = (this.traffic && this.traffic.cpu) || {};
+      const hist = ranged && ranged.cpu && ranged.cpu.length ? ranged.cpu : (cpu.history || []);
+      const proc = ranged && ranged.procCpu && ranged.procCpu.length
+        ? ranged.procCpu
+        : (cpu.procHistory || []);
       return [
-        { name: 'SISTEMA', data: (cpu.history || []).map((s) => Number((s.v || 0).toFixed(2))) },
-        { name: 'WG-EASY', data: (cpu.procHistory || []).map((s) => Number((s.v || 0).toFixed(2))) },
+        { name: 'SISTEMA', data: hist.map((s) => Number((s.v || 0).toFixed(2))) },
+        { name: 'WG-EASY', data: proc.map((s) => Number((s.v || 0).toFixed(2))) },
       ];
     },
     trafficMemSeries() {
+      const ranged = this.trafficRange !== 'realtime' && this.trafficRangeData;
       const mem = (this.traffic && this.traffic.mem) || {};
+      const hist = ranged && ranged.mem && ranged.mem.length ? ranged.mem : (mem.history || []);
+      const proc = ranged && ranged.procMem && ranged.procMem.length
+        ? ranged.procMem
+        : (mem.procHistory || []);
       return [
-        { name: 'SISTEMA', data: (mem.history || []).map((s) => Number((s.v || 0).toFixed(2))) },
-        { name: 'WG-EASY', data: (mem.procHistory || []).map((s) => Number((s.v || 0).toFixed(2))) },
+        { name: 'SISTEMA', data: hist.map((s) => Number((s.v || 0).toFixed(2))) },
+        { name: 'WG-EASY', data: proc.map((s) => Number((s.v || 0).toFixed(2))) },
       ];
     },
     trafficPanelOptions() {

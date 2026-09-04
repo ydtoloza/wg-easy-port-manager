@@ -407,10 +407,46 @@ describe('WireGuard', () => {
       await setupProbe({ nftPresent: true, handshakeSecondsAgo: 10, tcpResult: true });
       const verdict = await wg.probePortForward({ clientId: 'client1', rule: '0' });
       expect(verdict).toMatchObject({
-        rulePresent: true, tunnelUp: true, tcpConnectable: true, verdict: 'ok',
+        rulePresent: true, tunnelUp: true, tcpConnectable: true, peerConnectable: true, verdict: 'ok',
       });
       expect(verdict.rule).toMatchObject({
         proto: 'tcp', extPort: 2000, intPort: 2000, peerIP: '10.8.0.2',
+      });
+    });
+
+    it('derives ok via the tunnel when the public hairpin refuses', async () => {
+      // Production case: SYNs from the server to its own public IP never
+      // traverse prerouting DNAT, so the public check refuses while the
+      // service answers through wg0. Only the tunnel path decides 'ok'.
+      const instance = new (require('./WireGuard'))(); // eslint-disable-line global-require
+      await instance.getConfig();
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('nft -j list table')) return nftTable(true);
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(10);
+        return '';
+      });
+      const tcpConnect = jest.spyOn(instance, '__tcpConnect')
+        .mockImplementation(async (host) => host === '10.8.0.2');
+      const verdict = await instance.probePortForward({ clientId: 'client1', rule: '0' });
+      expect(tcpConnect).toHaveBeenCalledTimes(2);
+      expect(verdict).toMatchObject({
+        rulePresent: true, tunnelUp: true, tcpConnectable: false, peerConnectable: true, verdict: 'ok',
+      });
+    });
+
+    it('derives unreachable when the tunnel path refuses even if local answers', async () => {
+      const instance = new (require('./WireGuard'))(); // eslint-disable-line global-require
+      await instance.getConfig();
+      Util.exec.mockImplementation(async (cmd) => {
+        if (typeof cmd === 'string' && cmd.includes('nft -j list table')) return nftTable(true);
+        if (typeof cmd === 'string' && cmd.includes('wg show wg0 dump')) return dumpFor(10);
+        return '';
+      });
+      jest.spyOn(instance, '__tcpConnect')
+        .mockImplementation(async (host) => host !== '10.8.0.2');
+      const verdict = await instance.probePortForward({ clientId: 'client1', rule: '0' });
+      expect(verdict).toMatchObject({
+        rulePresent: true, tunnelUp: true, tcpConnectable: true, peerConnectable: false, verdict: 'unreachable',
       });
     });
 
@@ -424,7 +460,9 @@ describe('WireGuard', () => {
       });
       jest.spyOn(instance, '__tcpConnect').mockResolvedValue(false);
       const verdict = await instance.probePortForward({ clientId: 'client1', rule: '0' });
-      expect(verdict).toMatchObject({ rulePresent: false, tcpConnectable: false, verdict: 'rule-missing' });
+      expect(verdict).toMatchObject({
+        rulePresent: false, tcpConnectable: false, peerConnectable: null, verdict: 'rule-missing',
+      });
     });
 
     it('derives tunnel-down when the rule exists but the tunnel is stale', async () => {
@@ -480,7 +518,9 @@ describe('WireGuard', () => {
       const verdict = await wg.probePortForward({ clientId: 'client1', rule: '0' });
 
       expect(tcpConnect).not.toHaveBeenCalled();
-      expect(verdict).toMatchObject({ rulePresent: true, tcpConnectable: null, verdict: 'indeterminate' });
+      expect(verdict).toMatchObject({
+        rulePresent: true, tcpConnectable: null, peerConnectable: null, verdict: 'indeterminate',
+      });
     });
 
     it('reports a missing UDP-only DNAT rule without attempting a TCP probe', async () => {
@@ -496,7 +536,9 @@ describe('WireGuard', () => {
       const verdict = await wg.probePortForward({ clientId: 'client1', rule: '0' });
 
       expect(tcpConnect).not.toHaveBeenCalled();
-      expect(verdict).toMatchObject({ rulePresent: false, tcpConnectable: null, verdict: 'rule-missing' });
+      expect(verdict).toMatchObject({
+        rulePresent: false, tcpConnectable: null, peerConnectable: null, verdict: 'rule-missing',
+      });
     });
 
     it('labels hairpin connects honestly as dnat-local', async () => {
@@ -509,7 +551,9 @@ describe('WireGuard', () => {
       });
       jest.spyOn(wg4, '__tcpConnect').mockResolvedValue(true);
       const verdict = await wg4.probePortForward({ clientId: 'client1', rule: '0' });
-      expect(verdict).toMatchObject({ rulePresent: false, tcpConnectable: true, verdict: 'dnat-local' });
+      expect(verdict).toMatchObject({
+        rulePresent: false, tcpConnectable: true, peerConnectable: null, verdict: 'dnat-local',
+      });
     });
 
     it('rate-limits repeated probes of the same rule', async () => {

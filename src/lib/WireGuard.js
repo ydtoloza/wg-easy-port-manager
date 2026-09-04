@@ -1962,10 +1962,18 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     return now - client.latestHandshakeAt.getTime() < onlineWindowMs;
   }
 
-  // Three-level reachability verdict for one forwarding rule. Runs OUTSIDE the
-  // mutation queue (it performs network I/O with a 2s budget); the rule is
+  // Reachability verdict for one forwarding rule. Runs OUTSIDE the mutation
+  // queue (it performs network I/O with a ~2s budget); the rule is
   // snapshotted synchronously up front so concurrent mutations cannot change
   // what is being probed mid-flight.
+  //
+  // Two TCP checks run in parallel for TCP rules: one against the public
+  // endpoint (detects hairpin/dnat-local answers) and one DIRECTLY against
+  // peerIP:intPort through the wg0 tunnel (the server routes the peer /32
+  // over wg0). The tunnel-direct check is the honest end-to-end signal:
+  // locally originated SYNs to the server's own public IP never traverse
+  // prerouting DNAT, so the public check alone mislabels healthy forwards
+  // as 'unreachable'.
   async probePortForward({ clientId, rule }) {
     const config = await this.getConfig();
     const client = config.clients[clientId];
@@ -2017,9 +2025,18 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         debug(`Probe: could not read wg dump: ${err.message}`);
       }
 
-      const tcpConnectable = snapshot.proto === 'udp'
-        ? null
-        : await this.__tcpConnect(this.__serverSettings.host, snapshot.extPort);
+      const checks = [];
+      if (snapshot.proto !== 'udp') {
+        checks.push(this.__tcpConnect(this.__serverSettings.host, snapshot.extPort));
+        // Tunnel-direct service check; skipped when the DNAT rule itself is
+        // missing (the forward cannot work either way).
+        checks.push(isPresent
+          ? this.__tcpConnect(snapshot.peerIP, snapshot.intPort)
+          : Promise.resolve(null));
+      }
+      const [tcpConnectable, peerConnectable] = checks.length
+        ? await Promise.all(checks)
+        : [null, null];
 
       let verdict;
       if (!isPresent) {
@@ -2029,13 +2046,14 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
       } else if (!tunnelUp) {
         verdict = tcpConnectable ? 'dnat-local' : 'tunnel-down';
       } else {
-        verdict = tcpConnectable ? 'ok' : 'unreachable';
+        verdict = peerConnectable ? 'ok' : 'unreachable';
       }
       return {
         rule: { ...snapshot },
         rulePresent: isPresent,
         tunnelUp,
         tcpConnectable,
+        peerConnectable: peerConnectable ?? null,
         verdict,
       };
     })();

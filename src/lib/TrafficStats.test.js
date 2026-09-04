@@ -2,6 +2,9 @@
 
 'use strict';
 
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const TrafficStats = require('./TrafficStats');
 const { computeSpeeds, appendCapped } = require('./TrafficStats');
 
@@ -53,6 +56,62 @@ describe('TrafficStats sampler', () => {
     expect(summary.peakAt.rxSpeed).toBe(t);
     expect(summary.avgRx).toBe(3000);
     expect(summary.totals.rxBytes).toBeGreaterThan(0);
+  });
+
+  it('rolls ticks into per-minute and per-hour history', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wgpm-traffic-'));
+    let t = 1_700_000_000_000;
+    const stats = new TrafficStats({
+      pollMs: 1000, samples: 200, wgPath: dir, now: () => t,
+    });
+    // 3 ticks in minute A, 2 ticks in minute B, then jump 61 minutes.
+    for (let i = 0; i < 3; i += 1) {
+      stats.lastTickAt = t - 1000;
+      stats.recordIface('wg0', 1000, 500, t);
+      stats.recordSystem(10, 1, 20, 5, t);
+      t += 1000;
+    }
+    t = Math.ceil(t / 60000) * 60000 + 1000;
+    for (let i = 0; i < 2; i += 1) {
+      stats.lastTickAt = t - 1000;
+      stats.recordIface('wg0', 3000, 1500, t);
+      stats.recordSystem(30, 3, 40, 7, t);
+      t += 1000;
+    }
+    expect(stats.minutes).toHaveLength(1);
+    expect(stats.minutes[0]).toMatchObject({ rx: 1000, tx: 500 });
+    expect(stats.getHistory('24h').wg0).toHaveLength(1);
+
+    // Jump over an hour boundary: closes minute B (hourAcc opens).
+    t = (Math.floor(t / 3600000) + 1) * 3600000 + 1000;
+    stats.lastTickAt = t - 1000;
+    stats.recordIface('wg0', 5000, 2500, t);
+    stats.recordSystem(50, 5, 60, 9, t);
+    expect(stats.minutes).toHaveLength(2);
+    expect(stats.minutes[1]).toMatchObject({ rx: 3000, tx: 1500 });
+    expect(stats.hours).toHaveLength(0);
+    // Jump one more hour: closes the partial hour into hours.
+    t = (Math.floor(t / 3600000) + 1) * 3600000 + 61000;
+    stats.lastTickAt = t - 1000;
+    stats.recordIface('wg0', 5000, 2500, t);
+    stats.recordSystem(50, 5, 60, 9, t);
+    expect(stats.hours).toHaveLength(1);
+    expect(stats.hours[0]).toMatchObject({ rx: 2000, tx: 1000 });
+    const day = stats.getHistory('24h');
+    expect(day.wg0).toHaveLength(3);
+    expect(day.cpu[1]).toMatchObject({ v: 30 });
+    expect(stats.getHistory('1h').wg0).toHaveLength(3);
+    expect(stats.getHistory('30d').wg0).toHaveLength(1);
+
+    await stats.save();
+    const reloaded = new TrafficStats({
+      pollMs: 1000, samples: 200, wgPath: dir, now: Date.now,
+    });
+    await reloaded.load();
+    expect(reloaded.minutes).toHaveLength(3);
+    expect(reloaded.hours).toHaveLength(1);
+    expect(reloaded.getHistory('24h').wg0).toHaveLength(3);
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('generates synthetic demo traffic on non-linux for UI evaluation', async () => {

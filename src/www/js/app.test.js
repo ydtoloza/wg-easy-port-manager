@@ -146,6 +146,7 @@ describe('port-forward UI state', () => {
       clients: [client()],
       expandedPfClients: { client1: true },
       lastProbeAt: {},
+      lastProbeVerdict: {},
       api: { probePortForward },
       isPfExpanded: options.methods.isPfExpanded,
       notify: jest.fn(),
@@ -170,6 +171,7 @@ describe('port-forward UI state', () => {
       }],
       expandedPfClients: { client1: true },
       lastProbeAt: {},
+      lastProbeVerdict: {},
       api: {
         probePortForward: jest.fn().mockResolvedValue({ verdict: 'indeterminate' }),
       },
@@ -181,6 +183,39 @@ describe('port-forward UI state', () => {
     await options.methods.runAutoProbe.call(state);
 
     expect(state.notify).not.toHaveBeenCalled();
+  });
+
+  it('stays quiet for offline peers and notifies once per verdict change', async () => {
+    const options = loadAppOptions();
+    const api = { probePortForward: jest.fn().mockResolvedValue({ verdict: 'tunnel-down' }) };
+    const state = {
+      forwardingEnabled: true,
+      clients: [client()],
+      expandedPfClients: { client1: true },
+      lastProbeAt: {},
+      lastProbeVerdict: {},
+      api,
+      isPfExpanded: options.methods.isPfExpanded,
+      notify: jest.fn(),
+      $t: jest.fn((key) => key),
+    };
+
+    await options.methods.runAutoProbe.call(state);
+    expect(state.notify).not.toHaveBeenCalled();
+
+    api.probePortForward.mockResolvedValue({ verdict: 'unreachable' });
+    state.lastProbeAt = {};
+    await options.methods.runAutoProbe.call(state);
+    expect(state.notify).toHaveBeenCalledTimes(1);
+
+    state.lastProbeAt = {};
+    await options.methods.runAutoProbe.call(state);
+    expect(state.notify).toHaveBeenCalledTimes(1);
+
+    api.probePortForward.mockResolvedValue({ verdict: 'ok' });
+    state.lastProbeAt = {};
+    await options.methods.runAutoProbe.call(state);
+    expect(state.notify).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -239,5 +274,30 @@ describe('traffic side panel', () => {
     expect(options.methods.fmtBytes(0)).toBe('0 B');
     expect(options.methods.fmtBytes(1536)).toBe('1.5 KB');
     expect(options.methods.fmtSpeed(1500)).toBe('1.5 KB/s');
+  });
+
+  it('prefers the range snapshot over realtime while a historic range is active', async () => {
+    const options = loadAppOptions();
+    const snapshot = {
+      range: '24h',
+      wg0: [{ t: 1, rx: 7000, tx: 700 }],
+      cpu: [{ t: 1, v: 50 }],
+      procCpu: [{ t: 1, v: 5 }],
+      mem: [{ t: 1, v: 60 }],
+      procMem: [{ t: 1, v: 6 }],
+    };
+    const state = {
+      trafficRange: '24h',
+      trafficRangeData: snapshot,
+      trafficRangeAt: 0,
+      traffic: { history: { wg0: [{ t: 2, rx: 100, tx: 10 }] } },
+      api: { getTrafficHistory: jest.fn() },
+    };
+    expect(options.computed.trafficBw.call(state)).toEqual(snapshot.wg0);
+    expect(options.computed.trafficAvg.call({ ...state, trafficBw: snapshot.wg0 })).toEqual({ rx: 7000, tx: 700 });
+    expect(options.computed.trafficCpuSeries.call(state)[0].data).toEqual([50]);
+
+    state.trafficRange = 'realtime';
+    expect(options.computed.trafficBw.call(state)).toEqual([{ t: 2, rx: 100, tx: 10 }]);
   });
 });
