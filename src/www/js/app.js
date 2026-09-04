@@ -1032,10 +1032,10 @@ new Vue({
         },
         colors: ['#3b82f6', '#f59e0b'],
         // First series solid, second dashed: instant TX/RX distinction even
-        // at a glance or in grayscale.
+        // at a glance or in grayscale. NOTE: no `fill` key here — ApexCharts
+        // 3.49 drops the whole series when fill.opacity is 0 on line charts.
         stroke: { curve: 'smooth', width: 3, dashArray: [0, 7] },
         markers: { size: 0, hover: { size: 4 } },
-        fill: { opacity: 0 },
         dataLabels: { enabled: false },
         grid: {
           show: true,
