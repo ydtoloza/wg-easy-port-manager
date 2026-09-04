@@ -690,29 +690,33 @@ describe('HTTP server security', () => {
   });
 
   it('serves traffic realtime/history/summary behind admin auth', async () => {
+    // Isolated client IP: earlier flooding/lockout tests share the 127.0.0.1
+    // password bucket, so a fixed X-Forwarded-For (honored via the mocked
+    // TRUSTED_PROXY_IP) keeps this test deterministic under --runInBand.
+    const via = { Authorization: 'correct-password', 'X-Forwarded-For': '198.51.100.200' };
     const anon = await fetch(`${baseUrl}/api/traffic/realtime`);
     expect(anon.status).toBe(401);
 
     const realtime = await fetch(`${baseUrl}/api/traffic/realtime`, {
-      headers: { Authorization: 'correct-password' },
+      headers: via,
     });
     expect(realtime.status).toBe(200);
     expect(await realtime.json()).toMatchObject({ pollMs: 1000 });
     expect(TrafficStats.getRealtime).toHaveBeenCalled();
 
     const history = await fetch(`${baseUrl}/api/traffic/history?range=1h`, {
-      headers: { Authorization: 'correct-password' },
+      headers: via,
     });
     expect(history.status).toBe(200);
     expect(TrafficStats.getHistory).toHaveBeenCalledWith('1h');
 
     const badRange = await fetch(`${baseUrl}/api/traffic/history?range=99y`, {
-      headers: { Authorization: 'correct-password' },
+      headers: via,
     });
     expect(badRange.status).toBe(400);
 
     const summary = await fetch(`${baseUrl}/api/traffic/summary`, {
-      headers: { Authorization: 'correct-password' },
+      headers: via,
     });
     expect(summary.status).toBe(200);
     expect(TrafficStats.getSummary).toHaveBeenCalled();
