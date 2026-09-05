@@ -72,6 +72,15 @@ module.exports.UI_CHART_TYPE = [0, 1, 2, 3].includes(Number(process.env.UI_CHART
 module.exports.TRAFFIC_POLL_MS = Number(process.env.TRAFFIC_POLL_MS) || 1000;
 module.exports.TRAFFIC_SAMPLES = Number(process.env.TRAFFIC_SAMPLES) || 120;
 
+// Scheduled state backups (lib/Backup): copies wg0.json + sidecars into
+// WG_PATH/backups/<timestamp>/ every INTERVAL_HOURS, keeping the RETENTION
+// newest directories. Enabled by default; set WG_BACKUP_ENABLED=false to opt out.
+module.exports.WG_BACKUP_ENABLED = process.env.WG_BACKUP_ENABLED
+  ? isTrue(process.env.WG_BACKUP_ENABLED)
+  : true;
+module.exports.WG_BACKUP_INTERVAL_HOURS = Number(process.env.WG_BACKUP_INTERVAL_HOURS) || 24;
+module.exports.WG_BACKUP_RETENTION = Number(process.env.WG_BACKUP_RETENTION) || 7;
+
 module.exports.validateEnvironment = () => {
   if (module.exports.PASSWORD) {
     throw new Error('PASSWORD is not supported. Use PASSWORD_HASH instead.');
