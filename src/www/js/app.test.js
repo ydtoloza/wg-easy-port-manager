@@ -111,6 +111,7 @@ describe('port-forward UI state', () => {
     const state = {
       expandedPfClients: {},
       scheduleAutoProbe: jest.fn(),
+      persistPfExpanded: jest.fn(),
       $set(target, key, value) {
         target[key] = value;
       },
@@ -120,6 +121,7 @@ describe('port-forward UI state', () => {
     options.methods.togglePfExpanded.call(state, 'client1');
 
     expect(state.scheduleAutoProbe).toHaveBeenCalledTimes(1);
+    expect(state.persistPfExpanded).toHaveBeenCalledTimes(2);
   });
 
   it('re-arms one debounce timer instead of stacking probes', () => {
@@ -151,12 +153,16 @@ describe('port-forward UI state', () => {
       isPfExpanded: options.methods.isPfExpanded,
       notify: jest.fn(),
       $t: jest.fn(),
+      $set(target, key, value) {
+        target[key] = value;
+      },
     };
 
     await options.methods.runAutoProbe.call(state);
     await options.methods.runAutoProbe.call(state);
 
     expect(probePortForward).toHaveBeenCalledTimes(1);
+    expect(state.lastProbeVerdict['client1:rule1']).toEqual(expect.objectContaining({ verdict: 'ok' }));
   });
 
   it('does not alert for protocol-indeterminate probe results', async () => {
@@ -178,6 +184,9 @@ describe('port-forward UI state', () => {
       isPfExpanded: options.methods.isPfExpanded,
       notify: jest.fn(),
       $t: jest.fn(),
+      $set(target, key, value) {
+        target[key] = value;
+      },
     };
 
     await options.methods.runAutoProbe.call(state);
@@ -198,6 +207,9 @@ describe('port-forward UI state', () => {
       isPfExpanded: options.methods.isPfExpanded,
       notify: jest.fn(),
       $t: jest.fn((key) => key),
+      $set(target, key, value) {
+        target[key] = value;
+      },
     };
 
     await options.methods.runAutoProbe.call(state);
@@ -299,5 +311,331 @@ describe('traffic side panel', () => {
 
     state.trafficRange = 'realtime';
     expect(options.computed.trafficBw.call(state)).toEqual([{ t: 2, rx: 100, tx: 10 }]);
+  });
+});
+
+describe('notification center', () => {
+  afterEach(() => {
+    localStorageMock.getItem.mockReset();
+    localStorageMock.getItem.mockImplementation(() => null);
+    localStorageMock.setItem.mockClear();
+  });
+
+  function notificationState(options) {
+    return {
+      toasts: [],
+      toastId: 0,
+      notificationLogId: 0,
+      notifications: [],
+      notificationsReadAt: 0,
+      showNotifications: false,
+      dismissToast: options.methods.dismissToast,
+      logNotification: options.methods.logNotification,
+      persistNotifications: options.methods.persistNotifications,
+      markNotificationsRead: options.methods.markNotificationsRead,
+    };
+  }
+
+  it('logs every toast into the durable history and persists it', () => {
+    const options = loadAppOptions();
+    const state = notificationState(options);
+    options.methods.notify.call(state, 'probe failed', 'error', 5);
+    expect(state.notifications).toHaveLength(1);
+    expect(state.notifications[0].msg).toBe('probe failed');
+    expect(localStorageMock.setItem).toHaveBeenCalledWith('wgNotifications', expect.stringContaining('probe failed'));
+  });
+
+  it('caps the in-memory log and persists only the newest slice', () => {
+    const options = loadAppOptions();
+    const state = notificationState(options);
+    for (let i = 0; i < 120; i += 1) options.methods.logNotification.call(state, `n${i}`, 'error');
+    expect(state.notifications).toHaveLength(100);
+    expect(JSON.parse(localStorageMock.setItem.mock.calls.at(-1)[1])).toHaveLength(50);
+  });
+
+  it('marks entries read when the panel opens and clears on demand', () => {
+    const options = loadAppOptions();
+    const state = notificationState(options);
+    options.methods.logNotification.call(state, 'hello', 'info');
+    expect(options.computed.unreadCount.call(state)).toBe(1);
+    options.methods.toggleNotifications.call(state);
+    expect(state.showNotifications).toBe(true);
+    expect(options.computed.unreadCount.call(state)).toBe(0);
+    options.methods.clearNotifications.call(state);
+    expect(state.notifications).toHaveLength(0);
+  });
+
+  it('keeps newest notifications first in the panel slice', () => {
+    const options = loadAppOptions();
+    const state = {
+      notifications: [
+        {
+          id: 1, msg: 'old', type: 'error', at: 1,
+        },
+        {
+          id: 2, msg: 'new', type: 'error', at: 2,
+        },
+      ],
+    };
+    expect(options.computed.notificationsSlice.call(state).map((entry) => entry.id)).toEqual([2, 1]);
+  });
+});
+
+describe('random port generator', () => {
+  it('draws inside the configured window avoiding used and blocked ports', () => {
+    const options = loadAppOptions();
+    const state = {
+      forwardingEnabled: true,
+      clients: [{
+        id: 'a',
+        portForwards: [{
+          id: 'r1', proto: 'tcp', extPort: 5000, intPort: 80,
+        }],
+      }],
+      publicServerConfig: {
+        portFwdMin: 4998, portFwdMax: 5002, port: 51820, configPort: 51821,
+      },
+      newPf: {},
+      pfError: 'stale',
+      getNewPf: options.methods.getNewPf,
+      usedExternalPorts: options.methods.usedExternalPorts,
+      notify: jest.fn(),
+      $t: (key) => key,
+      $set(target, key, value) {
+        target[key] = value;
+      },
+    };
+    options.methods.randomPortFor.call(state, { id: 'a' });
+    const pf = state.newPf.a;
+    expect(pf.extPort).not.toBe(5000); // already assigned to this peer
+    expect(pf.extPort).toBeGreaterThanOrEqual(4998);
+    expect(pf.extPort).toBeLessThanOrEqual(5002);
+    expect(pf.intPort).toBe(pf.extPort); // seeding default mirrors the draw
+    expect(state.pfError).toBeNull();
+    expect(state.notify).not.toHaveBeenCalled();
+  });
+
+  it('notifies when the configured window has no free port left', () => {
+    const options = loadAppOptions();
+    const state = {
+      forwardingEnabled: true,
+      clients: [{
+        id: 'a',
+        portForwards: [{
+          id: 'r1', proto: 'tcp', extPort: 5000, intPort: 80,
+        }],
+      }],
+      publicServerConfig: {
+        portFwdMin: 5000, portFwdMax: 5000, port: 51820, configPort: 51821,
+      },
+      newPf: {},
+      pfError: null,
+      getNewPf: options.methods.getNewPf,
+      usedExternalPorts: options.methods.usedExternalPorts,
+      notify: jest.fn(),
+      $t: (key) => key,
+      $set(target, key, value) {
+        target[key] = value;
+      },
+    };
+    options.methods.randomPortFor.call(state, { id: 'a' });
+    expect(state.newPf.a.extPort).toBeNull(); // entry exists but was never filled
+    expect(state.notify).toHaveBeenCalledWith('pf.randomPortNone', 'error');
+  });
+
+  it('prefers ports outside the ephemeral range, falling back when forced', () => {
+    const options = loadAppOptions();
+    // Full window: the draw must land outside 32768-60999 (project constraint).
+    const wide = {
+      forwardingEnabled: true,
+      clients: [{ id: 'a', portForwards: [] }],
+      publicServerConfig: {
+        portFwdMin: 1024, portFwdMax: 65535, port: 51820, configPort: 51821,
+      },
+      newPf: {},
+      pfError: null,
+      getNewPf: options.methods.getNewPf,
+      usedExternalPorts: options.methods.usedExternalPorts,
+      notify: jest.fn(),
+      $t: (key) => key,
+      $set(target, key, value) {
+        target[key] = value;
+      },
+    };
+    for (let i = 0; i < 20; i += 1) {
+      options.methods.randomPortFor.call(wide, { id: 'a' });
+      const port = wide.newPf.a.extPort;
+      expect(port).toBeGreaterThanOrEqual(1024);
+      // Outside 32768-60999: below it or above it both count.
+      const inEphemeral = port >= 32768 && port <= 60999;
+      expect(inEphemeral).toBe(false);
+    }
+    // A window entirely inside the ephemeral range still yields a port.
+    const forced = {
+      ...wide,
+      publicServerConfig: {
+        portFwdMin: 40000, portFwdMax: 40100, port: 51820, configPort: 51821,
+      },
+    };
+    options.methods.randomPortFor.call(forced, { id: 'a' });
+    expect(forced.newPf.a.extPort).toBeGreaterThanOrEqual(40000);
+    expect(forced.newPf.a.extPort).toBeLessThanOrEqual(40100);
+  });
+
+  it('does nothing while the forwarding kill switch is engaged', () => {
+    const options = loadAppOptions();
+    const state = {
+      forwardingEnabled: false,
+      clients: [],
+      publicServerConfig: null,
+      newPf: {},
+      getNewPf: options.methods.getNewPf,
+      usedExternalPorts: options.methods.usedExternalPorts,
+      notify: jest.fn(),
+      $t: (key) => key,
+    };
+    options.methods.randomPortFor.call(state, { id: 'a' });
+    expect(state.newPf.a).toBeUndefined();
+    expect(state.notify).not.toHaveBeenCalled();
+  });
+});
+
+describe('port-forwarding panel persistence', () => {
+  afterEach(() => {
+    localStorageMock.getItem.mockReset();
+    localStorageMock.getItem.mockImplementation(() => null);
+    localStorageMock.setItem.mockClear();
+  });
+
+  it('hydrates expanded sections from localStorage, ignoring stale values', () => {
+    const options = loadAppOptions();
+    localStorageMock.getItem.mockImplementation((key) => (key === 'pfExpanded' ? '{"client1":true,"client2":false,"bad": "nope"}' : null));
+    const state = { notifications: [], notificationsReadAt: 0, expandedPfClients: {} };
+    options.methods.hydratePersistentState.call(state);
+    expect(state.expandedPfClients).toEqual({ client1: true });
+  });
+
+  it('stores only expanded sections when toggling, collapsed by default', () => {
+    const options = loadAppOptions();
+    const state = {
+      expandedPfClients: { client1: true },
+      scheduleAutoProbe: jest.fn(),
+      persistPfExpanded: options.methods.persistPfExpanded,
+      $set(target, key, value) {
+        target[key] = value;
+      },
+    };
+    options.methods.togglePfExpanded.call(state, 'client1'); // collapse
+    expect(localStorageMock.setItem).toHaveBeenLastCalledWith('pfExpanded', '{}');
+    options.methods.togglePfExpanded.call(state, 'client3'); // expand
+    expect(localStorageMock.setItem).toHaveBeenLastCalledWith('pfExpanded', '{"client3":true}');
+    expect(state.scheduleAutoProbe).toHaveBeenCalledTimes(1);
+  });
+
+  it('loads sections collapsed even when the peer already has forwards', async () => {
+    const options = loadAppOptions();
+    const state = {
+      ...options.data,
+      authenticated: true,
+      forwardingEnabled: true,
+      clients: null,
+      expandedPfClients: {},
+      newPf: {},
+      lastPfSignature: null,
+      lastProbeAt: {},
+      lastProbeVerdict: {},
+      refreshGeneration: 0,
+      chartsEnabled: false,
+      api: {
+        getClients: jest.fn().mockResolvedValue([client()]),
+        getServerConfig: jest.fn().mockResolvedValue({ forwardingEnabled: true, portFwdMin: 1024, portFwdMax: 65535 }),
+      },
+      scheduleAutoProbe: jest.fn(),
+      $set(target, key, value) {
+        target[key] = value;
+      },
+    };
+    await options.methods.refresh.call(state);
+    expect(state.expandedPfClients).toEqual({});
+    expect(state.publicServerConfig).toEqual(expect.objectContaining({ portFwdMin: 1024 }));
+  });
+
+  it('prunes probe bookkeeping when rules disappear', async () => {
+    const options = loadAppOptions();
+    const state = {
+      ...options.data,
+      authenticated: true,
+      forwardingEnabled: true,
+      clients: null,
+      expandedPfClients: {},
+      newPf: {},
+      lastPfSignature: null,
+      lastProbeAt: { 'gone:r1': 1 },
+      lastProbeVerdict: { 'gone:r1': { verdict: 'ok', at: 1 } },
+      refreshGeneration: 0,
+      chartsEnabled: false,
+      api: {
+        getClients: jest.fn().mockResolvedValue([]),
+        getServerConfig: jest.fn().mockResolvedValue({ forwardingEnabled: true }),
+      },
+      scheduleAutoProbe: jest.fn(),
+      $set(target, key, value) {
+        target[key] = value;
+      },
+    };
+    await options.methods.refresh.call(state);
+    expect(state.lastProbeAt).toEqual({});
+    expect(state.lastProbeVerdict).toEqual({});
+  });
+});
+
+describe('reachability dot', () => {
+  it('maps probe verdicts to dot colors', () => {
+    const options = loadAppOptions();
+    const state = {
+      lastProbeVerdict: {
+        'c:r-ok': { verdict: 'ok', at: 1 },
+        'c:r-bad': { verdict: 'unreachable', at: 1 },
+        'c:r-miss': { verdict: 'rule-missing', at: 1 },
+        'c:r-local': { verdict: 'dnat-local', at: 1 },
+        'c:r-off': { verdict: 'tunnel-down', at: 1 },
+        'c:r-udp': { verdict: 'indeterminate', at: 1 },
+      },
+      probeVerdictFor: options.methods.probeVerdictFor,
+      $t: (key) => key,
+    };
+    expect(options.methods.probeDotClass.call(state, 'c', 'r-ok')).toBe('bg-green-500');
+    expect(options.methods.probeDotClass.call(state, 'c', 'r-bad')).toBe('bg-red-500');
+    expect(options.methods.probeDotClass.call(state, 'c', 'r-miss')).toBe('bg-red-500');
+    expect(options.methods.probeDotClass.call(state, 'c', 'r-local')).toBe('bg-amber-400');
+    expect(options.methods.probeDotClass.call(state, 'c', 'r-off')).toBe('bg-gray-300 dark:bg-neutral-500');
+    expect(options.methods.probeDotClass.call(state, 'c', 'r-udp')).toBe('bg-gray-300 dark:bg-neutral-500');
+    expect(options.methods.probeDotClass.call(state, 'c', 'r-none')).toBe('bg-gray-300 dark:bg-neutral-500');
+    expect(options.methods.probeDotTitle.call(state, { id: 'c' }, { id: 'r-ok' })).toBe('networkPolicy.verdictTitle');
+  });
+
+  it('lists probe entries newest first for the notification panel', () => {
+    const options = loadAppOptions();
+    const state = {
+      clients: [
+        {
+          id: 'c1',
+          portForwards: [{
+            id: 'r1', proto: 'tcp', extPort: 8080, intPort: 80,
+          }],
+        },
+        {
+          id: 'c2',
+          portForwards: [{
+            id: 'r2', proto: 'udp', extPort: 53, intPort: 53,
+          }],
+        },
+      ],
+      lastProbeVerdict: {
+        'c1:r1': { verdict: 'ok', at: 10 },
+        'c2:r2': { verdict: 'indeterminate', at: 20 },
+      },
+    };
+    expect(options.methods.probeEntries.call(state).map((entry) => entry.rule.id)).toEqual(['r2', 'r1']);
   });
 });

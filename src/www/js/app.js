@@ -42,6 +42,55 @@ const CHART_COLORS = {
   gradient: { light: ['rgba(0,0,0,1.0)', 'rgba(0,0,0,1.0)'], dark: ['rgba(128,128,128,0)', 'rgba(128,128,128,0)'] },
 };
 
+// Ports the random generator must never suggest even though they sit in the
+// dynamic range: popular services an admin will plausibly run on the host
+// (databases, alt-HTTP, RDP/VNC/SMB, discovery protocols) plus this app's own
+// default WireGuard/panel ports. Server ports and already-assigned ports are
+// excluded separately at draw time.
+const RANDOM_PORT_BLOCKLIST = new Set([
+  51820, 51821,
+  1900, 5353,
+  3000, 5000, 8000, 8080, 8081, 8443, 8888,
+  1433, 3306, 5432, 6379, 11211, 9200, 27017,
+  1723, 3389, 445, 5060, 5061, 5900,
+]);
+
+// Linux default ephemeral range. docs/v2.1-security-constraints.md (Phase 1)
+// prefers auto-assigned forwards outside it so an inbound DNAT port never
+// competes with outbound source binds. Soft exclusion: only when the whole
+// configured window sits inside it do we fall back to drawing from there.
+const LINUX_EPHEMERAL_MIN = 32768;
+const LINUX_EPHEMERAL_MAX = 60999;
+
+const isEphemeralPort = (port) => port >= LINUX_EPHEMERAL_MIN && port <= LINUX_EPHEMERAL_MAX;
+
+// Uniform draw from [min, max] avoiding blocked values, preferring ports that
+// also avoid softBlocked (ephemeral range). Random draws are capped, then
+// deterministic sweeps cover tiny windows, so the function always terminates
+// and returns null only when the window is exhausted.
+function pickRandomPort({
+  min, max, blocked, softBlocked,
+}) {
+  const low = Math.ceil(min);
+  const high = Math.floor(max);
+  const span = high - low + 1;
+  if (span <= 0) return null;
+  const isFree = (port, strict) => !blocked.has(port) && !(strict && softBlocked && softBlocked(port));
+  const maxAttempts = Math.min(span, 1000);
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const port = low + Math.floor(Math.random() * span);
+    if (isFree(port, true)) return port;
+  }
+  for (let port = low; port <= high; port += 1) {
+    if (isFree(port, true)) return port;
+  }
+  // The whole window is soft-blocked (or nearly): allow it rather than fail.
+  for (let port = low; port <= high; port += 1) {
+    if (isFree(port, false)) return port;
+  }
+  return null;
+}
+
 const appTemplate = window.WgEasyAppTemplate;
 if (!appTemplate) throw new Error('Precompiled application template was not loaded.');
 
@@ -104,7 +153,22 @@ new Vue({
     autoProbeTimer: null,
     lastPfSignature: null,
     lastProbeAt: {},
+    // key `${clientId}:${ruleId}` -> { verdict, at }. Drives the per-rule
+    // reachability dot and the probe section of the notification center.
     lastProbeVerdict: {},
+
+    // Notification center behind the topbar bell. Toasts vanish by design;
+    // this durable log keeps the last 100 entries (50 persisted) so probe
+    // events stay reviewable. Unread = entry.at > notificationsReadAt.
+    notifications: [],
+    notificationLogId: 0,
+    notificationsReadAt: 0,
+    showNotifications: false,
+
+    // Public slice of the server settings (ports + forwarding window) as
+    // returned by /api/wireguard/server-config; the random-port generator
+    // stays inside the admin-configured window with it.
+    publicServerConfig: null,
 
     uiTrafficStats: false,
 
@@ -223,10 +287,54 @@ new Vue({
       const id = ++this.toastId;
       this.toasts.push({ id, msg, type });
       setTimeout(() => this.dismissToast(id), duration);
+      // Every toast also lands in the bell's durable history, so probe
+      // warnings that flash once stay reviewable later.
+      this.logNotification(msg, type);
     },
     dismissToast(id) {
       const idx = this.toasts.findIndex((t) => t.id === id);
       if (idx !== -1) this.toasts.splice(idx, 1);
+    },
+    // ── Notification center (bell) ────────────────────────────────────────
+    logNotification(msg, type) {
+      this.notifications.push({
+        id: ++this.notificationLogId, msg, type, at: Date.now(),
+      });
+      if (this.notifications.length > 100) {
+        this.notifications.splice(0, this.notifications.length - 100);
+      }
+      this.persistNotifications();
+    },
+    persistNotifications() {
+      try {
+        localStorage.setItem('wgNotifications', JSON.stringify(this.notifications.slice(-50)));
+      } catch (err) {
+        console.error(err);
+      }
+    },
+    toggleNotifications() {
+      this.showNotifications = !this.showNotifications;
+      if (this.showNotifications) this.markNotificationsRead();
+    },
+    closeNotifications() {
+      this.showNotifications = false;
+    },
+    markNotificationsRead() {
+      const newest = this.notifications.length
+        ? this.notifications[this.notifications.length - 1].at
+        : Date.now();
+      if (newest > this.notificationsReadAt) {
+        this.notificationsReadAt = newest;
+        try {
+          localStorage.setItem('wgNotificationsReadAt', String(this.notificationsReadAt));
+        } catch (err) {
+          console.error(err);
+        }
+      }
+    },
+    clearNotifications() {
+      this.notifications = [];
+      this.persistNotifications();
     },
     // ─────────────────────────────────────────────────────────────────────
 
@@ -251,7 +359,124 @@ new Vue({
     togglePfExpanded(clientId) {
       const expanded = !this.expandedPfClients[clientId];
       this.$set(this.expandedPfClients, clientId, expanded);
+      this.persistPfExpanded();
       if (expanded) this.scheduleAutoProbe();
+    },
+    // The open/closed state of each port-forwarding section survives reloads:
+    // only expanded peers are stored, so the default is collapsed.
+    persistPfExpanded() {
+      try {
+        const stored = {};
+        for (const [key, value] of Object.entries(this.expandedPfClients)) {
+          if (value === true) stored[key] = true;
+        }
+        localStorage.setItem('pfExpanded', JSON.stringify(stored));
+      } catch (err) {
+        console.error(err);
+      }
+    },
+    hydratePersistentState() {
+      try {
+        const stored = JSON.parse(localStorage.getItem('wgNotifications') || 'null');
+        if (Array.isArray(stored)) {
+          this.notifications = stored
+            .filter((entry) => entry && typeof entry.msg === 'string' && Number.isFinite(entry.at))
+            .slice(-50);
+        }
+        this.notificationsReadAt = Number(localStorage.getItem('wgNotificationsReadAt')) || 0;
+        const expanded = JSON.parse(localStorage.getItem('pfExpanded') || 'null');
+        if (expanded && typeof expanded === 'object') {
+          for (const [key, value] of Object.entries(expanded)) {
+            if (value === true) this.expandedPfClients[key] = true;
+          }
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    },
+    // ── Reachability dot + random port ────────────────────────────────────
+    probeVerdictFor(clientId, ruleId) {
+      const entry = this.lastProbeVerdict[`${clientId}:${ruleId}`];
+      return entry ? entry.verdict : null;
+    },
+    probeDotClass(clientId, ruleId) {
+      switch (this.probeVerdictFor(clientId, ruleId)) {
+        case 'ok':
+          return 'bg-green-500';
+        case 'dnat-local':
+          return 'bg-amber-400';
+        case 'unreachable':
+        case 'rule-missing':
+          return 'bg-red-500';
+        default:
+          // Unknown yet, UDP (not TCP-verifiable) or peer offline.
+          return 'bg-gray-300 dark:bg-neutral-500';
+      }
+    },
+    probeDotTitle(client, rule) {
+      const verdict = this.probeVerdictFor(client.id, rule.id);
+      if (!verdict) return this.$t('networkPolicy.probeNever');
+      return this.$t('networkPolicy.verdictTitle', {
+        verdict: this.$t(`networkPolicy.verdict.${verdict}`),
+      });
+    },
+    probeEntries() {
+      if (!this.clients) return [];
+      const entries = [];
+      for (const client of this.clients) {
+        for (const rule of client.portForwards || []) {
+          const entry = this.lastProbeVerdict[`${client.id}:${rule.id}`];
+          if (entry) {
+            entries.push({
+              client, rule, verdict: entry.verdict, at: entry.at,
+            });
+          }
+        }
+      }
+      return entries.sort((a, b) => b.at - a.at).slice(0, 10);
+    },
+    usedExternalPorts() {
+      const used = new Set();
+      for (const client of this.clients || []) {
+        for (const rule of client.portForwards || []) {
+          const port = Number(rule.extPort);
+          if (Number.isInteger(port)) used.add(port);
+        }
+      }
+      return used;
+    },
+    // Suggests a random free port for seeding: inside the admin-configured
+    // forwarding window when known, never privileged, never colliding with
+    // assigned rules, the server's own ports or the well-known blocklist.
+    // The server re-validates authoritatively on add.
+    randomPortFor(client) {
+      if (!this.forwardingEnabled) return;
+      const settings = this.publicServerConfig || {};
+      const configMin = Number(settings.portFwdMin);
+      const configMax = Number(settings.portFwdMax);
+      const min = Math.max(Number.isFinite(configMin) ? configMin : 1024, 1024);
+      const max = Math.min(Number.isFinite(configMax) ? configMax : 65535, 65535);
+      const blocked = new Set(RANDOM_PORT_BLOCKLIST);
+      for (const port of this.usedExternalPorts()) blocked.add(port);
+      blocked.add(Number(settings.port));
+      blocked.add(Number(settings.configPort));
+
+      const pf = this.getNewPf(client.id);
+      const port = pickRandomPort({
+        min, max, blocked, softBlocked: isEphemeralPort,
+      });
+      if (!port) {
+        this.notify(this.$t('pf.randomPortNone'), 'error');
+        return;
+      }
+      // Seeding default: the internal port mirrors the draw unless the user
+      // already typed one (qBittorrent listens on a single port).
+      this.$set(this.newPf, client.id, {
+        proto: pf.proto || 'tcp',
+        extPort: port,
+        intPort: pf.intPort || port,
+      });
+      this.pfError = null;
     },
     isPortConflicting(client) {
       const pf = this.newPf[client.id];
@@ -273,6 +498,7 @@ new Vue({
         this.api.getServerConfig().catch(() => null),
       ]);
       if (generation !== this.refreshGeneration) return;
+      if (serverConfig) this.publicServerConfig = serverConfig;
       const forwardingChanged = this.forwardingEnabled !== (serverConfig?.forwardingEnabled === true);
       this.forwardingEnabled = serverConfig?.forwardingEnabled === true;
       this.clients = clients.map((client) => {
@@ -289,10 +515,8 @@ new Vue({
           this.$set(this.newPf, client.id, { proto: 'tcp', extPort: null, intPort: null });
         }
 
-        // Auto-expand if client has port forwards
-        if (client.portForwards && client.portForwards.length > 0 && this.expandedPfClients[client.id] === undefined) {
-          this.$set(this.expandedPfClients, client.id, true);
-        }
+        // Sections stay collapsed unless the user expanded them (persisted in
+        // localStorage, hydrated once in mounted()): no auto-expand on load.
 
         this.clientsPersist[client.id].transferRxCurrent = client.transferRx - this.clientsPersist[client.id].transferRxPrevious;
         this.clientsPersist[client.id].transferRxPrevious = client.transferRx;
@@ -342,6 +566,18 @@ new Vue({
       ]));
       if (forwardingChanged || pfSignature !== this.lastPfSignature) {
         this.lastPfSignature = pfSignature;
+        // Drop probe bookkeeping for peers/rules that just disappeared so the
+        // maps cannot grow without bound across deletes and restores.
+        const liveKeys = new Set();
+        for (const client of this.clients) {
+          for (const rule of client.portForwards || []) liveKeys.add(`${client.id}:${rule.id}`);
+        }
+        for (const key of Object.keys(this.lastProbeAt)) {
+          if (!liveKeys.has(key)) delete this.lastProbeAt[key];
+        }
+        for (const key of Object.keys(this.lastProbeVerdict)) {
+          if (!liveKeys.has(key)) delete this.lastProbeVerdict[key];
+        }
         this.scheduleAutoProbe();
       }
     },
@@ -377,6 +613,7 @@ new Vue({
         .then(() => {
           this.authenticated = false;
           this.clients = null;
+          this.showNotifications = false;
           clearTimeout(this.pollTimer);
         })
         .catch((err) => {
@@ -726,21 +963,23 @@ new Vue({
           try {
             const result = await this.api.probePortForward({ clientId: client.id, ruleId: rule.id });
             if (!result || !result.verdict) continue;
+            const record = { verdict: result.verdict, at: Date.now() };
             // 'tunnel-down' just means the peer device is offline (phones go
             // quiet routinely): the online dot already shows it, a toast on
             // every cycle would be pure noise.
             if (result.verdict === 'tunnel-down') {
-              this.lastProbeVerdict[key] = result.verdict;
+              this.$set(this.lastProbeVerdict, key, record);
               continue;
             }
             if (['ok', 'dnat-local', 'indeterminate'].includes(result.verdict)) {
-              this.lastProbeVerdict[key] = result.verdict;
+              this.$set(this.lastProbeVerdict, key, record);
               continue;
             }
             // Notify once per verdict transition, not on every cycle, so a
             // persistently unreachable rule shows a single toast.
-            if (this.lastProbeVerdict[key] === result.verdict) continue;
-            this.lastProbeVerdict[key] = result.verdict;
+            const previous = this.lastProbeVerdict[key];
+            if (previous && previous.verdict === result.verdict) continue;
+            this.$set(this.lastProbeVerdict, key, record);
             this.notify(this.$t('networkPolicy.probeProblem', {
               client: client.name, proto: rule.proto, port: rule.extPort, verdict: result.verdict,
             }), 'error', 8000);
@@ -935,6 +1174,7 @@ new Vue({
   mounted() {
     this.prefersDarkScheme.addListener(this.handlePrefersChange);
     this.setTheme(this.uiTheme);
+    this.hydratePersistentState();
     this.api = new API();
     document.addEventListener('visibilitychange', this.handleVisibilityChange);
     this.initialize().catch((err) => this.notify(err.message || err.toString()));
@@ -949,6 +1189,13 @@ new Vue({
     availablePolicyPeers() {
       if (!this.networkPolicyDialog || !this.clients) return [];
       return this.clients.filter((client) => client.id !== this.networkPolicyDialog.clientId);
+    },
+    // ── Notification center ─────────────────────────────────────────
+    unreadCount() {
+      return this.notifications.filter((entry) => entry.at > this.notificationsReadAt).length;
+    },
+    notificationsSlice() {
+      return this.notifications.slice(-30).reverse();
     },
     chartTypeConfig() {
       return UI_CHART_TYPES[this.uiChartType] || UI_CHART_TYPES[0];
