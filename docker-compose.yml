@@ -3,7 +3,7 @@ volumes:
 
 services:
   wg-easy-port-manager:
-    image: ghcr.io/ydtoloza/wg-easy-port-manager:${IMAGE_TAG:-2.0.0}
+    image: ghcr.io/ydtoloza/wg-easy-port-manager:${IMAGE_TAG:-2.2.0}
     container_name: wg-easy-port-manager
     env_file: .env
     environment:
