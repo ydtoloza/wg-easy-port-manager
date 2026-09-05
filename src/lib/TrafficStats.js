@@ -167,20 +167,35 @@ module.exports = class TrafficStats {
     this.hours = [];
     this.startedAt = this.now();
     this.persistAt = 0;
+    // set once start() kicks off the restore; start() is idempotent.
+    this.loadPromise = null;
+    this.stopped = false;
   }
 
   start() {
     if (this.timer) return;
-    // First tick ASAP so the dashboard paints instantly; failures are
-    // swallowed (best-effort sampler must never take the panel down).
-    this.tick().catch(() => {});
-    this.timer = setInterval(() => {
+    this.stopped = false;
+    if (!this.loadPromise) {
+      // Restore persisted peaks/totals/rollups BEFORE the first sample lands
+      // so statistics survive restarts. traffic-history.json lives in WG_PATH
+      // (the persistent volume); before 2.3.0 load() existed but was never
+      // called, so every restart silently reset the dashboard.
+      this.loadPromise = this.load().catch(() => {});
+    }
+    this.loadPromise.then(() => {
+      // A stop() during the restore (or a second concurrent start()) must not
+      // schedule a second sampler.
+      if (this.stopped || this.timer) return;
       this.tick().catch(() => {});
-    }, this.pollMs);
-    if (typeof this.timer.unref === 'function') this.timer.unref();
+      this.timer = setInterval(() => {
+        this.tick().catch(() => {});
+      }, this.pollMs);
+      if (typeof this.timer.unref === 'function') this.timer.unref();
+    });
   }
 
   stop() {
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
   }

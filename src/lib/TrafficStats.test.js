@@ -125,3 +125,45 @@ describe('TrafficStats sampler', () => {
     expect(realtime.history.wg0.length).toBeGreaterThan(0);
   });
 });
+
+describe('TrafficStats restart survival', () => {
+  it('start() restores persisted aggregates before sampling (load was never called before 2.3.0)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wgpm-traffic-load-'));
+    try {
+      // Instance "before the restart": record traffic and persist it.
+      const t = 1_700_000_000_000;
+      const previous = new TrafficStats({ pollMs: 1000, wgPath: dir, now: () => t });
+      previous.recordIface('wg0', 9000, 4000, t);
+      previous.recordSystem(80, 7, 90, 8, t);
+      await previous.save();
+
+      // Fresh instance (post-restart): aggregates start empty...
+      const restarted = new TrafficStats({ pollMs: 1000, wgPath: dir, now: () => t + 60000 });
+      expect(restarted.peaks.rxSpeed).toBe(0);
+      expect(restarted.minutes).toHaveLength(0);
+
+      // ...and start() must bring them back before/without losing samples.
+      restarted.start();
+      await restarted.loadPromise;
+      expect(restarted.peaks.rxSpeed).toBe(9000);
+      expect(restarted.peaks.cpu).toBe(80);
+      restarted.stop();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('start() is idempotent: concurrent calls never schedule two samplers', async () => {
+    const stats = new TrafficStats({ pollMs: 1000, wgPath: null });
+    stats.start();
+    stats.start();
+    stats.start();
+    // The load promise resolves immediately (null wgPath); give the callbacks
+    // a tick to run, then there must be exactly one sampler timer.
+    await new Promise((resolve) => setImmediate(resolve));
+    const timersBefore = stats.timer;
+    expect(timersBefore).not.toBeNull();
+    stats.stop();
+    expect(stats.timer).toBeNull();
+  });
+});
