@@ -170,6 +170,14 @@ new Vue({
     // stays inside the admin-configured window with it.
     publicServerConfig: null,
 
+    // Consolidated "all ports" view: every forwarding rule in one table with
+    // search and filters, so admins don't expand peer by peer. Read-only:
+    // clicking a row jumps to that peer's own port-forwarding section.
+    allPortsOpen: localStorage.getItem('allPortsOpen') === '1',
+    allPortsSearch: '',
+    allPortsProto: 'all',
+    allPortsStatus: 'all',
+
     uiTrafficStats: false,
 
     // Traffic dashboard (Plex-style ANCHO DE BANDA / CPU / RAM + peaks).
@@ -374,6 +382,30 @@ new Vue({
       } catch (err) {
         console.error(err);
       }
+    },
+    toggleAllPorts() {
+      this.allPortsOpen = !this.allPortsOpen;
+      try {
+        localStorage.setItem('allPortsOpen', this.allPortsOpen ? '1' : '0');
+      } catch (err) {
+        console.error(err);
+      }
+    },
+    // Jump from the consolidated table to the owning peer: expand its
+    // port-forwarding section (persisted, same as a manual toggle) and scroll
+    // to it once Vue rendered the expanded block.
+    jumpToPeer(clientId) {
+      if (this.expandedPfClients[clientId] !== true) {
+        this.$set(this.expandedPfClients, clientId, true);
+        this.persistPfExpanded();
+        this.scheduleAutoProbe();
+      }
+      this.$nextTick(() => {
+        const el = document.getElementById(`port-forwards-${clientId}`);
+        if (el && typeof el.scrollIntoView === 'function') {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      });
     },
     hydratePersistentState() {
       try {
@@ -1196,6 +1228,37 @@ new Vue({
     },
     notificationsSlice() {
       return this.notifications.slice(-30).reverse();
+    },
+    // ── All-ports consolidated view ─────────────────────────────────
+    totalPortRules() {
+      if (!this.clients) return 0;
+      return this.clients.reduce((sum, client) => sum + ((client.portForwards || []).length), 0);
+    },
+    allPortsRows() {
+      if (!this.clients) return [];
+      const search = (this.allPortsSearch || '').trim().toLowerCase();
+      const rows = [];
+      for (const client of this.clients) {
+        for (const rule of client.portForwards || []) {
+          const entry = this.lastProbeVerdict[`${client.id}:${rule.id}`];
+          rows.push({
+            client, rule, verdict: entry ? entry.verdict : null, at: entry ? entry.at : 0,
+          });
+        }
+      }
+      return rows.filter((row) => {
+        if (this.allPortsProto !== 'all' && row.rule.proto !== this.allPortsProto) return false;
+        if (this.allPortsStatus === 'ok' && !['ok', 'dnat-local'].includes(row.verdict)) return false;
+        if (this.allPortsStatus === 'problems' && !['unreachable', 'rule-missing'].includes(row.verdict)) return false;
+        // Unknown = gray dot: never probed, UDP (not verifiable) or peer offline.
+        if (this.allPortsStatus === 'unknown'
+          && row.verdict !== null && !['tunnel-down', 'indeterminate'].includes(row.verdict)) return false;
+        if (search) {
+          const haystack = `${row.client.name} ${row.rule.proto} ${row.rule.extPort} ${row.rule.intPort}`.toLowerCase();
+          if (!haystack.includes(search)) return false;
+        }
+        return true;
+      }).sort((a, b) => a.rule.extPort - b.rule.extPort);
     },
     chartTypeConfig() {
       return UI_CHART_TYPES[this.uiChartType] || UI_CHART_TYPES[0];

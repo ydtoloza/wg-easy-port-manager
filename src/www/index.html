@@ -4,7 +4,7 @@
 <head>
   <title>WireGuard</title>
   <meta charset="utf-8"/>
-  <link href="./css/app.css?v=4" rel="stylesheet">
+  <link href="./css/app.css?v=5" rel="stylesheet">
   <link rel="manifest" href="./manifest.json">
   <link rel="icon" type="image/png" href="./img/favicon.png">
   <link rel="apple-touch-icon" href="./img/apple-touch-icon.png">
@@ -178,6 +178,81 @@
         <div class="text-sm text-gray-400 dark:text-neutral-400 mb-5"></div>
         <div :class="uiShowTraffic ? 'lg:flex lg:items-start lg:gap-5' : ''">
           <div :class="uiShowTraffic ? 'lg:flex-1 lg:min-w-0' : ''">
+        <!-- All ports: every forwarding rule in one searchable table -->
+        <div class="shadow-md rounded-lg bg-white dark:bg-neutral-700 overflow-hidden mb-5">
+          <button type="button"
+            class="flex items-center justify-between w-full px-5 py-3 text-left select-none hover:bg-gray-50 dark:hover:bg-neutral-700/50 transition-colors"
+            :aria-expanded="allPortsOpen ? 'true' : 'false'"
+            aria-controls="all-ports-panel"
+            @click="toggleAllPorts">
+            <div class="flex items-center gap-3">
+              <div class="p-1.5 rounded-md bg-gray-100 dark:bg-neutral-700 text-gray-500 dark:text-neutral-400">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18M8 3v18M16 3v18" />
+                </svg>
+              </div>
+              <span class="text-sm font-medium text-gray-700 dark:text-neutral-300">{{$t('allPorts.title')}}</span>
+              <span v-if="totalPortRules" class="inline-flex items-center justify-center px-2 py-0.5 text-xs font-bold leading-none text-red-100 bg-red-800 dark:bg-red-900/80 rounded-full">{{ totalPortRules }}</span>
+            </div>
+            <svg class="w-4 h-4 text-gray-400 dark:text-neutral-500 transition-transform duration-200" :class="{ 'rotate-180': allPortsOpen }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
+          <div v-show="allPortsOpen" id="all-ports-panel" class="px-4 pb-4">
+            <div class="flex flex-wrap items-center gap-2 mb-3">
+              <input v-model.trim="allPortsSearch" type="search" :placeholder="$t('allPorts.search')"
+                class="text-sm text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 outline-none w-full sm:w-56" />
+              <select v-model="allPortsProto"
+                class="text-xs font-bold text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-2 py-2 focus:ring-2 focus:ring-red-800 outline-none">
+                <option value="all">{{$t('allPorts.allProtos')}}</option>
+                <option value="tcp">TCP</option>
+                <option value="udp">UDP</option>
+                <option value="both">TCP + UDP</option>
+              </select>
+              <select v-model="allPortsStatus"
+                class="text-xs font-bold text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-2 py-2 focus:ring-2 focus:ring-red-800 outline-none">
+                <option value="all">{{$t('allPorts.allStatus')}}</option>
+                <option value="ok">{{$t('allPorts.statusOk')}}</option>
+                <option value="problems">{{$t('allPorts.statusProblems')}}</option>
+                <option value="unknown">{{$t('allPorts.statusUnknown')}}</option>
+              </select>
+              <span class="ml-auto text-xs text-gray-400 dark:text-neutral-500">{{ allPortsRows.length }} / {{ totalPortRules }}</span>
+            </div>
+            <div v-if="allPortsRows.length" class="space-y-2">
+              <div class="grid grid-cols-[auto_1fr_auto_1fr_1fr] gap-2 items-center px-3 text-xs font-medium text-gray-500 dark:text-neutral-400 uppercase tracking-wider">
+                <span>Proto</span>
+                <span>External Port</span>
+                <span></span>
+                <span>Internal Port</span>
+                <span>Peer</span>
+              </div>
+              <button v-for="row in allPortsRows" :key="row.client.id + ':' + row.rule.id" type="button" @click="jumpToPeer(row.client.id)" :title="$t('allPorts.jump')"
+                class="w-full grid grid-cols-[auto_1fr_auto_1fr_1fr] gap-2 items-center text-left bg-white dark:bg-neutral-700 rounded-lg px-3 py-2.5 shadow-sm border border-gray-200/60 dark:border-neutral-600/60 hover:border-red-300 dark:hover:border-red-800/50 transition-colors">
+                <span class="inline-flex items-center gap-1.5">
+                  <span class="w-2.5 h-2.5 rounded-full flex-shrink-0" :class="probeDotClass(row.client.id, row.rule.id)" :title="probeDotTitle(row.client, row.rule)"></span>
+                  <span class="inline-flex items-center justify-center px-2 py-1 text-xs font-bold rounded-md"
+                        :class="{
+                          'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300': row.rule.proto === 'tcp',
+                          'bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300': row.rule.proto === 'udp',
+                          'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300': row.rule.proto === 'both'
+                        }">
+                    {{ row.rule.proto === 'both' ? 'TCP + UDP' : row.rule.proto.toUpperCase() }}
+                  </span>
+                </span>
+                <span class="font-mono text-sm text-gray-800 dark:text-neutral-200">{{ row.rule.extPort }}</span>
+                <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3" /></svg>
+                <span class="font-mono text-sm text-gray-800 dark:text-neutral-200">{{ row.rule.intPort }}</span>
+                <span class="min-w-0 text-right sm:text-left">
+                  <span class="block text-sm text-gray-700 dark:text-neutral-200 truncate">{{ row.client.name }}</span>
+                  <span class="block text-[10px] text-gray-400 dark:text-neutral-500">
+                    {{ row.verdict ? $t('networkPolicy.verdict.' + row.verdict) : $t('networkPolicy.probeNever') }}<template v-if="row.at"> · {{ row.at | timeago }}</template>
+                  </span>
+                </span>
+              </button>
+            </div>
+            <p v-else class="text-xs text-gray-400 dark:text-neutral-500 py-4 text-center">{{$t('allPorts.empty')}}</p>
+          </div>
+        </div>
         <div class="shadow-md rounded-lg bg-white dark:bg-neutral-700 overflow-hidden">
           <div class="flex flex-row flex-auto items-center p-3 px-5 border-b-2 border-gray-100 dark:border-neutral-600">
             <div class="flex-grow">
@@ -1278,8 +1353,8 @@
   <script src="./js/vendor/timeago.full.min.js"></script>
   <script src="./js/api.js"></script>
   <script src="./js/i18n.js"></script>
-  <script src="./js/app-template.generated.js?v=14cdea0e2b55"></script>
-  <script src="./js/app.js?v=7"></script>
+  <script src="./js/app-template.generated.js?v=86c492078815"></script>
+  <script src="./js/app.js?v=8"></script>
 </body>
 
 </html>

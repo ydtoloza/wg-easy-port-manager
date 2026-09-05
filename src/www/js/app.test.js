@@ -639,3 +639,104 @@ describe('reachability dot', () => {
     expect(options.methods.probeEntries.call(state).map((entry) => entry.rule.id)).toEqual(['r2', 'r1']);
   });
 });
+
+describe('all-ports consolidated view', () => {
+  function portsState(options) {
+    return {
+      clients: [
+        {
+          id: 'a',
+          name: 'alpha',
+          portForwards: [{
+            id: 'r1', proto: 'tcp', extPort: 8080, intPort: 80,
+          }],
+        },
+        {
+          id: 'b',
+          name: 'beta',
+          portForwards: [
+            {
+              id: 'r2', proto: 'udp', extPort: 27015, intPort: 27015,
+            },
+            {
+              id: 'r3', proto: 'both', extPort: 51413, intPort: 51413,
+            },
+          ],
+        },
+      ],
+      lastProbeVerdict: {
+        'a:r1': { verdict: 'ok', at: 30 },
+        'b:r2': { verdict: 'unreachable', at: 20 },
+      },
+      allPortsSearch: '',
+      allPortsProto: 'all',
+      allPortsStatus: 'all',
+    };
+  }
+
+  it('aggregates every rule with its verdict, sorted by external port', () => {
+    const options = loadAppOptions();
+    const rows = options.computed.allPortsRows.call(portsState(options));
+    expect(rows.map((row) => row.rule.extPort)).toEqual([8080, 27015, 51413].sort((x, y) => x - y));
+    expect(rows[0].verdict).toBe('ok');
+    expect(rows.find((row) => row.rule.id === 'r3').verdict).toBeNull();
+    expect(options.computed.totalPortRules.call(portsState(options))).toBe(3);
+  });
+
+  it('filters by search text, protocol and probe status', () => {
+    const options = loadAppOptions();
+    const state = portsState(options);
+
+    state.allPortsSearch = 'alp';
+    expect(options.computed.allPortsRows.call(state)).toHaveLength(1);
+    state.allPortsSearch = '27015';
+    expect(options.computed.allPortsRows.call(state).map((row) => row.rule.id)).toEqual(['r2']);
+    state.allPortsSearch = '';
+
+    state.allPortsProto = 'udp';
+    expect(options.computed.allPortsRows.call(state).map((row) => row.rule.id)).toEqual(['r2']);
+    state.allPortsProto = 'all';
+
+    state.allPortsStatus = 'ok';
+    expect(options.computed.allPortsRows.call(state).map((row) => row.rule.id)).toEqual(['r1']);
+    state.allPortsStatus = 'problems';
+    expect(options.computed.allPortsRows.call(state).map((row) => row.rule.id)).toEqual(['r2']);
+    state.allPortsStatus = 'unknown';
+    expect(options.computed.allPortsRows.call(state).map((row) => row.rule.id)).toEqual(['r3']);
+  });
+
+  it('toggles with persistence', () => {
+    const options = loadAppOptions();
+    localStorageMock.setItem.mockClear();
+    const state = { allPortsOpen: false };
+    options.methods.toggleAllPorts.call(state);
+    expect(state.allPortsOpen).toBe(true);
+    expect(localStorageMock.setItem).toHaveBeenCalledWith('allPortsOpen', '1');
+    options.methods.toggleAllPorts.call(state);
+    expect(localStorageMock.setItem).toHaveBeenLastCalledWith('allPortsOpen', '0');
+  });
+
+  it('jumpToPeer expands the peer section, persists and schedules a probe', () => {
+    const options = loadAppOptions();
+    localStorageMock.setItem.mockClear();
+    const state = {
+      expandedPfClients: {},
+      persistPfExpanded: options.methods.persistPfExpanded,
+      scheduleAutoProbe: jest.fn(),
+      $set(target, key, value) {
+        target[key] = value;
+      },
+      // No DOM in the vm: record the tick instead of running it.
+      $nextTick(callback) {
+        state.__nextTick = callback;
+      },
+    };
+    options.methods.jumpToPeer.call(state, 'client9');
+    expect(state.expandedPfClients.client9).toBe(true);
+    expect(localStorageMock.setItem).toHaveBeenCalledWith('pfExpanded', '{"client9":true}');
+    expect(state.scheduleAutoProbe).toHaveBeenCalledTimes(1);
+    // Already expanded: no double probe scheduling.
+    options.methods.jumpToPeer.call(state, 'client9');
+    expect(state.scheduleAutoProbe).toHaveBeenCalledTimes(1);
+  });
+});
