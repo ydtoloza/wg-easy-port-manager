@@ -8,13 +8,13 @@ Choose one image channel before deployment:
 
 | Tag | Purpose | Production recommendation |
 | --- | --- | --- |
-| `2.3.0` | Immutable 2.0 release | Recommended |
+| `2.4.0` | Immutable 2.0 release | Recommended |
 | `2.0` | Latest compatible 2.0 patch | Suitable after testing |
 | `latest` | Latest stable release | Convenient, but less explicit |
 | `main` | Latest validated commit on `main` | Staging only |
 | `sha-<full commit>` | One exact source commit | Best for reproducible testing or rollback |
 
-The provided Compose file defaults to `2.3.0`. CI only publishes images; it never logs into or changes the VPS.
+The provided Compose file defaults to `2.4.0`. CI only publishes images; it never logs into or changes the VPS.
 
 ## Host requirements
 
@@ -47,8 +47,8 @@ sudo install -d -m 0750 /opt/wg-easy-port-manager
 sudo chown "$USER":"$USER" /opt/wg-easy-port-manager
 cd /opt/wg-easy-port-manager
 
-curl -fsSL https://raw.githubusercontent.com/ydtoloza/wg-easy-port-manager/v2.3.0/docker-compose.yml -o docker-compose.yml
-curl -fsSL https://raw.githubusercontent.com/ydtoloza/wg-easy-port-manager/v2.3.0/.env.example -o .env
+curl -fsSL https://raw.githubusercontent.com/ydtoloza/wg-easy-port-manager/v2.4.0/docker-compose.yml -o docker-compose.yml
+curl -fsSL https://raw.githubusercontent.com/ydtoloza/wg-easy-port-manager/v2.4.0/.env.example -o .env
 chmod 0600 .env
 ```
 
@@ -65,14 +65,14 @@ Public packages do not require a login.
 Generate a bcrypt password hash and a persistent session secret:
 
 ```sh
-docker run --rm ghcr.io/ydtoloza/wg-easy-port-manager:2.3.0 wgpw 'USE_A_LONG_UNIQUE_PASSWORD'
+docker run --rm ghcr.io/ydtoloza/wg-easy-port-manager:2.4.0 wgpw 'USE_A_LONG_UNIQUE_PASSWORD'
 openssl rand -hex 32
 ```
 
 Edit `/opt/wg-easy-port-manager/.env`:
 
 ```dotenv
-IMAGE_TAG=2.3.0
+IMAGE_TAG=2.4.0
 WG_HOST=vpn.example.com
 PASSWORD_HASH='$2b$12$REPLACE_WITH_THE_GENERATED_HASH'
 SESSION_SECRET=REPLACE_WITH_OPENSSL_OUTPUT
@@ -214,7 +214,7 @@ Keep the passphrase outside the VPS. After confirming the encrypted copy is reco
 
 1. Create and verify the backup above.
 2. Download the 2.0 Compose file.
-3. Set `IMAGE_TAG=2.3.0` in `.env`.
+3. Set `IMAGE_TAG=2.4.0` in `.env`.
 4. Pull and recreate the service.
 
 ```sh
@@ -224,7 +224,7 @@ TMP_COMPOSE=$(mktemp './docker-compose.yml.XXXXXX')
 cleanup_compose() { rm -f "$TMP_COMPOSE"; }
 trap cleanup_compose EXIT
 
-curl -fsSL https://raw.githubusercontent.com/ydtoloza/wg-easy-port-manager/v2.3.0/docker-compose.yml -o "$TMP_COMPOSE"
+curl -fsSL https://raw.githubusercontent.com/ydtoloza/wg-easy-port-manager/v2.4.0/docker-compose.yml -o "$TMP_COMPOSE"
 docker compose --env-file .env -f "$TMP_COMPOSE" config --quiet
 mv "$TMP_COMPOSE" docker-compose.yml
 trap - EXIT
