@@ -42,6 +42,17 @@ const CHART_COLORS = {
   gradient: { light: ['rgba(0,0,0,1.0)', 'rgba(0,0,0,1.0)'], dark: ['rgba(128,128,128,0)', 'rgba(128,128,128,0)'] },
 };
 
+// Traffic palette, validated for colour-blind separation on both surfaces
+// (same values as the CSS tokens --rx/--tx/--fg-muted in www/src/css/app.css).
+const THEME_COLORS = {
+  light: {
+    download: '#0969da', upload: '#d4570f', muted: '#59636e', grid: '#eff2f5', text: '#59636e',
+  },
+  dark: {
+    download: '#4493f8', upload: '#e0712c', muted: '#a1a1a1', grid: '#1a1a1a', text: '#a1a1a1',
+  },
+};
+
 // Ports the random generator must never suggest even though they sit in the
 // dynamic range: popular services an admin will plausibly run on the host
 // (databases, alt-HTTP, RDP/VNC/SMB, discovery protocols) plus this app's own
@@ -170,10 +181,16 @@ new Vue({
     // stays inside the admin-configured window with it.
     publicServerConfig: null,
 
+    // Current screen, driven by location.hash so the back button works:
+    // '' → panel, '#/ports' → all ports, '#/client/<id>' → client detail.
+    view: 'panel',
+    viewClientId: null,
+    clientSearch: '',
+    clientFilter: 'all',
+
     // Consolidated "all ports" view: every forwarding rule in one table with
     // search and filters, so admins don't expand peer by peer. Read-only:
-    // clicking a row jumps to that peer's own port-forwarding section.
-    allPortsOpen: localStorage.getItem('allPortsOpen') === '1',
+    // clicking a row opens that peer's detail.
     allPortsSearch: '',
     allPortsProto: 'all',
     allPortsStatus: 'all',
@@ -195,14 +212,14 @@ new Vue({
     trafficRangeFetch: null,
     trafficScope: 'all',
     trafficPollCount: 0,
-    // Opt-in: the panel stays hidden until UI_TRAFFIC_STATS=true or the
-    // user toggles it (persisted). Production with default flags keeps the
-    // exact previous layout (max-w-3xl, single column).
-    uiShowTraffic: localStorage.getItem('uiShowTraffic') === '1',
+    // Traffic is the centre of the panel: shown unless the user hid it
+    // (persisted as '0').
+    uiShowTraffic: localStorage.getItem('uiShowTraffic') !== '0',
+    trafficHidden: { download: false, upload: false },
 
     uiChartType: 0,
     uiShowCharts: localStorage.getItem('uiShowCharts') === '1',
-    uiTheme: localStorage.theme || 'auto',
+    uiTheme: localStorage.theme || 'dark',
     prefersDarkScheme: window.matchMedia('(prefers-color-scheme: dark)'),
     pollTimer: null,
     polling: false,
@@ -383,29 +400,49 @@ new Vue({
         console.error(err);
       }
     },
-    toggleAllPorts() {
-      this.allPortsOpen = !this.allPortsOpen;
-      try {
-        localStorage.setItem('allPortsOpen', this.allPortsOpen ? '1' : '0');
-      } catch (err) {
-        console.error(err);
-      }
-    },
-    // Jump from the consolidated table to the owning peer: expand its
-    // port-forwarding section (persisted, same as a manual toggle) and scroll
-    // to it once Vue rendered the expanded block.
+    // Open a peer's detail: its port-forwarding section counts as expanded
+    // (persisted, drives the auto-probe) and the hash route moves there.
     jumpToPeer(clientId) {
       if (this.expandedPfClients[clientId] !== true) {
         this.$set(this.expandedPfClients, clientId, true);
         this.persistPfExpanded();
         this.scheduleAutoProbe();
       }
-      this.$nextTick(() => {
-        const el = document.getElementById(`port-forwards-${clientId}`);
-        if (el && typeof el.scrollIntoView === 'function') {
-          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }
-      });
+      this.navigate('client', clientId);
+    },
+    navigate(view, clientId) {
+      const routes = { client: `#/client/${encodeURIComponent(clientId)}`, ports: '#/ports' };
+      const hash = routes[view] || '';
+      if (window.location && window.location.hash !== hash) {
+        window.location.hash = hash; // hashchange → applyRoute
+      } else {
+        this.applyRoute();
+      }
+    },
+    applyRoute() {
+      const hash = (window.location && window.location.hash) || '';
+      const client = /^#\/client\/(.+)$/.exec(hash);
+      if (client) {
+        this.view = 'client';
+        this.viewClientId = decodeURIComponent(client[1]);
+      } else {
+        this.view = hash === '#/ports' ? 'ports' : 'panel';
+        this.viewClientId = null;
+      }
+      if (typeof window.scrollTo === 'function') window.scrollTo(0, 0);
+    },
+    // Same as the `timeago` filter, usable inside template expressions.
+    ago(value) {
+      return timeago.format(value, i18n.locale);
+    },
+    clientStatus(client) {
+      if (!client.enabled) return { label: this.$t('ui.statusDisabled'), dot: 'dot-none' };
+      return client.online
+        ? { label: this.$t('ui.statusOnline'), dot: 'dot-ok' }
+        : { label: this.$t('ui.statusOffline'), dot: 'dot-off' };
+    },
+    toggleSeries(key) {
+      this.trafficHidden = { ...this.trafficHidden, [key]: !this.trafficHidden[key] };
     },
     hydratePersistentState() {
       try {
@@ -434,15 +471,15 @@ new Vue({
     probeDotClass(clientId, ruleId) {
       switch (this.probeVerdictFor(clientId, ruleId)) {
         case 'ok':
-          return 'bg-green-500';
+          return 'dot-ok';
         case 'dnat-local':
-          return 'bg-amber-400';
+          return 'dot-warn';
         case 'unreachable':
         case 'rule-missing':
-          return 'bg-red-500';
+          return 'dot-bad';
         default:
           // Unknown yet, UDP (not TCP-verifiable) or peer offline.
-          return 'bg-gray-300 dark:bg-neutral-500';
+          return 'dot-off';
       }
     },
     probeDotTitle(client, rule) {
@@ -1023,10 +1060,7 @@ new Vue({
       }
     },
     toggleTheme() {
-      const themes = ['light', 'dark', 'auto'];
-      const currentIndex = themes.indexOf(this.uiTheme);
-      const newIndex = (currentIndex + 1) % themes.length;
-      this.uiTheme = themes[newIndex];
+      this.uiTheme = this.theme === 'dark' ? 'light' : 'dark';
       localStorage.theme = this.uiTheme;
       this.setTheme(this.uiTheme);
     },
@@ -1209,12 +1243,15 @@ new Vue({
     this.hydratePersistentState();
     this.api = new API();
     document.addEventListener('visibilitychange', this.handleVisibilityChange);
+    window.addEventListener('hashchange', this.applyRoute);
+    this.applyRoute();
     this.initialize().catch((err) => this.notify(err.message || err.toString()));
   },
   beforeDestroy() {
     clearTimeout(this.pollTimer);
     clearTimeout(this.autoProbeTimer);
     document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+    window.removeEventListener('hashchange', this.applyRoute);
     this.prefersDarkScheme.removeListener(this.handlePrefersChange);
   },
   computed: {
@@ -1301,11 +1338,59 @@ new Vue({
       return hist;
     },
     trafficBwSeries() {
-      // x/y pairs so the tooltip shows the hour instead of the point index.
+      // Named from the clients' point of view: what wg0 transmits is what
+      // clients download. x/y pairs so the tooltip shows the hour.
       return [
-        { name: 'REMOTO (RX)', data: this.trafficBw.map((s) => ({ x: s.t, y: Math.round(s.rx || 0) })) },
-        { name: 'LOCAL (TX)', data: this.trafficBw.map((s) => ({ x: s.t, y: Math.round(s.tx || 0) })) },
+        { key: 'download', name: this.$t('ui.download'), data: this.trafficBw.map((s) => ({ x: s.t, y: Math.round(s.tx || 0) })) },
+        { key: 'upload', name: this.$t('ui.upload'), data: this.trafficBw.map((s) => ({ x: s.t, y: Math.round(s.rx || 0) })) },
       ];
+    },
+    trafficChartSeries() {
+      return this.trafficBwSeries.filter((s) => !this.trafficHidden[s.key]);
+    },
+    trafficChartOptions() {
+      const c = THEME_COLORS[this.theme] || THEME_COLORS.dark;
+      return { ...this.trafficPanelOptions, colors: this.trafficChartSeries.map((s) => c[s.key]) };
+    },
+    // Legend numbers for the displayed window: current, average, peak and
+    // bytes transferred (rate integrated over each sample interval).
+    trafficStats() {
+      const hist = this.trafficBw;
+      const stats = (field) => {
+        if (!hist.length) {
+          return {
+            now: 0, avg: 0, peak: 0, total: 0,
+          };
+        }
+        let total = 0;
+        for (let i = 1; i < hist.length; i += 1) {
+          total += (hist[i][field] || 0) * Math.max(0, (hist[i].t - hist[i - 1].t) / 1000);
+        }
+        return {
+          now: hist[hist.length - 1][field] || 0,
+          avg: hist.reduce((a, s) => a + (s[field] || 0), 0) / hist.length,
+          peak: Math.max(...hist.map((s) => s[field] || 0)),
+          total,
+        };
+      };
+      return { download: stats('tx'), upload: stats('rx') };
+    },
+    viewClient() {
+      if (!this.clients || !this.viewClientId) return null;
+      return this.clients.find((client) => client.id === this.viewClientId) || null;
+    },
+    onlineCount() {
+      return (this.clients || []).filter((client) => client.enabled && client.online).length;
+    },
+    filteredClients() {
+      const search = (this.clientSearch || '').trim().toLowerCase();
+      return (this.clients || []).filter((client) => {
+        if (search && !`${client.name} ${client.address} ${client.addressV6 || ''}`.toLowerCase().includes(search)) return false;
+        if (this.clientFilter === 'online') return client.enabled && client.online;
+        if (this.clientFilter === 'offline') return client.enabled && !client.online;
+        if (this.clientFilter === 'disabled') return !client.enabled;
+        return true;
+      });
     },
     trafficCpuSeries() {
       const ranged = this.trafficRange !== 'realtime' && this.trafficRangeData;
@@ -1335,47 +1420,49 @@ new Vue({
     },
     trafficPanelOptions() {
       const dark = this.theme === 'dark';
+      const c = THEME_COLORS[this.theme] || THEME_COLORS.dark;
       return {
         chart: {
           background: 'transparent',
-          type: 'line',
+          type: 'area',
           toolbar: { show: false },
           animations: { enabled: false },
           zoom: { enabled: false },
+          fontFamily: 'inherit',
         },
-        colors: ['#3b82f6', '#f59e0b'],
-        // First series solid, second dashed: instant TX/RX distinction even
-        // at a glance or in grayscale. NOTE: no `fill` key here — ApexCharts
-        // 3.49 drops the whole series when fill.opacity is 0 on line charts.
-        stroke: { curve: 'smooth', width: 3, dashArray: [0, 7] },
+        colors: [c.download, c.upload],
+        stroke: { curve: 'smooth', width: 2 },
+        fill: { type: 'solid', opacity: 0.12 },
         markers: { size: 0, hover: { size: 4 } },
         dataLabels: { enabled: false },
         grid: {
           show: true,
-          borderColor: dark ? '#525252' : '#e5e7eb',
+          borderColor: c.grid,
           strokeDashArray: 0,
-          xaxis: { lines: { show: false } },
+          xaxis: { lines: { show: true } },
           padding: {
             left: 8, right: 8, top: 0, bottom: 0,
           },
         },
         xaxis: {
           type: 'datetime',
-          labels: { show: false },
+          labels: { show: true, datetimeUTC: false, style: { colors: c.text, fontSize: '12px' } },
           axisTicks: { show: false },
           axisBorder: { show: false },
           tooltip: { enabled: false },
         },
         yaxis: {
           min: 0,
+          forceNiceScale: true,
           labels: {
             show: true,
-            style: { colors: dark ? '#d1d5db' : '#4b5563', fontSize: '10px' },
-            formatter: (v) => bytes(v, 0),
+            style: { colors: c.text, fontSize: '12px' },
+            formatter: (v) => `${bytes(v, 0)}/s`,
           },
         },
         tooltip: {
           enabled: true,
+          shared: true,
           theme: dark ? 'dark' : 'light',
           x: { format: 'dd MMM HH:mm' },
           y: { formatter: (v) => `${bytes(v, 1)}/s` },
@@ -1385,14 +1472,17 @@ new Vue({
     },
     trafficPctOptions() {
       const base = this.trafficPanelOptions;
+      const c = THEME_COLORS[this.theme] || THEME_COLORS.dark;
       return {
         ...base,
+        xaxis: { ...base.xaxis, labels: { show: false } },
         yaxis: {
           min: 0,
           max: 100,
+          tickAmount: 2,
           labels: {
             show: true,
-            style: { colors: this.theme === 'dark' ? '#d1d5db' : '#4b5563', fontSize: '10px' },
+            style: { colors: c.text, fontSize: '11px' },
             formatter: (v) => `${Math.round(v)}%`,
           },
         },
@@ -1404,14 +1494,14 @@ new Vue({
         },
       };
     },
+    // CPU/RAM stay neutral (system = grey, wg-easy = blue) so they never
+    // compete with the traffic colours.
     trafficCpuOptions() {
-      // Brighter strokes in dark mode so thin lines don't wash out.
-      const dark = this.theme === 'dark';
-      return { ...this.trafficPctOptions, colors: dark ? ['#fb7185', '#6ee7b7'] : ['#e11d48', '#16a34a'] };
+      const c = THEME_COLORS[this.theme] || THEME_COLORS.dark;
+      return { ...this.trafficPctOptions, colors: [c.muted, c.download] };
     },
     trafficMemOptions() {
-      const dark = this.theme === 'dark';
-      return { ...this.trafficPctOptions, colors: dark ? ['#d8b4fe', '#5eead4'] : ['#9333ea', '#0d9488'] };
+      return this.trafficCpuOptions;
     },
     trafficAvg() {
       const hist = this.trafficBw;
