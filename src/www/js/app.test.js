@@ -12,7 +12,7 @@ const localStorageMock = {
   theme: 'auto',
 };
 
-function loadAppOptions() {
+function loadAppOptions(windowExtra = {}) {
   let options;
   const context = {
     API: function API() {},
@@ -33,6 +33,7 @@ function loadAppOptions() {
     window: {
       WgEasyAppTemplate: { render: jest.fn(), staticRenderFns: [] },
       matchMedia: jest.fn(() => ({ matches: false })),
+      ...windowExtra,
     },
   };
   const source = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
@@ -232,19 +233,48 @@ describe('port-forward UI state', () => {
 });
 
 describe('traffic side panel', () => {
-  it('hides the panel by default and toggles with persistence', () => {
+  it('shows the panel by default and toggles with persistence', () => {
     const options = loadAppOptions();
-    expect(options.data.uiShowTraffic).toBe(false);
+    expect(options.data.uiShowTraffic).toBe(true);
 
     localStorageMock.setItem.mockClear();
     const state = {
-      uiShowTraffic: false,
+      uiShowTraffic: true,
       refreshTraffic: jest.fn().mockResolvedValue(),
     };
     options.methods.toggleTraffic.call(state);
+    expect(state.uiShowTraffic).toBe(false);
+    expect(localStorageMock.setItem).toHaveBeenCalledWith('uiShowTraffic', '0');
+    expect(state.refreshTraffic).not.toHaveBeenCalled();
+    options.methods.toggleTraffic.call(state);
     expect(state.uiShowTraffic).toBe(true);
-    expect(localStorageMock.setItem).toHaveBeenCalledWith('uiShowTraffic', '1');
+    expect(localStorageMock.setItem).toHaveBeenLastCalledWith('uiShowTraffic', '1');
     expect(state.refreshTraffic).toHaveBeenCalledTimes(1);
+  });
+
+  it('defaults to the dark theme and toggles between dark and light', () => {
+    const stored = localStorageMock.theme;
+    delete localStorageMock.theme; // no saved preference
+    const options = loadAppOptions();
+    localStorageMock.theme = stored;
+    expect(options.data.uiTheme).toBe('dark');
+    expect(loadAppOptions().data.uiTheme).toBe('auto'); // a saved choice is kept
+    const state = { uiTheme: 'dark', theme: 'dark', setTheme: jest.fn() };
+    options.methods.toggleTheme.call(state);
+    expect(state.uiTheme).toBe('light');
+    expect(state.setTheme).toHaveBeenCalledWith('light');
+  });
+
+  it('computes legend stats for the displayed window, integrating bytes per interval', () => {
+    const options = loadAppOptions();
+    // wg0 tx = clients' download, rx = clients' upload; samples 2 s apart.
+    const bw = [{ t: 0, rx: 100, tx: 1000 }, { t: 2000, rx: 300, tx: 3000 }, { t: 4000, rx: 200, tx: 2000 }];
+    const stats = options.computed.trafficStats.call({ trafficBw: bw });
+    expect(stats.download).toEqual({
+      now: 2000, avg: 2000, peak: 3000, total: (3000 + 2000) * 2,
+    });
+    expect(stats.upload.total).toBe((300 + 200) * 2);
+    expect(options.computed.trafficStats.call({ trafficBw: [] }).download.total).toBe(0);
   });
 
   it('auto-shows the panel when UI_TRAFFIC_STATS is on and no pref stored', async () => {
@@ -273,12 +303,16 @@ describe('traffic side panel', () => {
       traffic: { history: { wg0: bw } },
       trafficBw: bw,
       trafficSummary: null,
+      $t: (key) => key,
     };
     expect(options.computed.trafficBw.call(state)).toHaveLength(2);
-    expect(options.computed.trafficBwSeries.call(state)).toEqual([
-      { name: 'REMOTO (RX)', data: [{ x: 1, y: 1000 }, { x: 2, y: 3000 }] },
-      { name: 'LOCAL (TX)', data: [{ x: 1, y: 500 }, { x: 2, y: 1500 }] },
+    const series = options.computed.trafficBwSeries.call(state);
+    expect(series).toEqual([
+      { key: 'download', name: 'ui.download', data: [{ x: 1, y: 500 }, { x: 2, y: 1500 }] },
+      { key: 'upload', name: 'ui.upload', data: [{ x: 1, y: 1000 }, { x: 2, y: 3000 }] },
     ]);
+    const visible = options.computed.trafficChartSeries.call({ trafficBwSeries: series, trafficHidden: { upload: true } });
+    expect(visible.map((s) => s.key)).toEqual(['download']);
     const peak = options.computed.trafficPeak.call(state);
     expect(peak).toEqual({ rx: 3000, tx: 1500 });
     expect(options.computed.trafficPeakMax.call({ ...state, trafficPeak: peak })).toBe(3000);
@@ -604,13 +638,13 @@ describe('reachability dot', () => {
       probeVerdictFor: options.methods.probeVerdictFor,
       $t: (key) => key,
     };
-    expect(options.methods.probeDotClass.call(state, 'c', 'r-ok')).toBe('bg-green-500');
-    expect(options.methods.probeDotClass.call(state, 'c', 'r-bad')).toBe('bg-red-500');
-    expect(options.methods.probeDotClass.call(state, 'c', 'r-miss')).toBe('bg-red-500');
-    expect(options.methods.probeDotClass.call(state, 'c', 'r-local')).toBe('bg-amber-400');
-    expect(options.methods.probeDotClass.call(state, 'c', 'r-off')).toBe('bg-gray-300 dark:bg-neutral-500');
-    expect(options.methods.probeDotClass.call(state, 'c', 'r-udp')).toBe('bg-gray-300 dark:bg-neutral-500');
-    expect(options.methods.probeDotClass.call(state, 'c', 'r-none')).toBe('bg-gray-300 dark:bg-neutral-500');
+    expect(options.methods.probeDotClass.call(state, 'c', 'r-ok')).toBe('dot-ok');
+    expect(options.methods.probeDotClass.call(state, 'c', 'r-bad')).toBe('dot-bad');
+    expect(options.methods.probeDotClass.call(state, 'c', 'r-miss')).toBe('dot-bad');
+    expect(options.methods.probeDotClass.call(state, 'c', 'r-local')).toBe('dot-warn');
+    expect(options.methods.probeDotClass.call(state, 'c', 'r-off')).toBe('dot-off');
+    expect(options.methods.probeDotClass.call(state, 'c', 'r-udp')).toBe('dot-off');
+    expect(options.methods.probeDotClass.call(state, 'c', 'r-none')).toBe('dot-off');
     expect(options.methods.probeDotTitle.call(state, { id: 'c' }, { id: 'r-ok' })).toBe('networkPolicy.verdictTitle');
   });
 
@@ -705,38 +739,75 @@ describe('all-ports consolidated view', () => {
     expect(options.computed.allPortsRows.call(state).map((row) => row.rule.id)).toEqual(['r3']);
   });
 
-  it('toggles with persistence', () => {
-    const options = loadAppOptions();
-    localStorageMock.setItem.mockClear();
-    const state = { allPortsOpen: false };
-    options.methods.toggleAllPorts.call(state);
-    expect(state.allPortsOpen).toBe(true);
-    expect(localStorageMock.setItem).toHaveBeenCalledWith('allPortsOpen', '1');
-    options.methods.toggleAllPorts.call(state);
-    expect(localStorageMock.setItem).toHaveBeenLastCalledWith('allPortsOpen', '0');
-  });
-
-  it('jumpToPeer expands the peer section, persists and schedules a probe', () => {
+  it('jumpToPeer expands the peer section, persists, schedules a probe and opens the detail', () => {
     const options = loadAppOptions();
     localStorageMock.setItem.mockClear();
     const state = {
       expandedPfClients: {},
       persistPfExpanded: options.methods.persistPfExpanded,
       scheduleAutoProbe: jest.fn(),
+      navigate: jest.fn(),
       $set(target, key, value) {
         target[key] = value;
-      },
-      // No DOM in the vm: record the tick instead of running it.
-      $nextTick(callback) {
-        state.__nextTick = callback;
       },
     };
     options.methods.jumpToPeer.call(state, 'client9');
     expect(state.expandedPfClients.client9).toBe(true);
     expect(localStorageMock.setItem).toHaveBeenCalledWith('pfExpanded', '{"client9":true}');
     expect(state.scheduleAutoProbe).toHaveBeenCalledTimes(1);
+    expect(state.navigate).toHaveBeenCalledWith('client', 'client9');
     // Already expanded: no double probe scheduling.
     options.methods.jumpToPeer.call(state, 'client9');
     expect(state.scheduleAutoProbe).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('views and client list', () => {
+  it('maps the hash to the current view and navigates by setting it', () => {
+    const location = { hash: '' };
+    const options = loadAppOptions({ location });
+    const state = { view: null, viewClientId: null };
+    const route = (hash) => {
+      location.hash = hash;
+      options.methods.applyRoute.call(state);
+      return [state.view, state.viewClientId];
+    };
+    expect(route('')).toEqual(['panel', null]);
+    expect(route('#/ports')).toEqual(['ports', null]);
+    expect(route('#/client/a%2Fb')).toEqual(['client', 'a/b']);
+    expect(route('#/unknown')).toEqual(['panel', null]);
+
+    state.applyRoute = jest.fn();
+    location.hash = '';
+    options.methods.navigate.call(state, 'client', 'a/b');
+    expect(location.hash).toBe('#/client/a%2Fb');
+    // Same hash: no hashchange event will fire, so the route is applied directly.
+    options.methods.navigate.call(state, 'client', 'a/b');
+    expect(state.applyRoute).toHaveBeenCalledTimes(1);
+  });
+
+  it('filters clients by search text and status', () => {
+    const options = loadAppOptions();
+    const clients = [
+      {
+        id: 'a', name: 'nas-casa', address: '10.8.0.2', enabled: true, online: true,
+      },
+      {
+        id: 'b', name: 'laptop', address: '10.8.0.3', enabled: true, online: false,
+      },
+      {
+        id: 'c', name: 'tablet', address: '10.8.0.4', enabled: false, online: false,
+      },
+    ];
+    const ids = (state) => options.computed.filteredClients.call({ clients, ...state }).map((c) => c.id);
+    expect(ids({ clientSearch: '', clientFilter: 'all' })).toEqual(['a', 'b', 'c']);
+    expect(ids({ clientSearch: '10.8.0.3', clientFilter: 'all' })).toEqual(['b']);
+    expect(ids({ clientSearch: 'NAS', clientFilter: 'all' })).toEqual(['a']);
+    expect(ids({ clientSearch: '', clientFilter: 'online' })).toEqual(['a']);
+    expect(ids({ clientSearch: '', clientFilter: 'offline' })).toEqual(['b']);
+    expect(ids({ clientSearch: '', clientFilter: 'disabled' })).toEqual(['c']);
+    expect(options.computed.onlineCount.call({ clients })).toBe(1);
+    expect(options.computed.viewClient.call({ clients, viewClientId: 'b' }).name).toBe('laptop');
+    expect(options.computed.viewClient.call({ clients, viewClientId: 'zz' })).toBeNull();
   });
 });

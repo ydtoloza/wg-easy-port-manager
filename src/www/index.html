@@ -1,1347 +1,624 @@
 <!DOCTYPE html>
-<html>
+<html class="dark">
 
 <head>
   <title>WireGuard</title>
   <meta charset="utf-8"/>
-  <link href="./css/app.css?v=5" rel="stylesheet">
+  <link href="./css/app.css?v=6" rel="stylesheet">
   <link rel="manifest" href="./manifest.json">
   <link rel="icon" type="image/png" href="./img/favicon.png">
   <link rel="apple-touch-icon" href="./img/apple-touch-icon.png">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<style>
-  [v-cloak] {
-    display: none;
-  }
-  .line-chart .apexcharts-svg{
-    transform: translateY(3px);
-  }
-  /* Toast animations */
-  .toast-enter-active, .toast-leave-active { transition: all 0.3s cubic-bezier(0.4,0,0.2,1); }
-  .toast-enter { opacity: 0; transform: translateX(60px); }
-  .toast-leave-to { opacity: 0; transform: translateX(60px); }
-  .toast-move { transition: transform 0.3s ease; }
-</style>
+  <!-- Apply the stored theme before first paint (dark by default) to avoid a light flash. -->
+  <script>try { var t = localStorage.theme; if (t === 'light' || (t === 'auto' && !matchMedia('(prefers-color-scheme: dark)').matches)) document.documentElement.classList.remove('dark'); } catch (e) {}</script>
 </head>
 
-<body class="bg-gray-50 dark:bg-neutral-800">
+<body>
   <!-- vue-app-template:start -->
   <div id="app">
 
-    <!-- ── Toast Notifications ─────────────────────────────── -->
-    <div v-cloak class="fixed bottom-6 right-6 z-50 flex flex-col gap-3 items-end" style="max-width: 380px;">
+    <!-- Toasts -->
+    <div v-cloak class="toasts" aria-live="polite">
       <transition-group name="toast">
-        <div v-for="toast in toasts" :key="toast.id"
-          class="flex items-start gap-3 px-4 py-3 rounded-xl shadow-2xl border cursor-pointer w-full"
-          :class="toast.type === 'success'
-            ? 'bg-neutral-800 dark:bg-neutral-900 border-green-500/40 text-green-300'
-            : toast.type === 'info'
-            ? 'bg-neutral-800 dark:bg-neutral-900 border-blue-500/40 text-blue-300'
-            : 'bg-neutral-800 dark:bg-neutral-900 border-red-500/40 text-red-300'"
-          @click="dismissToast(toast.id)">
-          <!-- Icon -->
-          <svg v-if="toast.type === 'success'" class="w-5 h-5 flex-shrink-0 mt-0.5 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
-          <svg v-else class="w-5 h-5 flex-shrink-0 mt-0.5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-          </svg>
-          <!-- Message -->
-          <span class="text-sm font-medium leading-snug">{{ toast.msg }}</span>
-          <!-- Dismiss -->
-          <button class="ml-auto pl-2 opacity-60 hover:opacity-100 transition-opacity flex-shrink-0">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
-          </button>
-        </div>
+        <button v-for="toast in toasts" :key="toast.id" type="button" class="toast" :class="'toast-' + toast.type" @click="dismissToast(toast.id)">
+          <span class="grow">{{ toast.msg }}</span>
+          <span aria-hidden="true" class="muted">×</span>
+        </button>
       </transition-group>
     </div>
-    <!-- ────────────────────────────────────────────────────── -->
 
-    <div v-cloak class="container mx-auto px-3 md:px-0 mt-4 xs:mt-6" :class="uiShowTraffic ? 'max-w-6xl' : 'max-w-3xl'">
-      <div v-if="authenticated === true">
-        <div class="flex flex-col-reverse xxs:flex-row flex-auto items-center items-end gap-3">
-          <h1 class="text-4xl dark:text-neutral-200 font-medium flex-grow self-start mb-4">
-            <img src="./img/logo.png" width="32" class="inline align-middle dark:bg mr-2" /><span class="align-middle">WireGuard</span>
-          </h1>
-          <div class="flex items-center grow-0 gap-3 items-end self-end xxs:self-center">
-            <!-- Server Config -->
-            <button @click="openServerConfig"
-              class="flex items-center justify-center w-8 h-8 rounded-full bg-gray-200 hover:bg-gray-300 dark:bg-neutral-700 dark:hover:bg-neutral-600 transition" title="Server Config">
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"
-                class="w-5 h-5 text-gray-600 dark:text-neutral-400">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28Z" />
-                <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
-              </svg>
-            </button>
-            <!-- Dark / light theme -->
-            <button @click="toggleTheme"
-              class="flex items-center justify-center w-8 h-8 rounded-full bg-gray-200 hover:bg-gray-300 dark:bg-neutral-700 dark:hover:bg-neutral-600 transition" :title="$t(`theme.${uiTheme}`)">
-              <svg v-if="uiTheme === 'light'" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"
-                class="w-5 h-5">
-                <path stroke-linecap="round" stroke-linejoin="round"
-                  d="M12 3v2.25m6.364.386-1.591 1.591M21 12h-2.25m-.386 6.364-1.591-1.591M12 18.75V21m-4.773-4.227-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0Z" />
-              </svg>
-              <svg v-else-if="uiTheme === 'dark'" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"
-                class="w-5 h-5 text-neutral-400">
-                <path stroke-linecap="round" stroke-linejoin="round"
-                  d="M21.752 15.002A9.72 9.72 0 0 1 18 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 0 0 3 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 0 0 9.002-5.998Z" />
-              </svg>
-              <svg v-else xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24"
-                class="w-5 h-5 fill-gray-600 dark:fill-neutral-400">
-                <path
-                  d="M12,2.2c-5.4,0-9.8,4.4-9.8,9.8s4.4,9.8,9.8,9.8s9.8-4.4,9.8-9.8S17.4,2.2,12,2.2z M3.8,12c0-4.5,3.7-8.2,8.2-8.2v16.5C7.5,20.2,3.8,16.5,3.8,12z" />
-              </svg>
-            </button>
-            <!-- Show / hide traffic panel -->
-            <button @click="toggleTraffic"
-              class="flex items-center justify-center w-8 h-8 rounded-full bg-gray-200 hover:bg-gray-300 dark:bg-neutral-700 dark:hover:bg-neutral-600 transition" :title="$t('traffic.title')">
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"
-                class="w-5 h-5" :class="uiShowTraffic ? 'text-red-800 dark:text-red-400' : 'text-gray-600 dark:text-neutral-400'">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M2.25 18 9 11.25l4.306 4.307a11.95 11.95 0 0 1 5.814-5.519l2.74-1.22m0 0-5.94-2.28m5.94 2.28-2.28 5.941" />
-              </svg>
-            </button>
-            <!-- Notification center: toasts vanish, this durable history stays -->
-            <div class="relative">
-              <button @click="toggleNotifications" :aria-label="$t('notifications.title')"
-                class="relative flex items-center justify-center w-8 h-8 rounded-full bg-gray-200 hover:bg-gray-300 dark:bg-neutral-700 dark:hover:bg-neutral-600 transition" :title="$t('notifications.title')">
-                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"
-                  class="w-5 h-5" :class="unreadCount > 0 ? 'text-red-800 dark:text-red-400' : 'text-gray-600 dark:text-neutral-400'">
-                  <path stroke-linecap="round" stroke-linejoin="round" d="M14.857 17.082a23.848 23.848 0 0 0 5.454-1.31A8.967 8.967 0 0 1 18 9.75V9A6 6 0 0 0 6 9v.75a8.967 8.967 0 0 1-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 0 1-5.714 0m5.714 0a3 3 0 1 1-5.714 0" />
-                </svg>
-                <span v-if="unreadCount > 0" aria-hidden="true"
-                  class="absolute flex items-center justify-center min-w-[15px] h-[15px] px-1 text-[10px] font-bold leading-none text-white bg-red-600 rounded-full"
-                  style="top:-3px;right:-3px;">{{ unreadCount > 9 ? '9+' : unreadCount }}</span>
-              </button>
-              <!-- Click-outside catcher -->
-              <div v-if="showNotifications" class="fixed inset-0 z-30" @click="closeNotifications"></div>
-              <!-- Dropdown panel -->
-              <div v-if="showNotifications"
-                class="absolute right-0 mt-2 w-80 max-w-[calc(100vw-1.5rem)] rounded-xl shadow-2xl border border-gray-200 dark:border-neutral-600 bg-white dark:bg-neutral-800 z-40 overflow-hidden">
-                <div class="flex items-center justify-between px-4 py-3 border-b border-gray-100 dark:border-neutral-600">
-                  <p class="text-sm font-semibold text-gray-700 dark:text-neutral-200">{{$t('notifications.title')}}</p>
-                  <button type="button" @click="clearNotifications"
-                    class="text-xs text-gray-400 hover:text-red-700 dark:hover:text-red-400 transition">{{$t('notifications.clear')}}</button>
-                </div>
-                <div class="max-h-72 overflow-y-auto">
-                  <p v-if="!notifications.length" class="px-4 py-6 text-center text-xs text-gray-400 dark:text-neutral-500">{{$t('notifications.empty')}}</p>
-                  <div v-for="entry in notificationsSlice" :key="entry.id"
-                    class="flex items-start gap-2 px-4 py-2.5 border-b border-gray-50 dark:border-neutral-700/50 last:border-b-0">
-                    <svg v-if="entry.type === 'success'" class="w-4 h-4 flex-shrink-0 mt-0.5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                    </svg>
-                    <svg v-else class="w-4 h-4 flex-shrink-0 mt-0.5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                    </svg>
-                    <div class="min-w-0 flex-grow">
-                      <p class="text-xs leading-snug break-words"
-                        :class="entry.at > notificationsReadAt ? 'font-semibold text-gray-700 dark:text-neutral-100' : 'text-gray-500 dark:text-neutral-400'">{{ entry.msg }}</p>
-                      <p class="text-[10px] text-gray-400 dark:text-neutral-500 mt-0.5">{{ entry.at | timeago }}</p>
+    <div v-cloak>
+      <template v-if="authenticated === true">
+        <header class="top">
+          <div class="top-in">
+            <span class="brand"><img src="./img/logo.png" width="22" height="22" alt="" />WireGuard</span>
+            <nav class="top-nav" :aria-label="$t('ui.panel')">
+              <a href="#" :aria-current="view !== 'ports' ? 'page' : null" @click.prevent="navigate('panel')">{{ $t('ui.panel') }}</a>
+              <a href="#/ports" :aria-current="view === 'ports' ? 'page' : null">{{ $t('ui.ports') }} <span v-if="totalPortRules" class="muted">{{ totalPortRules }}</span></a>
+            </nav>
+            <div class="top-actions">
+              <div style="position:relative">
+                <button type="button" class="btn btn-icon" style="position:relative" @click="toggleNotifications" :aria-label="$t('ui.notifications')" :aria-expanded="showNotifications ? 'true' : 'false'">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"></path><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"></path></svg>
+                  <span v-if="unreadCount > 0" class="badge-dot" aria-hidden="true">{{ unreadCount > 9 ? '9+' : unreadCount }}</span>
+                </button>
+                <div v-if="showNotifications" style="position:fixed;inset:0;z-index:30" @click="closeNotifications"></div>
+                <div v-if="showNotifications" class="dropdown">
+                  <div class="row" style="padding:10px 16px">
+                    <strong class="grow">{{ $t('notifications.title') }}</strong>
+                    <button type="button" class="btn-link small" @click="clearNotifications">{{ $t('notifications.clear') }}</button>
+                  </div>
+                  <div class="dropdown-list">
+                    <p v-if="!notifications.length" class="empty small" style="margin:0">{{ $t('notifications.empty') }}</p>
+                    <div v-for="entry in notificationsSlice" :key="entry.id" class="dropdown-item">
+                      <span class="dot" :class="entry.type === 'success' ? 'dot-ok' : (entry.type === 'info' ? 'dot-off' : 'dot-bad')" style="margin-top:6px"></span>
+                      <div style="min-width:0">
+                        <div :class="{ strong: entry.at > notificationsReadAt }" style="overflow-wrap:anywhere">{{ entry.msg }}</div>
+                        <div class="xsmall muted">{{ entry.at | timeago }}</div>
+                      </div>
+                    </div>
+                  </div>
+                  <div style="padding:10px 16px;border-top:1px solid var(--border);background:var(--subtle)">
+                    <div class="xsmall muted strong" style="margin-bottom:4px">{{ $t('notifications.probes') }}</div>
+                    <p v-if="!probeEntries().length" class="xsmall muted" style="margin:0">{{ $t('notifications.probeEmpty') }}</p>
+                    <div v-for="(item, index) in probeEntries()" :key="'probe-' + index" class="row xsmall" style="flex-wrap:nowrap;padding:2px 0">
+                      <span class="dot" :class="probeDotClass(item.client.id, item.rule.id)"></span>
+                      <span class="mono">{{ item.rule.proto === 'both' ? 'TCP+UDP' : item.rule.proto.toUpperCase() }}/{{ item.rule.extPort }}</span>
+                      <span class="muted grow" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ item.client.name }}</span>
+                      <span>{{ $t('networkPolicy.verdict.' + item.verdict) }}</span>
                     </div>
                   </div>
                 </div>
-                <div class="px-4 py-3 border-t border-gray-100 dark:border-neutral-600 bg-gray-50 dark:bg-neutral-700/40">
-                  <p class="text-[10px] font-semibold uppercase tracking-wider text-gray-400 dark:text-neutral-500 mb-1.5">{{$t('notifications.probes')}}</p>
-                  <p v-if="!probeEntries().length" class="text-xs text-gray-400 dark:text-neutral-500">{{$t('notifications.probeEmpty')}}</p>
-                  <div v-for="(item, index) in probeEntries()" :key="'probe-' + index" class="flex items-center gap-2 py-1 text-xs">
-                    <span class="w-2 h-2 rounded-full flex-shrink-0" :class="probeDotClass(item.client.id, item.rule.id)"></span>
-                    <span class="font-mono text-gray-600 dark:text-neutral-300 flex-shrink-0">{{ item.rule.proto === 'both' ? 'TCP+UDP' : item.rule.proto.toUpperCase() }}/{{ item.rule.extPort }}</span>
-                    <span class="truncate text-gray-400 dark:text-neutral-500">{{ item.client.name }}</span>
-                    <span class="ml-auto flex-shrink-0 font-medium" :class="probeVerdictFor(item.client.id, item.rule.id) === 'ok' ? 'text-green-600 dark:text-green-400' : (['unreachable','rule-missing'].includes(probeVerdictFor(item.client.id, item.rule.id)) ? 'text-red-600 dark:text-red-400' : 'text-gray-400 dark:text-neutral-500')">
-                      {{ $t('networkPolicy.verdict.' + item.verdict) }}
-                    </span>
-                  </div>
+              </div>
+              <button type="button" class="btn" @click="openServerConfig">{{ $t('ui.serverConfig') }}</button>
+              <button type="button" class="btn" @click="toggleTraffic" :aria-pressed="uiShowTraffic ? 'true' : 'false'">{{ uiShowTraffic ? $t('ui.hideTraffic') : $t('ui.showTraffic') }}</button>
+              <button type="button" class="btn" @click="toggleTheme">{{ theme === 'dark' ? $t('ui.themeLight') : $t('ui.themeDark') }}</button>
+              <button v-if="requiresPassword" type="button" class="btn-link muted" style="color:var(--fg-muted)" @click="logout">{{ $t('logout') }}</button>
+            </div>
+          </div>
+        </header>
+
+        <main class="wrap">
+
+          <!-- ───────────── Panel ───────────── -->
+          <template v-if="view === 'panel'">
+            <div class="row">
+              <h1 class="grow">{{ $t('ui.panel') }}</h1>
+              <label for="inputRC" class="btn" :title="$t('titleRestoreConfig')">{{ $t('restore') }}
+                <input id="inputRC" type="file" name="configurationfile" accept="text/*,.json" @change="restoreConfig" class="sr-only" />
+              </label>
+              <a href="./api/wireguard/backup" class="btn" :title="$t('titleBackupConfig')">{{ $t('backup') }}</a>
+              <button type="button" class="btn btn-primary" @click="clientCreate = true; clientCreateName = '';">{{ $t('newClient') }}</button>
+            </div>
+
+            <section v-if="uiShowTraffic" class="box" aria-labelledby="h-traffic">
+              <div class="box-head">
+                <h2 id="h-traffic">{{ $t('ui.networkTraffic') }} <span class="muted" style="font-weight:400">· wg0</span></h2>
+                <div class="seg" role="group" :aria-label="$t('traffic.bandwidth')">
+                  <button type="button" :aria-pressed="trafficRange === 'realtime' ? 'true' : 'false'" @click="setTrafficRange('realtime')">2m</button>
+                  <button type="button" :aria-pressed="trafficRange === '1h' ? 'true' : 'false'" @click="setTrafficRange('1h')">1h</button>
+                  <button type="button" :aria-pressed="trafficRange === '24h' ? 'true' : 'false'" @click="setTrafficRange('24h')">24h</button>
+                  <button type="button" :aria-pressed="trafficRange === '30d' ? 'true' : 'false'" @click="setTrafficRange('30d')">30d</button>
                 </div>
               </div>
-            </div>
-            <!-- Show / hide charts -->
-            <label v-if="uiChartType > 0" class="inline-flex items-center justify-center cursor-pointer w-8 h-8 rounded-full bg-gray-200 hover:bg-gray-300 dark:bg-neutral-700 dark:hover:bg-neutral-600 whitespace-nowrap transition group" :title="$t('toggleCharts')">
-              <input type="checkbox" value="" class="sr-only peer" v-model="uiShowCharts" @change="toggleCharts">
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" stroke-width="1.5" fill="currentColor"
-                class="w-5 h-5 peer fill-gray-400 peer-checked:fill-gray-600 dark:fill-neutral-600 peer-checked:dark:fill-neutral-400 group-hover:dark:fill-neutral-500 transition">
-                  <path
-                    d="M18.375 2.25c-1.035 0-1.875.84-1.875 1.875v15.75c0 1.035.84 1.875 1.875 1.875h.75c1.035 0 1.875-.84 1.875-1.875V4.125c0-1.036-.84-1.875-1.875-1.875h-.75ZM9.75 8.625c0-1.036.84-1.875 1.875-1.875h.75c1.036 0 1.875.84 1.875 1.875v11.25c0 1.035-.84 1.875-1.875 1.875h-.75a1.875 1.875 0 0 1-1.875-1.875V8.625ZM3 13.125c0-1.036.84-1.875 1.875-1.875h.75c1.036 0 1.875.84 1.875 1.875v6.75c0 1.035-.84 1.875-1.875 1.875h-.75A1.875 1.875 0 0 1 3 19.875v-6.75Z" />
-              </svg>
-            </label>
-            <span v-if="requiresPassword"
-              class="text-sm text-gray-400 dark:text-neutral-400 cursor-pointer hover:underline"
-              @click="logout">
-              {{$t("logout")}}
-              <svg class="h-3 inline" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                  d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
-              </svg>
-            </span>
-          </div>
-        </div>
-        <div class="text-sm text-gray-400 dark:text-neutral-400 mb-5"></div>
-        <div :class="uiShowTraffic ? 'lg:flex lg:items-start lg:gap-5' : ''">
-          <div :class="uiShowTraffic ? 'lg:flex-1 lg:min-w-0' : ''">
-        <!-- All ports: every forwarding rule in one searchable table -->
-        <div class="shadow-md rounded-lg bg-white dark:bg-neutral-700 overflow-hidden mb-5">
-          <button type="button"
-            class="flex items-center justify-between w-full px-5 py-3 text-left select-none hover:bg-gray-50 dark:hover:bg-neutral-700/50 transition-colors"
-            :aria-expanded="allPortsOpen ? 'true' : 'false'"
-            aria-controls="all-ports-panel"
-            @click="toggleAllPorts">
-            <div class="flex items-center gap-3">
-              <div class="p-1.5 rounded-md bg-gray-100 dark:bg-neutral-700 text-gray-500 dark:text-neutral-400">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18M8 3v18M16 3v18" />
-                </svg>
+              <div class="scroll-x" style="border-bottom:1px solid var(--border)">
+                <table class="table num" style="min-width:560px">
+                  <thead>
+                    <tr>
+                      <th>{{ $t('ui.series') }}</th>
+                      <th class="right">{{ $t('ui.now') }}</th>
+                      <th class="right">{{ $t('ui.average') }}</th>
+                      <th class="right">{{ $t('ui.peak') }}</th>
+                      <th class="right">{{ $t('ui.totalInRange') }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="s in trafficBwSeries" :key="s.key" :style="{ opacity: trafficHidden[s.key] ? 0.5 : 1 }">
+                      <td>
+                        <button type="button" class="btn-link strong" style="color:var(--fg)" :aria-pressed="trafficHidden[s.key] ? 'false' : 'true'" :aria-label="$t('ui.toggleSeries', { name: s.name })" @click="toggleSeries(s.key)">
+                          <span class="swatch" :class="s.key === 'download' ? 'swatch-rx' : 'swatch-tx'"></span>{{ s.name }}
+                        </button>
+                      </td>
+                      <td class="right strong" style="font-size:16px">{{ fmtSpeed(trafficStats[s.key].now) }}</td>
+                      <td class="right">{{ fmtSpeed(trafficStats[s.key].avg) }}</td>
+                      <td class="right">{{ fmtSpeed(trafficStats[s.key].peak) }}</td>
+                      <td class="right">{{ fmtBytes(trafficStats[s.key].total) }}</td>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
-              <span class="text-sm font-medium text-gray-700 dark:text-neutral-300">{{$t('allPorts.title')}}</span>
-              <span v-if="totalPortRules" class="inline-flex items-center justify-center px-2 py-0.5 text-xs font-bold leading-none text-red-100 bg-red-800 dark:bg-red-900/80 rounded-full">{{ totalPortRules }}</span>
+              <div class="chart">
+                <apexchart v-if="trafficBw.length" width="100%" height="300" :options="trafficChartOptions" :series="trafficChartSeries"></apexchart>
+                <p v-else class="empty" style="margin:0">{{ $t('ui.noTraffic') }}</p>
+              </div>
+            </section>
+
+            <div v-if="uiShowTraffic" class="cols">
+              <section class="box col-main" aria-labelledby="h-server">
+                <div class="box-head">
+                  <h2 id="h-server">{{ $t('ui.server') }}</h2>
+                  <span class="xsmall muted"><span class="swatch" style="background:var(--fg-muted)"></span>{{ $t('ui.system') }} <span class="swatch swatch-rx" style="margin-left:8px"></span>WG-Easy</span>
+                </div>
+                <div class="box-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px">
+                  <div>
+                    <div class="row"><strong class="grow">{{ $t('traffic.cpu') }}</strong>
+                      <span v-if="traffic && traffic.cpu" class="num small">{{ (traffic.cpu.system || 0).toFixed(1) }}% <span class="muted">/ {{ (traffic.cpu.process || 0).toFixed(1) }}%</span></span>
+                    </div>
+                    <apexchart v-if="traffic && traffic.cpu && traffic.cpu.history.length" width="100%" height="120" :options="trafficCpuOptions" :series="trafficCpuSeries"></apexchart>
+                    <p v-else class="empty small" style="margin:0">{{ $t('traffic.noData') }}</p>
+                  </div>
+                  <div>
+                    <div class="row"><strong class="grow">{{ $t('traffic.ram') }}</strong>
+                      <span v-if="traffic && traffic.mem" class="num small">{{ (traffic.mem.system || 0).toFixed(1) }}% <span class="muted">/ {{ (traffic.mem.process || 0).toFixed(1) }}%</span></span>
+                    </div>
+                    <apexchart v-if="traffic && traffic.mem && traffic.mem.history.length" width="100%" height="120" :options="trafficMemOptions" :series="trafficMemSeries"></apexchart>
+                    <p v-else class="empty small" style="margin:0">{{ $t('traffic.noData') }}</p>
+                  </div>
+                </div>
+              </section>
+
+              <div class="col-side">
+                <section class="box" aria-labelledby="h-ifaces">
+                  <div class="box-head"><h2 id="h-ifaces">{{ $t('ui.interfaces') }}</h2></div>
+                  <table v-if="traffic && traffic.interfaces && traffic.interfaces.length" class="table num">
+                    <thead><tr><th>{{ $t('ui.iface') }}</th><th class="right">RX</th><th class="right">TX</th></tr></thead>
+                    <tbody>
+                      <tr v-for="iface in traffic.interfaces" :key="iface.id || iface.name">
+                        <td class="mono">{{ iface.id || iface.name }}</td>
+                        <td class="right nowrap">{{ fmtSpeed(iface.rxSpeed) }}<div class="xsmall muted">{{ $t('ui.peak') }} {{ fmtSpeed(iface.peakRx) }}</div></td>
+                        <td class="right nowrap">{{ fmtSpeed(iface.txSpeed) }}<div class="xsmall muted">{{ $t('ui.peak') }} {{ fmtSpeed(iface.peakTx) }}</div></td>
+                      </tr>
+                    </tbody>
+                  </table>
+                  <p v-else class="empty small" style="margin:0">{{ $t('traffic.noData') }}</p>
+                </section>
+                <section v-if="traffic && traffic.peaks" class="box" aria-labelledby="h-totals">
+                  <div class="box-head"><h2 id="h-totals">{{ $t('ui.sinceStart') }}</h2></div>
+                  <div class="box-body">
+                    <dl class="kv num">
+                      <dt>{{ $t('ui.peak') }} ↓</dt><dd>{{ fmtSpeed(traffic.peaks.txSpeed) }}<span v-if="traffic.peakAt && traffic.peakAt.txSpeed" class="xsmall muted"> · {{ traffic.peakAt.txSpeed | timeago }}</span></dd>
+                      <dt>{{ $t('ui.peak') }} ↑</dt><dd>{{ fmtSpeed(traffic.peaks.rxSpeed) }}<span v-if="traffic.peakAt && traffic.peakAt.rxSpeed" class="xsmall muted"> · {{ traffic.peakAt.rxSpeed | timeago }}</span></dd>
+                      <template v-if="trafficSummary">
+                        <dt>Total ↓</dt><dd>{{ fmtBytes(trafficSummary.totals.txBytes) }}</dd>
+                        <dt>Total ↑</dt><dd>{{ fmtBytes(trafficSummary.totals.rxBytes) }}</dd>
+                      </template>
+                    </dl>
+                  </div>
+                </section>
+              </div>
             </div>
-            <svg class="w-4 h-4 text-gray-400 dark:text-neutral-500 transition-transform duration-200" :class="{ 'rotate-180': allPortsOpen }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
-            </svg>
-          </button>
-          <div v-show="allPortsOpen" id="all-ports-panel" class="px-4 pb-4">
-            <div class="flex flex-wrap items-center gap-2 mb-3">
-              <input v-model.trim="allPortsSearch" type="search" :placeholder="$t('allPorts.search')"
-                class="text-sm text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 outline-none w-full sm:w-56" />
-              <select v-model="allPortsProto"
-                class="text-xs font-bold text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-2 py-2 focus:ring-2 focus:ring-red-800 outline-none">
-                <option value="all">{{$t('allPorts.allProtos')}}</option>
+
+            <section class="box" aria-labelledby="h-clients">
+              <div class="box-head">
+                <h2 id="h-clients">{{ $t('clients') }} <span v-if="clients" class="muted" style="font-weight:400">{{ $t('ui.clientsConnected', { online: onlineCount, total: clients.length }) }}</span></h2>
+                <input v-model="clientSearch" type="search" :aria-label="$t('ui.search')" :placeholder="$t('ui.search')" style="height:28px;width:240px;max-width:100%" />
+                <select v-model="clientFilter" :aria-label="$t('ui.filterStatus')" style="height:28px">
+                  <option value="all">{{ $t('ui.filterAll') }}</option>
+                  <option value="online">{{ $t('ui.filterOnline') }}</option>
+                  <option value="offline">{{ $t('ui.filterOffline') }}</option>
+                  <option value="disabled">{{ $t('ui.filterDisabled') }}</option>
+                </select>
+              </div>
+              <div v-if="clients === null" class="empty"><div class="spinner"></div></div>
+              <div v-else-if="clients.length === 0" class="empty">
+                <p>{{ $t('noClients') }}</p>
+                <button type="button" class="btn btn-primary" @click="clientCreate = true; clientCreateName = '';">{{ $t('newClient') }}</button>
+              </div>
+              <div v-else class="scroll-x">
+                <table class="table" style="min-width:880px">
+                  <thead>
+                    <tr>
+                      <th>{{ $t('ui.colName') }}</th>
+                      <th>{{ $t('ui.colAddress') }}</th>
+                      <th>{{ $t('ui.colStatus') }}</th>
+                      <th>{{ $t('ui.colLastSeen') }}</th>
+                      <th class="right">{{ $t('ui.colUsage') }}</th>
+                      <th class="right">{{ $t('ui.colPorts') }}</th>
+                      <th>{{ $t('ui.colEnabled') }}</th>
+                      <th><span class="sr-only">{{ $t('ui.colActions') }}</span></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="client in filteredClients" :key="client.id" :class="{ off: !client.enabled }">
+                      <td><a :href="'#/client/' + clientPathId(client.id)" class="strong" @click.prevent="jumpToPeer(client.id)">{{ client.name }}</a></td>
+                      <td class="mono">{{ client.address }}</td>
+                      <td class="nowrap"><span class="dot" :class="clientStatus(client).dot"></span>{{ clientStatus(client).label }}</td>
+                      <td class="nowrap" :title="client.latestHandshakeAt ? dateTime(new Date(client.latestHandshakeAt)) : null">{{ client.latestHandshakeAt ? ago(new Date(client.latestHandshakeAt)) : $t('ui.never') }}</td>
+                      <td class="right num nowrap">{{ client.transferTx != null ? fmtBytes(client.transferTx) : '—' }} / {{ client.transferRx != null ? fmtBytes(client.transferRx) : '—' }}</td>
+                      <td class="right">{{ (client.portForwards || []).length || '—' }}</td>
+                      <td><input type="checkbox" :checked="client.enabled" :aria-label="$t('ui.enableClient', { name: client.name })" @change="client.enabled ? disableClient(client) : enableClient(client)" /></td>
+                      <td class="right nowrap">
+                        <button type="button" class="btn-link" :disabled="!client.downloadableConfig" :title="!client.downloadableConfig ? $t('noPrivKey') : $t('showQR')" @click="qrcode = `./api/wireguard/client/${clientPathId(client.id)}/qrcode.svg`">{{ $t('ui.qr') }}</button>
+                        <span class="muted">·</span>
+                        <a :href="'./api/wireguard/client/' + clientPathId(client.id) + '/configuration'" :download="client.downloadableConfig ? 'configuration' : null" :class="{ 'is-disabled': !client.downloadableConfig }" :title="!client.downloadableConfig ? $t('noPrivKey') : $t('downloadConfig')" @click="preventUnavailableDownload($event, client)">{{ $t('ui.download_conf') }}</a>
+                        <span class="muted">·</span>
+                        <a :href="'#/client/' + clientPathId(client.id)" @click.prevent="jumpToPeer(client.id)">{{ $t('ui.open') }}</a>
+                      </td>
+                    </tr>
+                    <tr v-if="!filteredClients.length"><td colspan="8" class="empty">{{ $t('ui.noMatch') }}</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          </template>
+
+          <!-- ───────────── All ports ───────────── -->
+          <template v-else-if="view === 'ports'">
+            <div>
+              <h1>{{ $t('allPorts.title') }}</h1>
+              <p class="muted" style="margin:4px 0 0">{{ $t('ui.portsHint') }}</p>
+            </div>
+            <div class="row">
+              <input v-model.trim="allPortsSearch" type="search" class="grow" style="min-width:220px" :aria-label="$t('allPorts.search')" :placeholder="$t('allPorts.search')" />
+              <select v-model="allPortsProto" :aria-label="$t('ui.colProtocol')">
+                <option value="all">{{ $t('allPorts.allProtos') }}</option>
                 <option value="tcp">TCP</option>
                 <option value="udp">UDP</option>
                 <option value="both">TCP + UDP</option>
               </select>
-              <select v-model="allPortsStatus"
-                class="text-xs font-bold text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-2 py-2 focus:ring-2 focus:ring-red-800 outline-none">
-                <option value="all">{{$t('allPorts.allStatus')}}</option>
-                <option value="ok">{{$t('allPorts.statusOk')}}</option>
-                <option value="problems">{{$t('allPorts.statusProblems')}}</option>
-                <option value="unknown">{{$t('allPorts.statusUnknown')}}</option>
+              <select v-model="allPortsStatus" :aria-label="$t('ui.colReachable')">
+                <option value="all">{{ $t('allPorts.allStatus') }}</option>
+                <option value="ok">{{ $t('allPorts.statusOk') }}</option>
+                <option value="problems">{{ $t('allPorts.statusProblems') }}</option>
+                <option value="unknown">{{ $t('allPorts.statusUnknown') }}</option>
               </select>
-              <span class="ml-auto text-xs text-gray-400 dark:text-neutral-500">{{ allPortsRows.length }} / {{ totalPortRules }}</span>
             </div>
-            <div v-if="allPortsRows.length" class="space-y-2">
-              <div class="grid grid-cols-[auto_1fr_auto_1fr_1fr] gap-2 items-center px-3 text-xs font-medium text-gray-500 dark:text-neutral-400 uppercase tracking-wider">
-                <span>Proto</span>
-                <span>External Port</span>
-                <span></span>
-                <span>Internal Port</span>
-                <span>Peer</span>
+            <section class="box">
+              <div class="scroll-x">
+                <table class="table" style="min-width:760px">
+                  <thead>
+                    <tr>
+                      <th>{{ $t('ui.colReachable') }}</th>
+                      <th>{{ $t('ui.colPublic') }}</th>
+                      <th>{{ $t('ui.colDestination') }}</th>
+                      <th>{{ $t('ui.colProtocol') }}</th>
+                      <th>{{ $t('ui.colClient') }}</th>
+                      <th>{{ $t('ui.colProbe') }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="row in allPortsRows" :key="row.client.id + ':' + row.rule.id" :class="{ off: !row.client.enabled }">
+                      <td class="nowrap"><span class="dot" :class="probeDotClass(row.client.id, row.rule.id)" :title="probeDotTitle(row.client, row.rule)"></span>{{ row.verdict ? $t('networkPolicy.verdict.' + row.verdict) : $t('networkPolicy.probeNever') }}</td>
+                      <td class="mono">{{ row.rule.extPort }}</td>
+                      <td class="mono">{{ row.client.address }}:{{ row.rule.intPort }}</td>
+                      <td>{{ row.rule.proto === 'both' ? 'TCP + UDP' : row.rule.proto.toUpperCase() }}</td>
+                      <td><a :href="'#/client/' + clientPathId(row.client.id)" @click.prevent="jumpToPeer(row.client.id)">{{ row.client.name }}</a></td>
+                      <td class="muted">{{ row.at ? ago(row.at) : '—' }}</td>
+                    </tr>
+                    <tr v-if="!allPortsRows.length"><td colspan="6" class="empty">{{ $t('allPorts.empty') }}</td></tr>
+                  </tbody>
+                </table>
               </div>
-              <button v-for="row in allPortsRows" :key="row.client.id + ':' + row.rule.id" type="button" @click="jumpToPeer(row.client.id)" :title="$t('allPorts.jump')"
-                class="w-full grid grid-cols-[auto_1fr_auto_1fr_1fr] gap-2 items-center text-left bg-white dark:bg-neutral-700 rounded-lg px-3 py-2.5 shadow-sm border border-gray-200/60 dark:border-neutral-600/60 hover:border-red-300 dark:hover:border-red-800/50 transition-colors">
-                <span class="inline-flex items-center gap-1.5">
-                  <span class="w-2.5 h-2.5 rounded-full flex-shrink-0" :class="probeDotClass(row.client.id, row.rule.id)" :title="probeDotTitle(row.client, row.rule)"></span>
-                  <span class="inline-flex items-center justify-center px-2 py-1 text-xs font-bold rounded-md"
-                        :class="{
-                          'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300': row.rule.proto === 'tcp',
-                          'bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300': row.rule.proto === 'udp',
-                          'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300': row.rule.proto === 'both'
-                        }">
-                    {{ row.rule.proto === 'both' ? 'TCP + UDP' : row.rule.proto.toUpperCase() }}
-                  </span>
-                </span>
-                <span class="font-mono text-sm text-gray-800 dark:text-neutral-200">{{ row.rule.extPort }}</span>
-                <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3" /></svg>
-                <span class="font-mono text-sm text-gray-800 dark:text-neutral-200">{{ row.rule.intPort }}</span>
-                <span class="min-w-0 text-right sm:text-left">
-                  <span class="block text-sm text-gray-700 dark:text-neutral-200 truncate">{{ row.client.name }}</span>
-                  <span class="block text-[10px] text-gray-400 dark:text-neutral-500">
-                    {{ row.verdict ? $t('networkPolicy.verdict.' + row.verdict) : $t('networkPolicy.probeNever') }}<template v-if="row.at"> · {{ row.at | timeago }}</template>
-                  </span>
-                </span>
-              </button>
+            </section>
+            <p class="muted small" style="margin:0">{{ $t('ui.rulesShown', { shown: allPortsRows.length, total: totalPortRules }) }}</p>
+          </template>
+
+          <!-- ───────────── Client detail ───────────── -->
+          <template v-else>
+            <div v-if="clients === null" class="empty"><div class="spinner"></div></div>
+            <div v-else-if="!viewClient" class="box box-body">
+              <p>{{ $t('ui.clientNotFound') }}</p>
+              <a href="#" @click.prevent="navigate('panel')">{{ $t('ui.backToPanel') }}</a>
             </div>
-            <p v-else class="text-xs text-gray-400 dark:text-neutral-500 py-4 text-center">{{$t('allPorts.empty')}}</p>
-          </div>
-        </div>
-        <div class="shadow-md rounded-lg bg-white dark:bg-neutral-700 overflow-hidden">
-          <div class="flex flex-row flex-auto items-center p-3 px-5 border-b-2 border-gray-100 dark:border-neutral-600">
-            <div class="flex-grow">
-              <p class="text-2xl font-medium dark:text-neutral-200">{{$t("clients")}}</p>
-            </div>
-            <div class="flex md:block md:flex-shrink-0">
-              <!-- Restore configuration -->
-              <label for="inputRC" :title="$t('titleRestoreConfig')"
-                class="hover:cursor-pointer hover:bg-red-800 hover:border-red-800 hover:text-white text-gray-700 dark:text-neutral-200 max-md:border-r-0 border-2 border-gray-100 dark:border-neutral-600 py-2 px-4 rounded-l-full md:rounded inline-flex items-center transition">
-                <svg inline class="w-4 md:mr-2" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-                  <path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182m0-4.991v4.99"></path>
-                </svg>
-                <span class="max-md:hidden text-sm">{{$t("restore")}}</span>
-                <input id="inputRC" type="file" name="configurationfile" accept="text/*,.json" @change="restoreConfig" class="hidden"/>
-              </label>
-              <!-- Backup configuration -->
-              <a href="./api/wireguard/backup" :title="$t('titleBackupConfig')"
-                class="hover:bg-red-800 hover:border-red-800 hover:text-white text-gray-700 dark:text-neutral-200 max-md:border-x-0 border-2 border-gray-100 dark:border-neutral-600 py-2 px-4 md:rounded inline-flex items-center transition">
-                <svg inline class="w-4 md:mr-2" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-                  <path stroke-linecap="round" stroke-linejoin="round" d="M5.25 14.25h13.5m-13.5 0a3 3 0 0 1-3-3m3 3a3 3 0 1 0 0 6h13.5a3 3 0 1 0 0-6m-16.5-3a3 3 0 0 1 3-3h13.5a3 3 0 0 1 3 3m-19.5 0a4.5 4.5 0 0 1 .9-2.7L5.737 5.1a3.375 3.375 0 0 1 2.7-1.35h7.126c1.062 0 2.062.5 2.7 1.35l2.587 3.45a4.5 4.5 0 0 1 .9 2.7m0 0a3 3 0 0 1-3 3m0 3h.008v.008h-.008v-.008Zm0-6h.008v.008h-.008v-.008Zm-3 6h.008v.008h-.008v-.008Zm0-6h.008v.008h-.008v-.008Z"></path>
-                </svg>
-                <span class="max-md:hidden text-sm">{{$t("backup")}}</span>
-              </a>
-              <!-- New client -->
-              <button @click="clientCreate = true; clientCreateName = '';"
-                class="hover:bg-red-800 hover:border-red-800 hover:text-white text-gray-700 dark:text-neutral-200 max-md:border-l-0 border-2 border-gray-100 dark:border-neutral-600 py-2 px-4 rounded-r-full md:rounded inline-flex items-center transition">
-                <svg class="w-4 md:mr-2" inline xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"
-                  stroke="currentColor">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                    d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                </svg>
-                <span class="max-md:hidden text-sm">{{$t("new")}}</span>
-              </button>
-            </div>
-          </div>
-
-          <div>
-            <!-- Client -->
-            <div v-if="clients && clients.length > 0" v-for="client in clients" :key="client.id"
-              class="border-b last:border-b-0 border-gray-100 dark:border-neutral-600 border-solid">
-
-              <!-- Client inner: charts + main content, isolated -->
-              <div class="relative overflow-hidden">
-
-              <!-- Chart -->
-              <div v-if="chartsEnabled && client.transferTxSeries" :class="`absolute z-0 bottom-0 left-0 right-0 h-6 ${uiChartType === 1 && 'line-chart'}`" >
-                <apexchart width="100%" height="100%" :options="chartOptionsTX" :series="client.transferTxSeries">
-                </apexchart>
-              </div>
-              <div v-if="chartsEnabled && client.transferRxSeries" :class="`absolute z-0 top-0 left-0 right-0 h-6 ${uiChartType === 1 && 'line-chart'}`" >
-                <apexchart width="100%" height="100%" :options="chartOptionsRX" :series="client.transferRxSeries"
-                  style="transform: scaleY(-1);">
-                </apexchart>
-              </div>
-
-              <div class="relative py-3 md:py-5 px-3 z-10 flex flex-col sm:flex-row justify-between gap-3">
-                <div class="flex gap-3 md:gap-4 w-full items-center ">
-
-                  <!-- Avatar -->
-                  <div class="h-10 w-10 mt-2 self-start rounded-full bg-gray-50 relative">
-                    <svg class="w-6 m-2 text-gray-300" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"
-                      fill="currentColor">
-                      <path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z"
-                        clip-rule="evenodd" />
-                    </svg>
-                    <img v-if="client.avatar" :src="client.avatar" class="w-10 rounded-full absolute top-0 left-0" />
-
-                    <div v-if="client.online">
-                      <div
-                        class="animate-ping w-4 h-4 p-1 bg-red-100 dark:bg-red-100 rounded-full absolute -bottom-1 -right-1">
-                      </div>
-                      <div class="w-2 h-2 bg-red-800 dark:bg-red-600 rounded-full absolute bottom-0 right-0"></div>
-                    </div>
-                  </div>
-
-                  <!-- Name & Info -->
-                  <div class="flex flex-col xxs:flex-row w-full gap-2">
-
-                    <!-- Name -->
-                    <div class="flex flex-col flex-grow gap-1">
-                      <div class="text-gray-700 dark:text-neutral-200 group text-sm md:text-base"
-                        :title="$t('createdOn') + dateTime(new Date(client.createdAt))">
-
-                        <!-- Show -->
-                        <input v-show="clientEditNameId === client.id" v-model="clientEditName"
-                          v-on:keyup.enter="updateClientName(client, clientEditName); clientEditName = null; clientEditNameId = null;"
-                          v-on:keyup.escape="clientEditName = null; clientEditNameId = null;"
-                          :ref="'client-' + client.id + '-name'"
-                          class="rounded px-1 border-2 dark:bg-neutral-700 border-gray-100 dark:border-neutral-600 focus:border-gray-200 dark:focus:border-neutral-500 dark:placeholder:text-neutral-500 outline-none w-30" />
-                        <span v-show="clientEditNameId !== client.id"
-                          class="border-t-2 border-b-2 border-transparent">{{client.name}}</span>
-
-                        <!-- Edit -->
-                        <span v-show="clientEditNameId !== client.id"
-                          @click="clientEditName = client.name; clientEditNameId = client.id; setTimeout(() => $refs['client-' + client.id + '-name'][0].select(), 1);"
-                          class="cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity">
-                          <svg xmlns="http://www.w3.org/2000/svg"
-                            class="h-4 w-4 inline align-middle opacity-25 hover:opacity-100" fill="none"
-                            viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                              d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                          </svg>
-                        </span>
-                      </div>
-                      <!-- Address -->
-                      <div class=" block md:inline-block pb-1 md:pb-0 text-gray-500 dark:text-neutral-400 text-xs">
-                        <span class="group">
-                          <!-- Show -->
-                          <input v-show="clientEditAddressId === client.id" v-model="clientEditAddress"
-                            v-on:keyup.enter="updateClientAddress(client, clientEditAddress, undefined); clientEditAddress = null; clientEditAddressId = null;"
-                            v-on:keyup.escape="clientEditAddress = null; clientEditAddressId = null;"
-                            :ref="'client-' + client.id + '-address'"
-                            class="rounded border-2 dark:bg-neutral-700 border-gray-100 dark:border-neutral-600 focus:border-gray-200 dark:focus:border-neutral-500 outline-none w-20 text-black dark:text-neutral-300 dark:placeholder:text-neutral-500" />
-                          <span v-show="clientEditAddressId !== client.id"
-                            class="inline-block ">{{client.address}}</span>
-
-                          <!-- Edit -->
-                          <span v-show="clientEditAddressId !== client.id"
-                            @click="clientEditAddress = client.address; clientEditAddressId = client.id; setTimeout(() => $refs['client-' + client.id + '-address'][0].select(), 1);"
-                            class="cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity">
-                            <svg xmlns="http://www.w3.org/2000/svg"
-                              class="h-4 w-4 inline align-middle opacity-25 hover:opacity-100" fill="none"
-                              viewBox="0 0 24 24" stroke="currentColor">
-                              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                            </svg>
-                          </span>
-                        </span>
-                        <span v-if="client.addressV6" class="group ml-2">
-                          ·
-                          <!-- Show V6 -->
-                          <input v-show="clientEditAddressV6Id === client.id" v-model="clientEditAddressV6"
-                            v-on:keyup.enter="updateClientAddress(client, undefined, clientEditAddressV6); clientEditAddressV6 = null; clientEditAddressV6Id = null;"
-                            v-on:keyup.escape="clientEditAddressV6 = null; clientEditAddressV6Id = null;"
-                            :ref="'client-' + client.id + '-addressV6'"
-                            class="rounded border-2 dark:bg-neutral-700 border-gray-100 dark:border-neutral-600 focus:border-gray-200 dark:focus:border-neutral-500 outline-none w-44 text-black dark:text-neutral-300 dark:placeholder:text-neutral-500" />
-                          <span v-show="clientEditAddressV6Id !== client.id"
-                            class="inline-block ">{{client.addressV6}}</span>
-
-                          <!-- Edit V6 -->
-                          <span v-show="clientEditAddressV6Id !== client.id"
-                            @click="clientEditAddressV6 = client.addressV6; clientEditAddressV6Id = client.id; setTimeout(() => $refs['client-' + client.id + '-addressV6'][0].select(), 1);"
-                            class="cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity">
-                            <svg xmlns="http://www.w3.org/2000/svg"
-                              class="h-4 w-4 inline align-middle opacity-25 hover:opacity-100" fill="none"
-                              viewBox="0 0 24 24" stroke="currentColor">
-                              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                            </svg>
-                          </span>
-                        </span>
-                        <!-- Inline Transfer TX -->
-                        <span v-if="!uiTrafficStats && client.transferTx" class="whitespace-nowrap" :title="$t('totalDownload') + bytes(client.transferTx)">
-                          ·
-                          <svg class="align-middle h-3 inline" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                            <path fill-rule="evenodd"
-                              d="M16.707 10.293a1 1 0 010 1.414l-6 6a1 1 0 01-1.414 0l-6-6a1 1 0 111.414-1.414L9 14.586V3a1 1 0 012 0v11.586l4.293-4.293a1 1 0 011.414 0z"
-                              clip-rule="evenodd" />
-                          </svg>
-                          {{client.transferTxCurrent | bytes}}/s
-                        </span>
-                        
-                        <!-- Inline Transfer RX -->
-                        <span v-if="!uiTrafficStats && client.transferRx" class="whitespace-nowrap" :title="$t('totalUpload') + bytes(client.transferRx)">
-                          ·
-                          <svg class="align-middle h-3 inline" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                            <path fill-rule="evenodd"
-                              d="M3.293 9.707a1 1 0 010-1.414l6-6a1 1 0 011.414 0l6 6a1 1 0 01-1.414 1.414L11 5.414V17a1 1 0 11-2 0V5.414L4.707 9.707a1 1 0 01-1.414 0z"
-                              clip-rule="evenodd" />
-                          </svg>
-                          {{client.transferRxCurrent | bytes}}/s
-                        </span>
-                        <!-- Last seen -->
-                        <span class="text-gray-400 dark:text-neutral-500 whitespace-nowrap" v-if="client.latestHandshakeAt"
-                          :title="$t('lastSeen') + dateTime(new Date(client.latestHandshakeAt))">
-                          {{!uiTrafficStats ? " · " : ""}}{{new Date(client.latestHandshakeAt) | timeago}}
-                        </span>
-                      </div>
-                    </div>
-
-                    <!-- Info -->
-                    <div v-if="uiTrafficStats"
-                      class="flex gap-2 items-center shrink-0 text-gray-400 dark:text-neutral-400 text-xs mt-px justify-end">
-
-                      <!-- Transfer TX -->
-                      <div class="min-w-20 md:min-w-24" v-if="client.transferTx">
-                        <span class="flex gap-1" :title="$t('totalDownload') + bytes(client.transferTx)">
-                          <svg class="align-middle h-3 inline mt-0.5" xmlns="http://www.w3.org/2000/svg"
-                            viewBox="0 0 20 20" fill="currentColor">
-                            <path fill-rule="evenodd"
-                              d="M16.707 10.293a1 1 0 010 1.414l-6 6a1 1 0 01-1.414 0l-6-6a1 1 0 111.414-1.414L9 14.586V3a1 1 0 012 0v11.586l4.293-4.293a1 1 0 011.414 0z"
-                              clip-rule="evenodd" />
-                          </svg>
-                          <div>
-                            <span class="text-gray-700 dark:text-neutral-200">{{client.transferTxCurrent |
-                              bytes}}/s</span>
-                            <!-- Total TX -->
-                            <br><span class="font-regular" style="font-size:0.85em">{{bytes(client.transferTx)}}</span>
-                          </div>
-                        </span>
-
-                      </div>
-
-                      <!-- Transfer RX -->
-                      <div class="min-w-20 md:min-w-24" v-if="client.transferRx">
-                        <span class="flex gap-1" :title="$t('totalUpload') + bytes(client.transferRx)">
-
-                          <svg class="align-middle h-3 inline mt-0.5" xmlns="http://www.w3.org/2000/svg"
-                            viewBox="0 0 20 20" fill="currentColor">
-                            <path fill-rule="evenodd"
-                              d="M3.293 9.707a1 1 0 010-1.414l6-6a1 1 0 011.414 0l6 6a1 1 0 01-1.414 1.414L11 5.414V17a1 1 0 11-2 0V5.414L4.707 9.707a1 1 0 01-1.414 0z"
-                              clip-rule="evenodd" />
-                          </svg>
-                          <div>
-                            <span class="text-gray-700 dark:text-neutral-200">{{client.transferRxCurrent |
-                              bytes}}/s</span>
-                            <!-- Total RX -->
-                            <br><span class="font-regular" style="font-size:0.85em">{{bytes(client.transferRx)}}</span>
-                          </div>
-                        </span>
-                      </div>
-
-                    </div>
-                  </div>
-                  <!-- </div> --> <!-- <div class="flex flex-grow items-center"> -->
+            <template v-else>
+              <div>
+                <nav class="muted small" :aria-label="$t('ui.panel')"><a href="#" @click.prevent="navigate('panel')">{{ $t('ui.panel') }}</a> / {{ $t('clients') }} / {{ viewClient.name }}</nav>
+                <div class="row" style="margin-top:4px">
+                  <h1 class="grow">{{ viewClient.name }} <span class="badge" :class="{ ok: viewClient.enabled && viewClient.online }">{{ clientStatus(viewClient).label }}</span></h1>
+                  <button type="button" class="btn" :disabled="!viewClient.downloadableConfig" :title="!viewClient.downloadableConfig ? $t('noPrivKey') : $t('showQR')" @click="qrcode = `./api/wireguard/client/${clientPathId(viewClient.id)}/qrcode.svg`">{{ $t('showQR') }}</button>
+                  <button type="button" class="btn" :disabled="!viewClient.downloadableConfig" :title="!viewClient.downloadableConfig ? $t('noPrivKey') : $t('ui.viewConfig')" @click="viewConfiguration(viewClient)">{{ $t('ui.viewConfig') }}</button>
+                  <a class="btn" :class="{ 'is-disabled': !viewClient.downloadableConfig }" :href="'./api/wireguard/client/' + clientPathId(viewClient.id) + '/configuration'" :download="viewClient.downloadableConfig ? 'configuration' : null" @click="preventUnavailableDownload($event, viewClient)">{{ $t('downloadConfig') }}</a>
+                  <button type="button" class="btn" @click="viewClient.enabled ? disableClient(viewClient) : enableClient(viewClient)">{{ viewClient.enabled ? $t('ui.disable') : $t('ui.enable') }}</button>
+                  <button type="button" class="btn btn-danger" @click="clientDelete = viewClient">{{ $t('deleteClient') }}</button>
                 </div>
-
-                <div class="flex items-center justify-end">
-                  <div class="text-gray-400 dark:text-neutral-400 flex gap-1 items-center justify-between">
-
-                    <!-- Enable/Disable -->
-                    <div @click="disableClient(client)" v-if="client.enabled === true" :title="$t('disableClient')"
-                      class="inline-block align-middle rounded-full w-10 h-6 mr-1 bg-red-800 cursor-pointer hover:bg-red-700 transition-all">
-                      <div class="rounded-full w-4 h-4 m-1 ml-5 bg-white"></div>
-                    </div>
-
-                    <div @click="enableClient(client)" v-if="client.enabled === false" :title="$t('enableClient')"
-                      class="inline-block align-middle rounded-full w-10 h-6 mr-1 bg-gray-200 dark:bg-neutral-400 cursor-pointer hover:bg-gray-300 dark:hover:bg-neutral-500 transition-all">
-
-                      <div class="rounded-full w-4 h-4 m-1 bg-white"></div>
-                    </div>
-
-                    <!-- Network Policy -->
-                    <button
-                      class="relative align-middle bg-gray-100 dark:bg-neutral-600 dark:text-neutral-300 hover:bg-red-800 dark:hover:bg-red-800 hover:text-white dark:hover:text-white p-2 rounded transition"
-                      :title="$t('networkPolicy.title')" @click="openNetworkPolicy(client)">
-                      <svg class="w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3l7 3v5c0 4.6-2.9 8.7-7 10-4.1-1.3-7-5.4-7-10V6l7-3zm-2 9l1.5 1.5L15 10" />
-                      </svg>
-                      <span v-if="client.networkPolicy && (client.networkPolicy.blockedProtocols.length || client.networkPolicy.customRules.length)"
-                        class="absolute w-2 h-2 bg-red-600 rounded-full" style="top:3px;right:3px;"></span>
-                    </button>
-
-                    <!-- Show QR-->
-
-                    <button :disabled="!client.downloadableConfig"
-                      class="align-middle bg-gray-100 dark:bg-neutral-600 dark:text-neutral-300 p-2 rounded transition"
-                      :class="{
-                        'hover:bg-red-800 dark:hover:bg-red-800 hover:text-white dark:hover:text-white': client.downloadableConfig,
-                        'is-disabled': !client.downloadableConfig
-                      }"
-                      :title="!client.downloadableConfig ? $t('noPrivKey') : $t('showQR')"
-                      @click="qrcode = `./api/wireguard/client/${clientPathId(client.id)}/qrcode.svg`">
-                      <svg class="w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"
-                        stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                          d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z" />
-                      </svg>
-                    </button>
-
-                    <!-- View Config -->
-                    <button :disabled="!client.downloadableConfig"
-                      class="align-middle bg-gray-100 dark:bg-neutral-600 dark:text-neutral-300 p-2 rounded transition ml-1"
-                      :class="{
-                        'hover:bg-red-800 dark:hover:bg-red-800 hover:text-white dark:hover:text-white': client.downloadableConfig,
-                        'is-disabled': !client.downloadableConfig
-                      }"
-                      :title="!client.downloadableConfig ? $t('noPrivKey') : 'View Configuration'"
-                      @click="viewConfiguration(client)">
-                      <svg class="w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                      </svg>
-                    </button>
-
-                    <!-- Download Config -->
-                    <a :disabled="!client.downloadableConfig"
-                      :href="'./api/wireguard/client/' + clientPathId(client.id) + '/configuration'"
-                      :download="client.downloadableConfig ? 'configuration' : null"
-                      class="align-middle inline-block bg-gray-100 dark:bg-neutral-600 dark:text-neutral-300 p-2 rounded transition ml-1 mr-1"
-                      :class="{
-                        'hover:bg-red-800 dark:hover:bg-red-800 hover:text-white dark:hover:text-white': client.downloadableConfig,
-                        'is-disabled': !client.downloadableConfig
-                      }"
-                      :title="!client.downloadableConfig ? $t('noPrivKey') : $t('downloadConfig')"
-                      @click="preventUnavailableDownload($event, client)">
-                      <svg class="w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"
-                        stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                          d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                      </svg>
-                    </a>
-
-                    <!-- Delete -->
-
-                    <button
-                      class="align-middle bg-gray-100 dark:bg-neutral-600 dark:text-neutral-300 hover:bg-red-800 dark:hover:bg-red-800 hover:text-white dark:hover:text-white p-2 rounded transition"
-                      :title="$t('deleteClient')" @click="clientDelete = client">
-                      <svg class="w-5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                        <path fill-rule="evenodd"
-                          d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z"
-                          clip-rule="evenodd" />
-                      </svg>
-                    </button>
-                  </div>
-                </div>
-
               </div>
 
-              </div><!-- end chart-isolated wrapper -->
-
-              <!-- Port Forwards Section -->
-              <div class="border-t border-gray-100 dark:border-neutral-600 bg-gray-50/50 dark:bg-neutral-800/30">
-                <button type="button"
-                  class="flex items-center justify-between w-full px-4 py-3 text-left select-none hover:bg-gray-50 dark:hover:bg-neutral-700/50 transition-colors"
-                  :aria-expanded="isPfExpanded(client.id) ? 'true' : 'false'"
-                  :aria-controls="'port-forwards-' + client.id"
-                  @click="togglePfExpanded(client.id)">
-                  <div class="flex items-center gap-3">
-                    <div class="p-1.5 rounded-md bg-gray-100 dark:bg-neutral-700 text-gray-500 dark:text-neutral-400">
-                      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
-                      </svg>
-                    </div>
-                    <span class="text-sm font-medium text-gray-700 dark:text-neutral-300">Port Forwarding</span>
-                    <span v-if="client.portForwards && client.portForwards.length" class="inline-flex items-center justify-center px-2 py-0.5 ml-2 text-xs font-bold leading-none text-red-100 bg-red-800 dark:bg-red-900/80 rounded-full">{{ client.portForwards.length }}</span>
-                  </div>
-                  <svg class="w-4 h-4 text-gray-400 dark:text-neutral-500 transition-transform duration-200" :class="{ 'rotate-180': isPfExpanded(client.id) }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
-                  </svg>
-                </button>
-
-                <div v-show="isPfExpanded(client.id)" :id="'port-forwards-' + client.id" class="px-4 pb-4">
-                  <!-- Kill-switch banner: rules stay visible but inactive -->
-                  <div v-if="!forwardingEnabled"
-                    class="mb-3 flex items-start gap-2 px-3 py-2 rounded-lg border border-amber-300/70 dark:border-amber-700/50 bg-amber-50 dark:bg-amber-900/20 text-xs font-medium text-amber-700 dark:text-amber-400">
-                    <svg class="w-4 h-4 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                    </svg>
-                    <span>{{$t("networkPolicy.forwardingDisabledBanner")}}</span>
-                  </div>
-                  <!-- Existing Rules -->
-                  <div class="space-y-2 mb-4" v-if="client.portForwards && client.portForwards.length > 0"
-                    :class="{ 'opacity-50': !forwardingEnabled }" :aria-disabled="!forwardingEnabled">
-                    <div class="grid grid-cols-[auto_1fr_auto_1fr_auto] gap-2 items-center px-3 py-2 text-xs font-medium text-gray-500 dark:text-neutral-400 uppercase tracking-wider">
-                      <span>Protocol</span>
-                      <span>External Port</span>
-                      <span></span>
-                      <span>Internal Port</span>
-                      <span>Actions</span>
-                    </div>
-                    
-                    <div v-for="(rule, index) in client.portForwards" :key="index"
-                      class="grid grid-cols-[auto_1fr_auto_1fr_auto] gap-2 items-center bg-white dark:bg-neutral-700 rounded-lg px-3 py-2.5 shadow-sm border border-gray-200/60 dark:border-neutral-600/60 group hover:border-red-300 dark:hover:border-red-800/50 transition-colors">
-                      <!-- View Mode -->
-                      <template v-if="editingPfClientId !== client.id || editingPfIndex !== index">
-                        <span class="inline-flex items-center gap-1.5">
-                          <!-- Reachability dot: green = reachable per probe, red = down, gray = unknown/udp/offline -->
-                          <span class="w-2.5 h-2.5 rounded-full flex-shrink-0"
-                            :class="probeDotClass(client.id, rule.id)"
-                            :title="probeDotTitle(client, rule)"></span>
-                          <span class="inline-flex items-center justify-center px-2 py-1 text-xs font-bold rounded-md"
-                                :class="{
-                                  'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300': rule.proto === 'tcp',
-                                  'bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300': rule.proto === 'udp',
-                                  'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300': rule.proto === 'both'
-                                }">
-                            {{ rule.proto === 'both' ? 'TCP + UDP' : rule.proto.toUpperCase() }}
-                          </span>
+              <div class="cols">
+                <section class="box" style="flex:1 1 380px;min-width:0" aria-labelledby="h-details">
+                  <div class="box-head"><h2 id="h-details">{{ $t('ui.details') }}</h2></div>
+                  <div class="box-body">
+                    <dl class="kv">
+                      <dt>{{ $t('name') }}</dt>
+                      <dd>
+                        <span v-if="clientEditNameId === viewClient.id" class="row">
+                          <input v-model="clientEditName" :aria-label="$t('name')" @keyup.enter="updateClientName(viewClient, clientEditName); clientEditNameId = null" @keyup.escape="clientEditNameId = null" />
+                          <button type="button" class="btn btn-sm" @click="updateClientName(viewClient, clientEditName); clientEditNameId = null">{{ $t('ui.save') }}</button>
+                          <button type="button" class="btn-link small" @click="clientEditNameId = null">{{ $t('cancel') }}</button>
                         </span>
-                        <span class="font-mono text-sm text-gray-800 dark:text-neutral-200">{{ rule.extPort }}</span>
-                        <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3" /></svg>
-                        <span class="font-mono text-sm text-gray-800 dark:text-neutral-200">{{ rule.intPort }}</span>
-                        <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity justify-end">
-                          <button type="button" @click="editPortForward(client, index)" :disabled="!forwardingEnabled" class="p-1.5 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30 disabled:cursor-not-allowed rounded-md transition-colors" title="Edit">
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
-                          </button>
-                          <button type="button" @click="removePortForward(client, index)" :disabled="!forwardingEnabled" class="p-1.5 text-gray-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30 disabled:cursor-not-allowed rounded-md transition-colors" title="Delete">
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
-                          </button>
-                        </div>
+                        <span v-else>{{ viewClient.name }} <button type="button" class="btn-link small" @click="clientEditName = viewClient.name; clientEditNameId = viewClient.id">{{ $t('ui.edit') }}</button></span>
+                      </dd>
+                      <dt>IPv4</dt>
+                      <dd>
+                        <span v-if="clientEditAddressId === viewClient.id" class="row">
+                          <input v-model="clientEditAddress" class="mono" aria-label="IPv4" @keyup.enter="updateClientAddress(viewClient, clientEditAddress, undefined); clientEditAddressId = null" @keyup.escape="clientEditAddressId = null" />
+                          <button type="button" class="btn btn-sm" @click="updateClientAddress(viewClient, clientEditAddress, undefined); clientEditAddressId = null">{{ $t('ui.save') }}</button>
+                          <button type="button" class="btn-link small" @click="clientEditAddressId = null">{{ $t('cancel') }}</button>
+                        </span>
+                        <span v-else><span class="mono">{{ viewClient.address }}</span> <button type="button" class="btn-link small" @click="clientEditAddress = viewClient.address; clientEditAddressId = viewClient.id">{{ $t('ui.edit') }}</button></span>
+                      </dd>
+                      <template v-if="viewClient.addressV6">
+                        <dt>IPv6</dt>
+                        <dd>
+                          <span v-if="clientEditAddressV6Id === viewClient.id" class="row">
+                            <input v-model="clientEditAddressV6" class="mono" aria-label="IPv6" @keyup.enter="updateClientAddress(viewClient, undefined, clientEditAddressV6); clientEditAddressV6Id = null" @keyup.escape="clientEditAddressV6Id = null" />
+                            <button type="button" class="btn btn-sm" @click="updateClientAddress(viewClient, undefined, clientEditAddressV6); clientEditAddressV6Id = null">{{ $t('ui.save') }}</button>
+                            <button type="button" class="btn-link small" @click="clientEditAddressV6Id = null">{{ $t('cancel') }}</button>
+                          </span>
+                          <span v-else><span class="mono">{{ viewClient.addressV6 }}</span> <button type="button" class="btn-link small" @click="clientEditAddressV6 = viewClient.addressV6; clientEditAddressV6Id = viewClient.id">{{ $t('ui.edit') }}</button></span>
+                        </dd>
                       </template>
-                      <!-- Edit Mode -->
-                      <template v-else>
-                        <select v-model="editingPfRule.proto" :disabled="!forwardingEnabled" class="text-xs font-bold text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-300 dark:border-neutral-500 rounded-md px-2 py-1.5 focus:ring-2 focus:ring-red-800 disabled:cursor-not-allowed outline-none">
-                          <option value="tcp" class="bg-white dark:bg-neutral-800">TCP</option>
-                          <option value="udp" class="bg-white dark:bg-neutral-800">UDP</option>
-                          <option value="both" class="bg-white dark:bg-neutral-800">TCP + UDP</option>
-                        </select>
-                        <input v-model.number="editingPfRule.extPort" type="number" :disabled="!forwardingEnabled" class="font-mono text-sm text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-300 dark:border-neutral-500 rounded-md px-2 py-1.5 focus:ring-2 focus:ring-red-800 disabled:cursor-not-allowed outline-none w-full" />
-                        <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3" /></svg>
-                        <input v-model.number="editingPfRule.intPort" type="number" :disabled="!forwardingEnabled" class="font-mono text-sm text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-300 dark:border-neutral-500 rounded-md px-2 py-1.5 focus:ring-2 focus:ring-red-800 disabled:cursor-not-allowed outline-none w-full" />
-                        <div class="flex items-center gap-1 justify-end">
-                          <button type="button" @click="updatePortForward(client)" :disabled="!forwardingEnabled" class="p-1.5 text-green-600 hover:bg-green-50 dark:hover:bg-green-900/30 disabled:opacity-50 disabled:cursor-not-allowed rounded-md transition-colors" title="Save">
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg>
-                          </button>
-                          <button type="button" @click="cancelEditPortForward()" class="p-1.5 text-gray-500 hover:bg-gray-100 dark:hover:bg-neutral-600 rounded-md transition-colors" title="Cancel">
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
-                          </button>
-                        </div>
-                      </template>
-                    </div>
+                      <dt>{{ $t('ui.publicKey') }}</dt><dd class="mono">{{ viewClient.publicKey }}</dd>
+                      <dt>{{ $t('ui.lastHandshake') }}</dt><dd>{{ viewClient.latestHandshakeAt ? dateTime(new Date(viewClient.latestHandshakeAt)) : $t('ui.never') }}</dd>
+                      <dt>{{ $t('ui.colUsage') }}</dt><dd class="num">{{ viewClient.transferTx != null ? fmtBytes(viewClient.transferTx) : '—' }} / {{ viewClient.transferRx != null ? fmtBytes(viewClient.transferRx) : '—' }}</dd>
+                      <dt>{{ $t('ui.created') }}</dt><dd>{{ dateTime(new Date(viewClient.createdAt)) }}</dd>
+                    </dl>
+                    <p class="xsmall muted" style="margin:10px 0 0">{{ $t('ui.usageNote') }}</p>
                   </div>
+                </section>
 
-                  <!-- Add New Rule -->
-                  <div class="bg-white dark:bg-neutral-700/50 p-3 rounded-lg border border-dashed border-gray-300 dark:border-neutral-600"
-                    :class="{ 'opacity-50': !forwardingEnabled }" :aria-disabled="!forwardingEnabled">
-                    <div class="flex flex-wrap sm:flex-nowrap items-center gap-2">
-                      <select v-model="newPf[client.id].proto" :disabled="!forwardingEnabled" class="text-xs font-bold text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 disabled:cursor-not-allowed outline-none flex-shrink-0">
-                        <option value="tcp" class="bg-white dark:bg-neutral-800">TCP</option>
-                        <option value="udp" class="bg-white dark:bg-neutral-800">UDP</option>
-                        <option value="both" class="bg-white dark:bg-neutral-800">TCP + UDP</option>
-                      </select>
-                      <input v-model.number="newPf[client.id].extPort" type="number" :disabled="!forwardingEnabled" placeholder="External Port (e.g. 8080)" @input="pfError = null" :class="{'border-red-500 ring-2 ring-red-500/20': isPortConflicting(client)}" class="text-sm font-mono text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 disabled:cursor-not-allowed outline-none flex-grow min-w-[100px]" />
-                      <!-- Random free port for seeding: skips used, server and well-known ports -->
-                      <button type="button" @click="randomPortFor(client)" :disabled="!forwardingEnabled" :title="$t('pf.randomPort')"
-                        class="flex-shrink-0 p-2 text-gray-400 hover:text-red-800 dark:hover:text-red-400 hover:bg-gray-100 dark:hover:bg-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed rounded-md transition-colors">
-                        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                          <rect x="4" y="4" width="16" height="16" rx="3" />
-                          <circle cx="9" cy="9" r="1.3" fill="currentColor" stroke="none" />
-                          <circle cx="15" cy="9" r="1.3" fill="currentColor" stroke="none" />
-                          <circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none" />
-                          <circle cx="9" cy="15" r="1.3" fill="currentColor" stroke="none" />
-                          <circle cx="15" cy="15" r="1.3" fill="currentColor" stroke="none" />
-                        </svg>
+                <section class="box" style="flex:1 1 300px;min-width:0" aria-labelledby="h-policy">
+                  <div class="box-head"><h2 id="h-policy">{{ $t('ui.policy') }}</h2></div>
+                  <div class="box-body stack">
+                    <div v-if="viewClient.networkPolicy" class="small">
+                      <div>{{ $t('ui.blockedCount', { n: viewClient.networkPolicy.blockedProtocols.length }) }}</div>
+                      <div>{{ $t('ui.rulesCount', { n: viewClient.networkPolicy.customRules.length }) }}</div>
+                      <div>{{ $t('ui.peersCount', { n: viewClient.networkPolicy.peerAllowlist.length }) }}</div>
+                    </div>
+                    <div><button type="button" class="btn" @click="openNetworkPolicy(viewClient)">{{ $t('ui.editPolicy') }}</button></div>
+                  </div>
+                </section>
+              </div>
+
+              <section class="box" :id="'port-forwards-' + viewClient.id" aria-labelledby="h-pf">
+                <div class="box-head"><h2 id="h-pf">{{ $t('ui.portForwarding') }} <span v-if="(viewClient.portForwards || []).length" class="muted" style="font-weight:400">{{ viewClient.portForwards.length }}</span></h2></div>
+                <div v-if="!forwardingEnabled" class="box-body" style="padding-bottom:0"><div class="notice">{{ $t('networkPolicy.forwardingDisabledBanner') }}</div></div>
+                <div class="scroll-x" :style="{ opacity: forwardingEnabled ? 1 : 0.6 }">
+                  <table class="table" style="min-width:640px">
+                    <thead>
+                      <tr>
+                        <th>{{ $t('ui.colReachable') }}</th>
+                        <th>{{ $t('ui.colProtocol') }}</th>
+                        <th>{{ $t('ui.colPublic') }}</th>
+                        <th>{{ $t('ui.colDestination') }}</th>
+                        <th><span class="sr-only">{{ $t('ui.colActions') }}</span></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="(rule, index) in viewClient.portForwards" :key="rule.id || index">
+                        <template v-if="editingPfClientId !== viewClient.id || editingPfIndex !== index">
+                          <td class="nowrap"><span class="dot" :class="probeDotClass(viewClient.id, rule.id)" :title="probeDotTitle(viewClient, rule)"></span>{{ probeVerdictFor(viewClient.id, rule.id) ? $t('networkPolicy.verdict.' + probeVerdictFor(viewClient.id, rule.id)) : $t('networkPolicy.probeNever') }}</td>
+                          <td>{{ rule.proto === 'both' ? 'TCP + UDP' : rule.proto.toUpperCase() }}</td>
+                          <td class="mono">{{ rule.extPort }}</td>
+                          <td class="mono">{{ viewClient.address }}:{{ rule.intPort }}</td>
+                          <td class="right nowrap">
+                            <button type="button" class="btn-link" :disabled="!forwardingEnabled" @click="editPortForward(viewClient, index)">{{ $t('ui.edit') }}</button>
+                            <span class="muted">·</span>
+                            <button type="button" class="btn-link" style="color:var(--danger)" :disabled="!forwardingEnabled" @click="removePortForward(viewClient, index)">{{ $t('ui.deleteRule') }}</button>
+                          </td>
+                        </template>
+                        <template v-else>
+                          <td></td>
+                          <td><select v-model="editingPfRule.proto" :aria-label="$t('ui.colProtocol')"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="both">TCP + UDP</option></select></td>
+                          <td><input v-model.number="editingPfRule.extPort" type="number" class="mono" style="width:110px" :aria-label="$t('ui.colPublic')" /></td>
+                          <td><input v-model.number="editingPfRule.intPort" type="number" class="mono" style="width:110px" :aria-label="$t('ui.colDestination')" /></td>
+                          <td class="right nowrap">
+                            <button type="button" class="btn btn-sm btn-primary" :disabled="!forwardingEnabled" @click="updatePortForward(viewClient)">{{ $t('ui.save') }}</button>
+                            <button type="button" class="btn-link small" @click="cancelEditPortForward()">{{ $t('cancel') }}</button>
+                          </td>
+                        </template>
+                      </tr>
+                      <tr v-if="!(viewClient.portForwards || []).length"><td colspan="5" class="muted">{{ $t('ui.noRules') }}</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+                <form class="box-foot row" style="padding:12px 16px" :aria-disabled="!forwardingEnabled ? 'true' : 'false'" @submit.prevent="addPortForward(viewClient)">
+                  <label class="field">{{ $t('ui.colProtocol') }}
+                    <select v-model="newPf[viewClient.id].proto" :disabled="!forwardingEnabled"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="both">TCP + UDP</option></select>
+                  </label>
+                  <label class="field">{{ $t('ui.colPublic') }}
+                    <span class="row" style="flex-wrap:nowrap;gap:4px">
+                      <input v-model.number="newPf[viewClient.id].extPort" type="number" class="mono" style="width:120px" :disabled="!forwardingEnabled" :placeholder="$t('ui.extPortPh')" :class="{ 'input-conflict': isPortConflicting(viewClient) }" @input="pfError = null" />
+                      <button type="button" class="btn btn-icon" :disabled="!forwardingEnabled" :title="$t('pf.randomPort')" :aria-label="$t('pf.randomPort')" @click="randomPortFor(viewClient)">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"></rect><circle cx="9" cy="9" r="1.3" fill="currentColor" stroke="none"></circle><circle cx="15" cy="9" r="1.3" fill="currentColor" stroke="none"></circle><circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none"></circle><circle cx="9" cy="15" r="1.3" fill="currentColor" stroke="none"></circle><circle cx="15" cy="15" r="1.3" fill="currentColor" stroke="none"></circle></svg>
                       </button>
-                      <svg class="w-4 h-4 text-gray-400 flex-shrink-0 hidden sm:block" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3" /></svg>
-                      <input v-model.number="newPf[client.id].intPort" type="number" :disabled="!forwardingEnabled" placeholder="Internal Port (e.g. 80)" class="text-sm font-mono text-gray-700 dark:text-neutral-200 bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-600 rounded-md px-3 py-2 focus:ring-2 focus:ring-red-800 disabled:cursor-not-allowed outline-none flex-grow min-w-[100px]" />
-                      <button type="button" @click="addPortForward(client)" :disabled="!forwardingEnabled" class="flex items-center justify-center gap-2 bg-red-800 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium text-sm px-4 py-2 rounded-md shadow-sm transition-colors flex-shrink-0 w-full sm:w-auto mt-2 sm:mt-0">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>
-                        Add Rule
-                      </button>
-                    </div>
-                    <!-- Inline error message -->
-                    <div v-if="pfError && pfError.clientId === client.id"
-                      class="flex items-center gap-3 mt-3 px-4 py-3 rounded-lg border text-sm font-medium"
-                      style="background: rgba(220,38,38,0.12); border-color: rgba(220,38,38,0.35); color: #fca5a5;">
-                      <svg class="w-4 h-4 flex-shrink-0" style="color:#f87171" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
-                      <span>{{ pfError.msg }}</span>
-                      <button @click="pfError = null" class="ml-auto opacity-70 hover:opacity-100 transition-opacity" style="color:#f87171">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-
-            </div>
-            <div v-if="clients && clients.length === 0">
-              <p class="text-center m-10 text-gray-400 dark:text-neutral-400 text-sm">
-                {{$t("noClients")}}<br /><br />
-                <button @click="clientCreate = true; clientCreateName = '';"
-                  class="bg-red-800 hover:bg-red-700 text-white border-2 border-none py-2 px-4 rounded inline-flex items-center transition">
-                  <svg class="w-4 mr-2" inline xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"
-                    stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                      d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                  </svg>
-                  <span class="text-sm">{{$t("newClient")}}</span>
-                </button>
-              </p>
-            </div>
-            <div v-if="clients === null" class="text-gray-200 dark:text-red-300 p-5">
-              <svg class="w-5 animate-spin mx-auto" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
-                fill="currentColor">
-                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                <path class="opacity-75" fill="currentColor"
-                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z">
-                </path>
-              </svg>
-            </div>
-          </div>
-        </div>
-          </div><!-- /clients column -->
-          <!-- ── Traffic side panel (same card aesthetic as clients) ── -->
-          <aside v-if="uiShowTraffic" class="w-full lg:w-80 xl:w-96 flex-shrink-0 mt-5 lg:mt-0 space-y-4">
-            <!-- Bandwidth -->
-            <div class="shadow-md rounded-lg bg-white dark:bg-neutral-700 overflow-hidden">
-              <div class="flex flex-row flex-auto items-center p-3 px-4 border-b-2 border-gray-100 dark:border-neutral-600">
-                <p class="text-sm font-medium dark:text-neutral-200 flex-grow">{{ $t('traffic.bandwidth') }}</p>
-                <div class="flex gap-2 text-xs text-gray-400 dark:text-neutral-400">
-                  <button type="button" @click="setTrafficRange('realtime')" :class="{ 'font-bold text-red-800 dark:text-red-400': trafficRange === 'realtime' }">2m</button>
-                  <button type="button" @click="setTrafficRange('1h')" :class="{ 'font-bold text-red-800 dark:text-red-400': trafficRange === '1h' }">1h</button>
-                  <button type="button" @click="setTrafficRange('24h')" :class="{ 'font-bold text-red-800 dark:text-red-400': trafficRange === '24h' }">24h</button>
-                  <button type="button" @click="setTrafficRange('30d')" :class="{ 'font-bold text-red-800 dark:text-red-400': trafficRange === '30d' }">30d</button>
-                </div>
-              </div>
-              <div class="p-2">
-                <div v-if="trafficBw.length">
-                  <apexchart width="100%" height="150" :options="trafficPanelOptions" :series="trafficBwSeries"></apexchart>
-                  <div class="flex flex-wrap items-center gap-x-3 gap-y-1 px-2 pb-1 text-xs text-gray-500 dark:text-neutral-400">
-                    <span><span class="inline-block w-4 mr-1" style="border-top:3px solid #3b82f6"></span>{{ $t('traffic.remote') }}</span>
-                    <span><span class="inline-block w-4 mr-1" style="border-top:3px dashed #f59e0b"></span>{{ $t('traffic.local') }}</span>
-                    <span class="w-full">{{ $t('traffic.averages') }}: {{ fmtSpeed(trafficAvg.rx) }} / {{ fmtSpeed(trafficAvg.tx) }} · {{ $t('traffic.peak') }} {{ fmtSpeed(trafficPeakMax) }}</span>
-                  </div>
-                  <div v-if="traffic && traffic.peaks" class="mx-2 mb-1 mt-2 pt-2 border-t border-gray-100 dark:border-neutral-600 text-xs text-gray-500 dark:text-neutral-400">
-                    <div class="grid grid-cols-2 gap-x-3 gap-y-1">
-                      <span title="Descarga (RX)">Pico ↓ <strong class="font-medium text-gray-700 dark:text-neutral-200">{{ fmtSpeed(traffic.peaks.rxSpeed) }}</strong></span>
-                      <span title="Subida (TX)">Pico ↑ <strong class="font-medium text-gray-700 dark:text-neutral-200">{{ fmtSpeed(traffic.peaks.txSpeed) }}</strong></span>
-                      <span v-if="trafficSummary">Total ↓ <strong class="font-medium text-gray-700 dark:text-neutral-200">{{ fmtBytes(trafficSummary.totals.rxBytes) }}</strong></span>
-                      <span v-if="trafficSummary">Total ↑ <strong class="font-medium text-gray-700 dark:text-neutral-200">{{ fmtBytes(trafficSummary.totals.txBytes) }}</strong></span>
-                    </div>
-                    <p v-if="traffic.peakAt && traffic.peakAt.rxSpeed" class="mt-1">Picos vistos: ↓ {{ traffic.peakAt.rxSpeed | timeago }} · ↑ {{ traffic.peakAt.txSpeed | timeago }}</p>
-                  </div>
-                </div>
-                <p v-else class="text-xs text-gray-400 dark:text-neutral-400 py-6 text-center">{{ $t('traffic.noData') }}</p>
-              </div>
-            </div>
-            <!-- CPU -->
-            <div class="shadow-md rounded-lg bg-white dark:bg-neutral-700 overflow-hidden">
-              <div class="flex flex-row flex-auto items-center p-3 px-4 border-b-2 border-gray-100 dark:border-neutral-600">
-                <p class="text-sm font-medium dark:text-neutral-200 flex-grow">{{ $t('traffic.cpu') }}</p>
-                <span class="text-xs text-gray-400 dark:text-neutral-400">{{ $t('traffic.all') }}</span>
-              </div>
-              <div class="p-2">
-                <div v-if="traffic && traffic.cpu && traffic.cpu.history.length">
-                  <apexchart width="100%" height="110" :options="trafficCpuOptions" :series="trafficCpuSeries"></apexchart>
-                  <div class="flex flex-wrap items-center gap-x-3 gap-y-1 px-2 pb-1 text-xs text-gray-500 dark:text-neutral-400">
-                    <span><span class="inline-block w-4 mr-1" :style="{ borderTop: '3px dashed ' + (theme === 'dark' ? '#6ee7b7' : '#16a34a') }"></span>WG-EASY</span>
-                    <span><span class="inline-block w-4 mr-1" :style="{ borderTop: '3px solid ' + (theme === 'dark' ? '#fb7185' : '#e11d48') }"></span>{{ $t('traffic.system') }}</span>
-                    <span class="w-full">{{ (traffic.cpu.process || 0).toFixed(1) }}% / {{ (traffic.cpu.system || 0).toFixed(1) }}%</span>
-                  </div>
-                </div>
-                <p v-else class="text-xs text-gray-400 dark:text-neutral-400 py-6 text-center">{{ $t('traffic.noData') }}</p>
-              </div>
-            </div>
-            <!-- RAM -->
-            <div class="shadow-md rounded-lg bg-white dark:bg-neutral-700 overflow-hidden">
-              <div class="flex flex-row flex-auto items-center p-3 px-4 border-b-2 border-gray-100 dark:border-neutral-600">
-                <p class="text-sm font-medium dark:text-neutral-200 flex-grow">{{ $t('traffic.ram') }}</p>
-                <span class="text-xs text-gray-400 dark:text-neutral-400">{{ $t('traffic.all') }}</span>
-              </div>
-              <div class="p-2">
-                <div v-if="traffic && traffic.mem && traffic.mem.history.length">
-                  <apexchart width="100%" height="110" :options="trafficMemOptions" :series="trafficMemSeries"></apexchart>
-                  <div class="flex flex-wrap items-center gap-x-3 gap-y-1 px-2 pb-1 text-xs text-gray-500 dark:text-neutral-400">
-                    <span><span class="inline-block w-4 mr-1" :style="{ borderTop: '3px dashed ' + (theme === 'dark' ? '#5eead4' : '#0d9488') }"></span>WG-EASY {{ (traffic.mem.process || 0).toFixed(1) }}%</span>
-                    <span><span class="inline-block w-4 mr-1" :style="{ borderTop: '3px solid ' + (theme === 'dark' ? '#d8b4fe' : '#9333ea') }"></span>{{ $t('traffic.system') }} {{ (traffic.mem.system || 0).toFixed(1) }}%</span>
-                  </div>
-                </div>
-                <p v-else class="text-xs text-gray-400 dark:text-neutral-400 py-6 text-center">{{ $t('traffic.noData') }}</p>
-              </div>
-            </div>
-          </aside>
-        </div><!-- /main columns -->
-
-        <!-- QR Code-->
-        <div v-if="qrcode">
-          <div class="bg-black bg-opacity-50 fixed top-0 right-0 left-0 bottom-0 flex items-center justify-center z-20">
-            <div class="bg-white rounded-md shadow-lg relative p-8">
-              <button @click="qrcode = null"
-                class="absolute right-4 top-4 text-gray-600 dark:text-neutral-500 hover:text-gray-800 dark:hover:text-neutral-700">
-                <svg class="w-8" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"
-                  stroke="currentColor">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-              <img :src="qrcode" />
-            </div>
-          </div>
-        </div>
-
-        <!-- View Config Dialog -->
-        <div v-if="configDialog" class="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <!-- Backdrop -->
-          <div class="absolute inset-0 bg-black opacity-60" @click="configDialog = null; copyConfigSuccess = false;"></div>
-          <!-- Modal -->
-          <div class="relative z-10 rounded-lg shadow-2xl"
-               style="background:#1f1f1f;border:1px solid #3a3a3a;max-width:92vw;max-height:90vh;display:flex;flex-direction:column;"
-               role="dialog" aria-modal="true">
-            <!-- Header -->
-            <div class="flex items-center justify-between px-3 py-2" style="border-bottom:1px solid #3a3a3a;flex-shrink:0;">
-              <span style="color:#ccc;font-size:12px;font-weight:600;">Configuración del cliente</span>
-              <div class="flex items-center" style="gap:6px;">
-                <button @click="copyConfigToClipboard()" class="bg-red-800 hover:bg-red-900 text-white"
-                  style="font-size:11px;padding:3px 10px;border-radius:4px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:4px;">
-                  <svg style="width:11px;height:11px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-                  {{ copyConfigSuccess ? '✓ Copiado' : 'Copiar' }}
-                </button>
-                <button @click="configDialog = null; copyConfigSuccess = false;" class="text-gray-400 hover:text-white"
-                  style="background:none;border:none;cursor:pointer;padding:2px;">
-                  <svg style="width:15px;height:15px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
-                </button>
-              </div>
-            </div>
-            <div style="padding:8px;overflow:auto;">
-              <pre style="margin:0;padding:10px 14px;background:#111;color:#d4d4d4;border:1px solid #333;border-radius:4px;font-family:monospace;font-size:12px;line-height:1.6;white-space:pre;">{{ configDialog.text }}</pre>
-            </div>
-          </div>
-        </div>
-
-        <!-- Network Policy Dialog -->
-        <div v-if="networkPolicyDialog" class="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6">
-          <div class="absolute inset-0 bg-black opacity-60" @click="closeNetworkPolicy"></div>
-          <div class="relative z-10 w-full bg-white dark:bg-neutral-800 rounded-xl shadow-2xl overflow-hidden flex flex-col"
-            style="max-width:820px;max-height:92vh;" role="dialog" aria-modal="true">
-            <div class="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-neutral-700">
-              <div class="flex items-center gap-3 min-w-0">
-                <div class="flex items-center justify-center w-10 h-10 rounded-lg bg-red-800 text-white flex-shrink-0">
-                  <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M12 3l7 3v5c0 4.6-2.9 8.7-7 10-4.1-1.3-7-5.4-7-10V6l7-3zm-2 9l1.5 1.5L15 10" />
-                  </svg>
-                </div>
-                <div class="min-w-0">
-                  <h2 class="text-lg font-semibold text-gray-900 dark:text-neutral-100">{{$t('networkPolicy.title')}}</h2>
-                  <p class="text-sm text-gray-500 dark:text-neutral-400 truncate">{{networkPolicyDialog.clientName}}</p>
-                </div>
-              </div>
-              <button type="button" @click="closeNetworkPolicy" :disabled="networkPolicySaving"
-                class="p-2 text-gray-400 hover:text-gray-700 dark:hover:text-neutral-100 rounded-lg transition">
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-
-            <div class="overflow-y-auto px-5 py-5 space-y-7">
-              <div class="flex gap-3 p-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/50 text-amber-900 dark:text-amber-200">
-                <svg class="w-5 h-5 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v3m0 4h.01M10.3 4.5L2.6 18a1.5 1.5 0 001.3 2.2h16.2a1.5 1.5 0 001.3-2.2L13.7 4.5a1.5 1.5 0 00-3.4 0z" />
-                </svg>
-                <p class="text-sm leading-relaxed">{{$t('networkPolicy.portNotice')}}</p>
-              </div>
-
-              <section>
-                <h3 class="text-sm font-semibold text-gray-900 dark:text-neutral-100">{{$t('networkPolicy.blockedOutbound')}}</h3>
-                <p class="mt-1 mb-3 text-xs text-gray-500 dark:text-neutral-400">{{$t('networkPolicy.blockedOutboundHelp')}}</p>
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  <label v-for="preset in networkPolicyOptions.protocolPresets" :key="preset.id"
-                    class="flex items-center gap-3 p-3 rounded-lg border border-gray-200 dark:border-neutral-700 hover:border-red-300 dark:hover:border-red-800 cursor-pointer transition">
-                    <input type="checkbox" :value="preset.id" v-model="networkPolicyDialog.blockedProtocols"
-                      class="w-4 h-4 accent-red-800 flex-shrink-0">
-                    <span class="min-w-0">
-                      <span class="block text-sm font-medium text-gray-800 dark:text-neutral-200">{{preset.name}}</span>
-                      <span class="block text-xs text-gray-500 dark:text-neutral-500">{{preset.rules.map(formatPolicyRule).join(', ')}}</span>
                     </span>
                   </label>
-                </div>
+                  <label class="field">{{ $t('ui.colDestination') }}
+                    <input v-model.number="newPf[viewClient.id].intPort" type="number" class="mono" style="width:120px" :disabled="!forwardingEnabled" :placeholder="$t('ui.intPortPh')" />
+                  </label>
+                  <button type="submit" class="btn btn-primary" style="align-self:flex-end" :disabled="!forwardingEnabled">{{ $t('ui.addRule') }}</button>
+                  <div v-if="pfError && pfError.clientId === viewClient.id" class="error-box row" style="width:100%" role="alert">
+                    <span class="grow">{{ pfError.msg }}</span>
+                    <button type="button" class="btn-link" :aria-label="$t('ui.close')" @click="pfError = null">×</button>
+                  </div>
+                </form>
               </section>
+            </template>
+          </template>
+        </main>
 
-              <section>
-                <h3 class="text-sm font-semibold text-gray-900 dark:text-neutral-100">{{$t('networkPolicy.peerAccess')}}</h3>
-                <p class="mt-1 mb-3 text-xs text-gray-500 dark:text-neutral-400">{{$t('networkPolicy.peerAccessHelp')}}</p>
-                <div v-if="availablePolicyPeers.length" class="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  <label v-for="peer in availablePolicyPeers" :key="peer.id"
-                    class="flex items-center gap-3 p-3 rounded-lg border border-gray-200 dark:border-neutral-700 hover:border-red-300 dark:hover:border-red-800 cursor-pointer transition">
-                    <input type="checkbox" :value="peer.id" v-model="networkPolicyDialog.peerAllowlist"
-                      class="w-4 h-4 accent-red-800 flex-shrink-0">
-                    <span class="min-w-0">
-                      <span class="block text-sm font-medium text-gray-800 dark:text-neutral-200 truncate">{{peer.name}}</span>
-                      <span class="block text-xs font-mono text-gray-500 dark:text-neutral-500 truncate">{{peer.address}}</span>
-                    </span>
+        <!-- QR Code -->
+        <div v-if="qrcode" class="modal">
+          <div class="modal-backdrop" @click="qrcode = null"></div>
+          <div class="modal-panel" style="max-width:420px" role="dialog" aria-modal="true" :aria-label="$t('showQR')">
+            <div class="modal-head"><h2>{{ $t('showQR') }}</h2><button type="button" class="btn btn-sm" @click="qrcode = null">{{ $t('ui.close') }}</button></div>
+            <div class="modal-body" style="align-items:center;background:#fff"><img :src="qrcode" alt="" style="max-width:100%" /></div>
+          </div>
+        </div>
+
+        <!-- View Config -->
+        <div v-if="configDialog" class="modal">
+          <div class="modal-backdrop" @click="configDialog = null; copyConfigSuccess = false;"></div>
+          <div class="modal-panel wide" role="dialog" aria-modal="true" aria-labelledby="h-config">
+            <div class="modal-head">
+              <h2 id="h-config">{{ $t('ui.configTitle') }}</h2>
+              <button type="button" class="btn btn-sm" @click="copyConfigToClipboard()">{{ copyConfigSuccess ? $t('ui.copied') : $t('ui.copy') }}</button>
+              <button type="button" class="btn btn-sm" @click="configDialog = null; copyConfigSuccess = false;">{{ $t('ui.close') }}</button>
+            </div>
+            <div class="modal-body"><pre>{{ configDialog.text }}</pre></div>
+          </div>
+        </div>
+
+        <!-- Network Policy -->
+        <div v-if="networkPolicyDialog" class="modal">
+          <div class="modal-backdrop" @click="closeNetworkPolicy"></div>
+          <div class="modal-panel wide" role="dialog" aria-modal="true" aria-labelledby="h-np">
+            <div class="modal-head">
+              <h2 id="h-np">{{ $t('networkPolicy.title') }} <span class="muted" style="font-weight:400">· {{ networkPolicyDialog.clientName }}</span></h2>
+              <button type="button" class="btn btn-sm" :disabled="networkPolicySaving" @click="closeNetworkPolicy">{{ $t('ui.close') }}</button>
+            </div>
+            <div class="modal-body">
+              <div class="notice">{{ $t('networkPolicy.portNotice') }}</div>
+              <fieldset style="border:0;margin:0;padding:0">
+                <legend class="strong">{{ $t('networkPolicy.blockedOutbound') }}</legend>
+                <p class="small muted" style="margin:2px 0 8px">{{ $t('networkPolicy.blockedOutboundHelp') }}</p>
+                <div class="grid-choices">
+                  <label v-for="preset in networkPolicyOptions.protocolPresets" :key="preset.id" class="choice">
+                    <input type="checkbox" :value="preset.id" v-model="networkPolicyDialog.blockedProtocols" />
+                    <span style="min-width:0"><span class="strong" style="display:block">{{ preset.name }}</span><span class="xsmall muted">{{ preset.rules.map(formatPolicyRule).join(', ') }}</span></span>
                   </label>
                 </div>
-                <p v-else class="p-3 rounded-lg bg-gray-50 dark:bg-neutral-700/50 text-sm text-gray-500 dark:text-neutral-400">
-                  {{$t('networkPolicy.noPeers')}}
-                </p>
-              </section>
-
-              <section>
-                <div class="flex items-end justify-between gap-3">
-                  <div>
-                    <h3 class="text-sm font-semibold text-gray-900 dark:text-neutral-100">{{$t('networkPolicy.customRules')}}</h3>
-                    <p class="mt-1 text-xs text-gray-500 dark:text-neutral-400">{{$t('networkPolicy.customRulesHelp')}}</p>
-                  </div>
-                  <span class="text-xs text-gray-400">{{networkPolicyDialog.customRules.length}} / {{networkPolicyOptions.maxCustomRules}}</span>
+              </fieldset>
+              <fieldset style="border:0;margin:0;padding:0">
+                <legend class="strong">{{ $t('networkPolicy.peerAccess') }}</legend>
+                <p class="small muted" style="margin:2px 0 8px">{{ $t('networkPolicy.peerAccessHelp') }}</p>
+                <div v-if="availablePolicyPeers.length" class="grid-choices">
+                  <label v-for="peer in availablePolicyPeers" :key="peer.id" class="choice">
+                    <input type="checkbox" :value="peer.id" v-model="networkPolicyDialog.peerAllowlist" />
+                    <span style="min-width:0"><span class="strong" style="display:block">{{ peer.name }}</span><span class="mono muted">{{ peer.address }}</span></span>
+                  </label>
                 </div>
-
-                <div v-if="networkPolicyDialog.customRules.length" class="mt-3 space-y-2">
-                  <div v-for="(rule, index) in networkPolicyDialog.customRules" :key="index"
-                    class="flex items-center gap-3 p-3 rounded-lg bg-gray-50 dark:bg-neutral-700/50 border border-gray-200 dark:border-neutral-700">
-                    <span class="px-2 py-1 text-xs font-bold rounded bg-gray-200 dark:bg-neutral-600 text-gray-700 dark:text-neutral-200">{{rule.proto.toUpperCase()}}</span>
-                    <span class="font-mono text-sm text-gray-800 dark:text-neutral-200">{{rule.startPort}}{{rule.endPort !== rule.startPort ? `-${rule.endPort}` : ''}}</span>
-                    <span class="text-sm text-gray-500 dark:text-neutral-400 truncate flex-grow">{{rule.label}}</span>
-                    <button type="button" @click="removeNetworkPolicyRule(index)" class="p-1.5 text-gray-400 hover:text-red-700 rounded transition">
-                      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.9 12.1A2 2 0 0116.1 21H7.9a2 2 0 01-2-1.9L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                      </svg>
-                    </button>
-                  </div>
+                <p v-else class="small muted" style="margin:0">{{ $t('networkPolicy.noPeers') }}</p>
+              </fieldset>
+              <fieldset style="border:0;margin:0;padding:0">
+                <legend class="strong">{{ $t('networkPolicy.customRules') }} <span class="muted" style="font-weight:400">{{ networkPolicyDialog.customRules.length }} / {{ networkPolicyOptions.maxCustomRules }}</span></legend>
+                <p class="small muted" style="margin:2px 0 8px">{{ $t('networkPolicy.customRulesHelp') }}</p>
+                <table v-if="networkPolicyDialog.customRules.length" class="table" style="border:1px solid var(--border);border-radius:6px">
+                  <tbody>
+                    <tr v-for="(rule, index) in networkPolicyDialog.customRules" :key="index">
+                      <td>{{ rule.proto.toUpperCase() }}</td>
+                      <td class="mono">{{ rule.startPort }}{{ rule.endPort !== rule.startPort ? `-${rule.endPort}` : '' }}</td>
+                      <td class="muted">{{ rule.label }}</td>
+                      <td class="right"><button type="button" class="btn-link" style="color:var(--danger)" @click="removeNetworkPolicyRule(index)">{{ $t('ui.deleteRule') }}</button></td>
+                    </tr>
+                  </tbody>
+                </table>
+                <p v-else class="small muted" style="margin:0">{{ $t('networkPolicy.noCustomRules') }}</p>
+                <div class="row" style="margin-top:8px">
+                  <select v-model="newNetworkPolicyRule.proto" :aria-label="$t('ui.colProtocol')"><option value="tcp">TCP</option><option value="udp">UDP</option></select>
+                  <input v-model.trim="newNetworkPolicyRule.label" type="text" maxlength="64" class="grow" :placeholder="$t('networkPolicy.ruleLabel')" :aria-label="$t('networkPolicy.ruleLabel')" />
+                  <input v-model.number="newNetworkPolicyRule.startPort" type="number" min="1" max="65535" style="width:110px" :placeholder="$t('networkPolicy.startPort')" :aria-label="$t('networkPolicy.startPort')" />
+                  <input v-model.number="newNetworkPolicyRule.endPort" type="number" min="1" max="65535" style="width:110px" :placeholder="$t('networkPolicy.endPort')" :aria-label="$t('networkPolicy.endPort')" />
+                  <button type="button" class="btn" @click="addNetworkPolicyRule">{{ $t('networkPolicy.addRule') }}</button>
                 </div>
-                <p v-else class="mt-3 text-xs text-gray-400">{{$t('networkPolicy.noCustomRules')}}</p>
-
-                <div class="mt-3 p-3 rounded-lg border border-dashed border-gray-300 dark:border-neutral-600">
-                  <div class="grid grid-cols-2 sm:grid-cols-[90px_1fr_120px_120px_auto] gap-2">
-                    <select v-model="newNetworkPolicyRule.proto"
-                      class="rounded-md px-3 py-2 text-sm bg-gray-50 dark:bg-neutral-700 text-gray-800 dark:text-neutral-200 border border-gray-200 dark:border-neutral-600 outline-none">
-                      <option value="tcp">TCP</option>
-                      <option value="udp">UDP</option>
-                    </select>
-                    <input v-model.trim="newNetworkPolicyRule.label" type="text" maxlength="64" :placeholder="$t('networkPolicy.ruleLabel')"
-                      class="col-span-1 rounded-md px-3 py-2 text-sm bg-gray-50 dark:bg-neutral-700 text-gray-800 dark:text-neutral-200 border border-gray-200 dark:border-neutral-600 outline-none">
-                    <input v-model.number="newNetworkPolicyRule.startPort" type="number" min="1" max="65535" :placeholder="$t('networkPolicy.startPort')"
-                      class="rounded-md px-3 py-2 text-sm bg-gray-50 dark:bg-neutral-700 text-gray-800 dark:text-neutral-200 border border-gray-200 dark:border-neutral-600 outline-none">
-                    <input v-model.number="newNetworkPolicyRule.endPort" type="number" min="1" max="65535" :placeholder="$t('networkPolicy.endPort')"
-                      class="rounded-md px-3 py-2 text-sm bg-gray-50 dark:bg-neutral-700 text-gray-800 dark:text-neutral-200 border border-gray-200 dark:border-neutral-600 outline-none">
-                    <button type="button" @click="addNetworkPolicyRule"
-                      class="col-span-2 sm:col-span-1 px-4 py-2 rounded-md bg-neutral-800 dark:bg-neutral-600 hover:bg-red-800 text-white text-sm font-medium transition">
-                      {{$t('networkPolicy.addRule')}}
-                    </button>
-                  </div>
-                </div>
-              </section>
-
-              <div v-if="networkPolicyError" class="p-3 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-sm text-red-700 dark:text-red-300">
-                {{networkPolicyError}}
-              </div>
+              </fieldset>
+              <div v-if="networkPolicyError" class="error-box" role="alert">{{ networkPolicyError }}</div>
             </div>
-
-            <div class="flex flex-col-reverse sm:flex-row sm:justify-end gap-2 px-5 py-4 border-t border-gray-200 dark:border-neutral-700 bg-gray-50 dark:bg-neutral-800">
-              <button type="button" @click="closeNetworkPolicy" :disabled="networkPolicySaving"
-                class="px-4 py-2 rounded-md border border-gray-300 dark:border-neutral-600 text-gray-700 dark:text-neutral-200 text-sm font-medium hover:bg-gray-100 dark:hover:bg-neutral-700 transition">
-                {{$t('cancel')}}
-              </button>
-              <button type="button" @click="saveNetworkPolicy" :disabled="networkPolicySaving"
-                class="px-4 py-2 rounded-md bg-red-800 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium transition">
-                {{networkPolicySaving ? $t('networkPolicy.saving') : $t('networkPolicy.save')}}
-              </button>
+            <div class="modal-foot">
+              <button type="button" class="btn" :disabled="networkPolicySaving" @click="closeNetworkPolicy">{{ $t('cancel') }}</button>
+              <button type="button" class="btn btn-primary" :disabled="networkPolicySaving" @click="saveNetworkPolicy">{{ networkPolicySaving ? $t('networkPolicy.saving') : $t('networkPolicy.save') }}</button>
             </div>
           </div>
         </div>
 
-        <!-- Create Dialog -->
-        <div v-if="clientCreate" class="fixed z-10 inset-0 overflow-y-auto">
-          <div class="flex items-center justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
-            <!--
-        Background overlay, show/hide based on modal state.
-
-        Entering: "ease-out duration-300"
-          From: "opacity-0"
-          To: "opacity-100"
-        Leaving: "ease-in duration-200"
-          From: "opacity-100"
-          To: "opacity-0"
-      -->
-            <div class="fixed inset-0 transition-opacity" aria-hidden="true">
-              <div class="absolute inset-0 bg-gray-500 dark:bg-black opacity-75 dark:opacity-50"></div>
+        <!-- Create client -->
+        <div v-if="clientCreate" class="modal">
+          <div class="modal-backdrop" @click="clientCreate = null"></div>
+          <form class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="h-create" @submit.prevent="clientCreateName.length && (createClient(), clientCreate = null)">
+            <div class="modal-head"><h2 id="h-create">{{ $t('newClient') }}</h2></div>
+            <div class="modal-body">
+              <label class="field">{{ $t('name') }}<input type="text" v-model.trim="clientCreateName" :placeholder="$t('name')" /></label>
             </div>
+            <div class="modal-foot">
+              <button type="button" class="btn" @click="clientCreate = null">{{ $t('cancel') }}</button>
+              <button type="submit" class="btn btn-primary" :disabled="!clientCreateName.length">{{ $t('create') }}</button>
+            </div>
+          </form>
+        </div>
 
-            <!-- This element is to trick the browser into centering the modal contents. -->
-            <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
-            <!--
-        Modal panel, show/hide based on modal state.
-
-        Entering: "ease-out duration-300"
-          From: "opacity-0 tranneutral-y-4 sm:tranneutral-y-0 sm:scale-95"
-          To: "opacity-100 tranneutral-y-0 sm:scale-100"
-        Leaving: "ease-in duration-200"
-          From: "opacity-100 tranneutral-y-0 sm:scale-100"
-          To: "opacity-0 tranneutral-y-4 sm:tranneutral-y-0 sm:scale-95"
-      -->
-            <div
-              class="inline-block align-bottom bg-white dark:bg-neutral-700 rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-lg w-full"
-              role="dialog" aria-modal="true" aria-labelledby="modal-headline">
-              <div class="bg-white dark:bg-neutral-700 px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
-                <div class="sm:flex sm:items-start">
-                  <div
-                    class="mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full bg-red-800 sm:mx-0 sm:h-10 sm:w-10">
-                    <svg class="h-6 w-6 text-white" inline xmlns="http://www.w3.org/2000/svg"
-                      fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                        d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                    </svg>
-                  </div>
-                  <div class="flex-grow mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left">
-                    <h3 class="text-lg leading-6 font-medium text-gray-900 dark:text-neutral-200" id="modal-headline">
-                      {{$t("newClient")}}
-                    </h3>
-                    <div class="mt-2">
-                      <p class="text-sm text-gray-500">
-                        <input
-                          class="rounded p-2 border-2 dark:bg-neutral-700 dark:text-neutral-200 border-gray-100 dark:border-neutral-600 focus:border-gray-200 focus:dark:border-neutral-500 dark:placeholder:text-neutral-400 outline-none w-full"
-                          type="text" v-model.trim="clientCreateName" :placeholder="$t('name')" />
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-              <div class="bg-gray-50 dark:bg-neutral-700 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
-                <button v-if="clientCreateName.length" type="button" @click="createClient(); clientCreate = null"
-                  class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-red-800 text-base font-medium text-white hover:bg-red-700 focus:outline-none sm:ml-3 sm:w-auto sm:text-sm">
-                  {{$t("create")}}
-                </button>
-                <button v-else type="button"
-                  class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-gray-200 dark:bg-neutral-400 text-base font-medium text-white dark:text-neutral-300 sm:ml-3 sm:w-auto sm:text-sm cursor-not-allowed">
-                  {{$t("create")}}
-                </button>
-                <button type="button" @click="clientCreate = null"
-                  class="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 dark:border-neutral-500 shadow-sm px-4 py-2 bg-white dark:bg-neutral-500 text-base font-medium text-gray-700 dark:text-neutral-50 hover:bg-gray-50 dark:hover:bg-neutral-600 dark:hover:border-neutral-600 focus:outline-none sm:mt-0 sm:ml-3 sm:w-auto sm:text-sm">
-                  {{$t("cancel")}}
-                </button>
-              </div>
+        <!-- Delete client -->
+        <div v-if="clientDelete" class="modal">
+          <div class="modal-backdrop" @click="clientDelete = null"></div>
+          <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="h-delete">
+            <div class="modal-head"><h2 id="h-delete">{{ $t('deleteClient') }}</h2></div>
+            <div class="modal-body"><p style="margin:0">{{ $t('deleteDialog1') }} <strong>{{ clientDelete.name }}</strong>? {{ $t('deleteDialog2') }}</p></div>
+            <div class="modal-foot">
+              <button type="button" class="btn" @click="clientDelete = null">{{ $t('cancel') }}</button>
+              <button type="button" class="btn btn-danger" @click="deleteClient(clientDelete); clientDelete = null; navigate('panel')">{{ $t('deleteClient') }}</button>
             </div>
           </div>
         </div>
 
-        <!-- Delete Dialog -->
-        <div v-if="clientDelete" class="fixed z-10 inset-0 overflow-y-auto">
-          <div class="flex items-center justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
-            <!--
-        Background overlay, show/hide based on modal state.
-
-        Entering: "ease-out duration-300"
-          From: "opacity-0"
-          To: "opacity-100"
-        Leaving: "ease-in duration-200"
-          From: "opacity-100"
-          To: "opacity-0"
-      -->
-            <div class="fixed inset-0 transition-opacity" aria-hidden="true">
-              <div class="absolute inset-0 bg-gray-500 dark:bg-black opacity-75 dark:opacity-50"></div>
+        <!-- Delete port-forward rule -->
+        <div v-if="pfDelete" class="modal">
+          <div class="modal-backdrop" @click="pfDelete = null"></div>
+          <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="h-pfdel">
+            <div class="modal-head"><h2 id="h-pfdel">{{ $t('ui.deleteRule') }}</h2></div>
+            <div class="modal-body">
+              <p style="margin:0">{{ $t('ui.deleteRuleConfirm') }}</p>
+              <p class="mono strong" style="margin:0">{{ pfDelete.rule.proto === 'both' ? 'TCP + UDP' : pfDelete.rule.proto.toUpperCase() }} {{ pfDelete.rule.extPort }} → {{ pfDelete.rule.intPort }}</p>
             </div>
-
-            <!-- This element is to trick the browser into centering the modal contents. -->
-            <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
-            <!--
-        Modal panel, show/hide based on modal state.
-
-        Entering: "ease-out duration-300"
-          From: "opacity-0 tranneutral-y-4 sm:tranneutral-y-0 sm:scale-95"
-          To: "opacity-100 tranneutral-y-0 sm:scale-100"
-        Leaving: "ease-in duration-200"
-          From: "opacity-100 tranneutral-y-0 sm:scale-100"
-          To: "opacity-0 tranneutral-y-4 sm:tranneutral-y-0 sm:scale-95"
-      -->
-            <div
-              class="inline-block align-bottom bg-white dark:bg-neutral-700 rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-lg w-full"
-              role="dialog" aria-modal="true" aria-labelledby="modal-headline">
-              <div class="bg-white dark:bg-neutral-700 px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
-                <div class="sm:flex sm:items-start">
-                  <div
-                    class="mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full bg-red-100 sm:mx-0 sm:h-10 sm:w-10">
-                    <!-- Heroicon name: outline/exclamation -->
-                    <svg class="h-6 w-6 text-red-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"
-                      stroke="currentColor" aria-hidden="true">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                        d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                    </svg>
-                  </div>
-                  <div class="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left">
-                    <h3 class="text-lg leading-6 font-medium text-gray-900 dark:text-neutral-200" id="modal-headline">
-                      {{$t("deleteClient")}}
-                    </h3>
-                    <div class="mt-2">
-                      <p class="text-sm text-gray-500 dark:text-neutral-300">
-                        {{$t("deleteDialog1")}} <strong>{{clientDelete.name}}</strong>? {{$t("deleteDialog2")}}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-              <div class="bg-gray-50 dark:bg-neutral-600 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
-                <button type="button" @click="deleteClient(clientDelete); clientDelete = null"
-                  class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-red-600 dark:bg-red-600 text-base font-medium text-white dark:text-white hover:bg-red-700 dark:hover:bg-red-700 focus:outline-none sm:ml-3 sm:w-auto sm:text-sm">
-                  {{$t("deleteClient")}}
-                </button>
-                <button type="button" @click="clientDelete = null"
-                  class="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 dark:border-neutral-500 shadow-sm px-4 py-2 bg-white dark:bg-neutral-500 text-base font-medium text-gray-700 dark:text-neutral-50 hover:bg-gray-50 dark:hover:bg-neutral-600 dark:hover:border-neutral-600 focus:outline-none sm:mt-0 sm:ml-3 sm:w-auto sm:text-sm">
-                  {{$t("cancel")}}
-                </button>
-              </div>
+            <div class="modal-foot">
+              <button type="button" class="btn" @click="pfDelete = null">{{ $t('cancel') }}</button>
+              <button type="button" class="btn btn-danger" :disabled="!forwardingEnabled" @click="confirmRemovePortForward()">{{ $t('ui.deleteRule') }}</button>
             </div>
           </div>
         </div>
 
-        <!-- Delete Port Forwarding Dialog -->
-        <div v-if="pfDelete" class="fixed z-10 inset-0 overflow-y-auto">
-          <div class="flex items-center justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
-            <div class="fixed inset-0 transition-opacity" aria-hidden="true">
-              <div class="absolute inset-0 bg-gray-500 dark:bg-black opacity-75 dark:opacity-50"></div>
-            </div>
-            <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
-            <div
-              class="inline-block align-bottom bg-white dark:bg-neutral-700 rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-lg w-full"
-              role="dialog" aria-modal="true" aria-labelledby="modal-headline">
-              <div class="bg-white dark:bg-neutral-700 px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
-                <div class="sm:flex sm:items-start">
-                  <div
-                    class="mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full bg-red-100 sm:mx-0 sm:h-10 sm:w-10">
-                    <svg class="h-6 w-6 text-red-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"
-                      stroke="currentColor" aria-hidden="true">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                        d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                    </svg>
-                  </div>
-                  <div class="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left">
-                    <h3 class="text-lg leading-6 font-medium text-gray-900 dark:text-neutral-200" id="modal-headline">
-                      Eliminar regla de redirección
-                    </h3>
-                    <div class="mt-2">
-                      <p class="text-sm text-gray-500 dark:text-neutral-300">
-                        ¿Estás seguro de que deseas eliminar esta regla? 
-                        <br><br>
-                        <strong>{{pfDelete.rule.proto === 'both' ? 'TCP + UDP' : pfDelete.rule.proto.toUpperCase()}} {{pfDelete.rule.extPort}} → {{pfDelete.rule.intPort}}</strong>
-                      </p>
-                    </div>
-                  </div>
-                </div>
+        <!-- Server config -->
+        <div v-if="showServerConfig && serverConfigEdit" class="modal">
+          <div class="modal-backdrop" @click="closeServerConfig"></div>
+          <form class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="h-srvcfg" @submit.prevent="saveServerConfig">
+            <div class="modal-head"><h2 id="h-srvcfg">Server Configuration</h2></div>
+            <div class="modal-body">
+              <label class="field">Public Host / IP<input type="text" v-model="serverConfigEdit.host" placeholder="vpn.example.com" /></label>
+              <div class="row" style="flex-wrap:nowrap">
+                <label class="field grow">WG Port<input type="number" v-model="serverConfigEdit.port" /></label>
+                <label class="field grow">Config Port<input type="number" v-model="serverConfigEdit.configPort" /></label>
               </div>
-              <div class="bg-gray-50 dark:bg-neutral-600 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
-                <button type="button" @click="confirmRemovePortForward()" :disabled="!forwardingEnabled"
-                  class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-red-600 dark:bg-red-600 text-base font-medium text-white dark:text-white hover:bg-red-700 dark:hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none sm:ml-3 sm:w-auto sm:text-sm transition-colors">
-                  Eliminar Regla
-                </button>
-                <button type="button" @click="pfDelete = null"
-                  class="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 dark:border-neutral-500 shadow-sm px-4 py-2 bg-white dark:bg-neutral-500 text-base font-medium text-gray-700 dark:text-neutral-50 hover:bg-gray-50 dark:hover:bg-neutral-600 dark:hover:border-neutral-600 focus:outline-none sm:mt-0 sm:ml-3 sm:w-auto sm:text-sm transition-colors">
-                  {{$t("cancel")}}
-                </button>
+              <label class="field">DNS Servers<input type="text" v-model="serverConfigEdit.defaultDns" placeholder="1.1.1.1, 8.8.8.8" /></label>
+              <label class="field">Default Address Range (IPv4)<input type="text" v-model="serverConfigEdit.defaultAddress" placeholder="10.8.0.x" /></label>
+              <label class="row small strong" style="gap:8px"><input type="checkbox" v-model="serverConfigEdit.enableIpv6" />Enable IPv6</label>
+              <label v-if="serverConfigEdit.enableIpv6" class="field">Default Address Range (IPv6)<input type="text" v-model="serverConfigEdit.defaultAddressV6" placeholder="fd42:42:42::x" /></label>
+              <label class="field">Allowed IPs<input type="text" v-model="serverConfigEdit.allowedIps" placeholder="0.0.0.0/0, ::/0" /></label>
+              <div class="row" style="flex-wrap:nowrap">
+                <label class="field grow">MTU<input type="text" v-model="serverConfigEdit.mtu" placeholder="Auto" /></label>
+                <label class="field grow">Keep Alive (s)<input type="number" v-model="serverConfigEdit.persistentKeepalive" /></label>
               </div>
+              <div>
+                <label class="row small strong" style="gap:8px"><input type="checkbox" v-model="serverConfigEdit.forwardingEnabled" />{{ $t('networkPolicy.forwardingEnabled') }}</label>
+                <p class="xsmall muted" style="margin:4px 0 0 24px">{{ $t('networkPolicy.forwardingEnabledHint') }}</p>
+              </div>
+              <label class="field">Network Device<input type="text" v-model="serverConfigEdit.device" placeholder="eth0" /></label>
             </div>
-          </div>
+            <div class="modal-foot">
+              <button type="button" class="btn" @click="closeServerConfig">{{ $t('cancel') }}</button>
+              <button type="submit" class="btn btn-primary" :disabled="serverConfigSaving">{{ serverConfigSaving ? $t('ui.saving') : $t('ui.save') }}</button>
+            </div>
+          </form>
         </div>
+      </template>
 
-        <!-- Server Config Dialog -->
-        <div v-if="showServerConfig && serverConfigEdit" class="fixed z-10 inset-0 overflow-y-auto">
-          <div class="flex items-center justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
-            <div class="fixed inset-0 transition-opacity" aria-hidden="true">
-              <div class="absolute inset-0 bg-gray-500 dark:bg-black opacity-75 dark:opacity-50"></div>
-            </div>
-            <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
-            <div class="inline-block align-bottom bg-white dark:bg-neutral-700 rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-lg w-full"
-              role="dialog" aria-modal="true">
-              <div class="bg-white dark:bg-neutral-700 px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
-                <div class="sm:flex sm:items-start">
-                  <div class="mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full bg-red-800 sm:mx-0 sm:h-10 sm:w-10">
-                    <svg class="h-6 w-6 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-                      <path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28Z" />
-                      <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
-                    </svg>
-                  </div>
-                  <div class="flex-grow mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left">
-                    <h3 class="text-lg leading-6 font-medium text-gray-900 dark:text-neutral-200">Server Configuration</h3>
-                    <div class="mt-4 space-y-3">
-                      <div>
-                        <label class="block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider">Public Host / IP</label>
-                        <input type="text" v-model="serverConfigEdit.host"
-                          class="rounded p-2 border-2 dark:bg-neutral-600 dark:text-neutral-200 border-gray-100 dark:border-neutral-500 focus:border-red-800 dark:focus:border-red-700 outline-none w-full text-sm" placeholder="vpn.example.com" />
-                      </div>
-                      <div class="grid grid-cols-2 gap-3">
-                        <div>
-                          <label class="block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider">WG Port</label>
-                          <input type="number" v-model="serverConfigEdit.port"
-                            class="rounded p-2 border-2 dark:bg-neutral-600 dark:text-neutral-200 border-gray-100 dark:border-neutral-500 focus:border-red-800 dark:focus:border-red-700 outline-none w-full text-sm" />
-                        </div>
-                        <div>
-                          <label class="block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider">Config Port</label>
-                          <input type="number" v-model="serverConfigEdit.configPort"
-                            class="rounded p-2 border-2 dark:bg-neutral-600 dark:text-neutral-200 border-gray-100 dark:border-neutral-500 focus:border-red-800 dark:focus:border-red-700 outline-none w-full text-sm" />
-                        </div>
-                      </div>
-                      <div>
-                        <label class="block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider">DNS Servers</label>
-                        <input type="text" v-model="serverConfigEdit.defaultDns"
-                          class="rounded p-2 border-2 dark:bg-neutral-600 dark:text-neutral-200 border-gray-100 dark:border-neutral-500 focus:border-red-800 dark:focus:border-red-700 outline-none w-full text-sm" placeholder="1.1.1.1, 8.8.8.8" />
-                      </div>
-                      <div>
-                        <label class="block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider">Default Address Range (IPv4)</label>
-                        <input type="text" v-model="serverConfigEdit.defaultAddress"
-                          class="rounded p-2 border-2 dark:bg-neutral-600 dark:text-neutral-200 border-gray-100 dark:border-neutral-500 focus:border-red-800 dark:focus:border-red-700 outline-none w-full text-sm" placeholder="10.8.0.x" />
-                      </div>
-                      <div>
-                        <label class="flex items-center gap-2 block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider cursor-pointer">
-                          <input type="checkbox" v-model="serverConfigEdit.enableIpv6" class="rounded text-red-800 focus:ring-red-800 border-gray-300 dark:border-neutral-600 dark:bg-neutral-700" />
-                          Enable IPv6
-                        </label>
-                      </div>
-                      <div v-if="serverConfigEdit.enableIpv6">
-                        <label class="block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider">Default Address Range (IPv6)</label>
-                        <input type="text" v-model="serverConfigEdit.defaultAddressV6"
-                          class="rounded p-2 border-2 dark:bg-neutral-600 dark:text-neutral-200 border-gray-100 dark:border-neutral-500 focus:border-red-800 dark:focus:border-red-700 outline-none w-full text-sm" placeholder="fd42:42:42::x" />
-                      </div>
-                      <div>
-                        <label class="block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider">Allowed IPs</label>
-                        <input type="text" v-model="serverConfigEdit.allowedIps"
-                          class="rounded p-2 border-2 dark:bg-neutral-600 dark:text-neutral-200 border-gray-100 dark:border-neutral-500 focus:border-red-800 dark:focus:border-red-700 outline-none w-full text-sm" placeholder="0.0.0.0/0, ::/0" />
-                      </div>
-                      <div class="grid grid-cols-2 gap-3">
-                        <div>
-                          <label class="block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider">MTU</label>
-                          <input type="text" v-model="serverConfigEdit.mtu"
-                            class="rounded p-2 border-2 dark:bg-neutral-600 dark:text-neutral-200 border-gray-100 dark:border-neutral-500 focus:border-red-800 dark:focus:border-red-700 outline-none w-full text-sm" placeholder="Auto" />
-                        </div>
-                        <div>
-                          <label class="block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider">Keep Alive (s)</label>
-                          <input type="number" v-model="serverConfigEdit.persistentKeepalive"
-                            class="rounded p-2 border-2 dark:bg-neutral-600 dark:text-neutral-200 border-gray-100 dark:border-neutral-500 focus:border-red-800 dark:focus:border-red-700 outline-none w-full text-sm" />
-                        </div>
-                      </div>
-                      <div>
-                        <label class="flex items-center gap-2 block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider cursor-pointer">
-                          <input type="checkbox" v-model="serverConfigEdit.forwardingEnabled" class="rounded text-red-800 focus:ring-red-800 border-gray-300 dark:border-neutral-600 dark:bg-neutral-700" />
-                          {{$t("networkPolicy.forwardingEnabled")}}
-                        </label>
-                        <p class="mt-1 ml-6 text-xs font-normal normal-case tracking-normal text-gray-400 dark:text-neutral-500">{{$t("networkPolicy.forwardingEnabledHint")}}</p>
-                      </div>
-                      <div>
-                        <label class="block text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1 uppercase tracking-wider">Network Device</label>
-                        <input type="text" v-model="serverConfigEdit.device"
-                          class="rounded p-2 border-2 dark:bg-neutral-600 dark:text-neutral-200 border-gray-100 dark:border-neutral-500 focus:border-red-800 dark:focus:border-red-700 outline-none w-full text-sm" placeholder="eth0" />
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-              <div class="bg-gray-50 dark:bg-neutral-700 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
-                <button type="button" @click="saveServerConfig" :disabled="serverConfigSaving"
-                  class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-red-800 text-base font-medium text-white hover:bg-red-700 focus:outline-none sm:ml-3 sm:w-auto sm:text-sm transition"
-                  :class="{ 'opacity-50 cursor-not-allowed': serverConfigSaving }">
-                  {{ serverConfigSaving ? 'Saving...' : 'Save' }}
-                </button>
-                <button type="button" @click="closeServerConfig"
-                  class="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 dark:border-neutral-500 shadow-sm px-4 py-2 bg-white dark:bg-neutral-500 text-base font-medium text-gray-700 dark:text-neutral-50 hover:bg-gray-50 dark:hover:bg-neutral-600 focus:outline-none sm:mt-0 sm:ml-3 sm:w-auto sm:text-sm transition">
-                  Cancel
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div v-if="authenticated === false">
-        <h1 class="text-4xl font-medium my-16 text-gray-700 dark:text-neutral-200 text-center">
-          <img src="./img/logo.png" width="32" class="inline align-middle dark:bg" />
-          <span class="align-middle">WireGuard</span>
-        </h1>
-
-        <form @submit="login"
-          class="shadow rounded-md bg-white dark:bg-neutral-700 mx-auto w-64 p-5 overflow-hidden mt-10">
-          <!-- Avatar -->
-          <div class="h-20 w-20 mb-10 mt-5 mx-auto rounded-full bg-red-800 dark:bg-red-800 relative overflow-hidden">
-            <svg class="w-10 h-10 m-5 text-white dark:text-white" xmlns="http://www.w3.org/2000/svg"
-              viewBox="0 0 20 20" fill="currentColor">
-              <path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd" />
-            </svg>
-          </div>
-
-          <input type="password" name="password" :placeholder="$t('password')" v-model="password" autocomplete="current-password"
-            class="px-3 py-2 text-sm dark:bg-neutral-700 text-gray-500 dark:text-gray-500 mb-5 border-2 border-gray-100 dark:border-neutral-800 rounded-lg w-full focus:border-red-800 dark:focus:border-red-800 dark:placeholder:text-neutral-400 outline-none" />
-
-          <button v-if="authenticating"
-            class="bg-red-800 dark:bg-red-800 w-full rounded shadow py-2 text-sm text-white dark:text-white cursor-not-allowed">
-            <svg class="w-5 animate-spin mx-auto" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
-              fill="currentColor">
-              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-              <path class="opacity-75" fill="currentColor"
-                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z">
-              </path>
-            </svg>
+      <!-- Login -->
+      <div v-if="authenticated === false" class="login">
+        <h1 style="text-align:center;font-size:22px"><img src="./img/logo.png" width="28" height="28" alt="" style="display:inline;vertical-align:-6px;margin-right:8px" />WireGuard</h1>
+        <form class="box box-body stack" style="padding:16px" @submit="login">
+          <label class="field" style="font-size:14px">{{ $t('password') }}
+            <input type="password" name="password" v-model="password" autocomplete="current-password" style="height:36px" />
+          </label>
+          <button type="submit" class="btn btn-primary" style="height:36px" :disabled="authenticating || !password">
+            <span v-if="authenticating" class="spinner" style="width:16px;height:16px;border-top-color:#fff"></span>
+            <span v-else>{{ $t('signIn') }}</span>
           </button>
-          <input v-if="!authenticating && password" type="submit"
-            class="bg-red-800 dark:bg-red-800 w-full rounded shadow py-2 text-sm text-white dark:text-white hover:bg-red-700 dark:hover:bg-red-700 transition cursor-pointer"
-            :value="$t('signIn')">
-          <input v-if="!authenticating && !password" type="submit"
-            class="bg-gray-200 dark:bg-neutral-800 w-full rounded shadow py-2 text-sm text-white dark:text-white cursor-not-allowed"
-            :value="$t('signIn')">
         </form>
       </div>
 
-      <div v-if="authenticated === null" class="text-gray-300 dark:text-red-300 pt-24 pb-12">
-
-        <svg class="w-5 animate-spin mx-auto" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
-          fill="currentColor">
-          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-          <path class="opacity-75" fill="currentColor"
-            d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z">
-          </path>
-        </svg>
-
-      </div>
-
+      <div v-if="authenticated === null" class="empty" style="padding-top:96px"><div class="spinner"></div></div>
     </div>
 
-    <p v-cloak class="text-center m-10 text-gray-300 dark:text-neutral-600 text-xs"> <a class="hover:underline" target="_blank"
-        href="https://github.com/wg-easy/wg-easy">WireGuard Easy</a> © 2021-2024 by <a class="hover:underline" target="_blank"
-        href="https://emilenijssen.nl/?ref=wg-easy">Emile Nijssen</a> · Fork by <a class="hover:underline" target="_blank"
-        href="https://github.com/ydtoloza">ydtoloza</a> is licensed under <a class="hover:underline" target="_blank"
-        href="http://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> · <a class="hover:underline"
-        href="https://github.com/sponsors/WeeJeWel" target="_blank">{{$t("donate")}}</a></p>
+    <p v-cloak class="footer"><a target="_blank" rel="noopener" href="https://github.com/wg-easy/wg-easy">WireGuard Easy</a> © 2021-2024 by <a target="_blank" rel="noopener" href="https://emilenijssen.nl/?ref=wg-easy">Emile Nijssen</a> · Fork by <a target="_blank" rel="noopener" href="https://github.com/ydtoloza">ydtoloza</a> is licensed under <a target="_blank" rel="noopener" href="http://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> · <a target="_blank" rel="noopener" href="https://github.com/sponsors/WeeJeWel">{{ $t('donate') }}</a></p>
 
   </div>
   <!-- vue-app-template:end -->
@@ -1353,8 +630,8 @@
   <script src="./js/vendor/timeago.full.min.js"></script>
   <script src="./js/api.js"></script>
   <script src="./js/i18n.js"></script>
-  <script src="./js/app-template.generated.js?v=86c492078815"></script>
-  <script src="./js/app.js?v=8"></script>
+  <script src="./js/app-template.generated.js?v=7d7bf3cdb8e0"></script>
+  <script src="./js/app.js?v=9"></script>
 </body>
 
 </html>
