@@ -1798,4 +1798,96 @@ describe('WireGuard', () => {
       expect(JSON.stringify(status)).not.toContain('password');
     });
   });
+  describe('user codes and portal profiles', () => {
+    beforeEach(() => {
+      let n = 10;
+      Util.exec.mockImplementation(async (cmd) => (cmd === 'wg genkey' || cmd === 'wg genpsk'
+        ? Buffer.alloc(32, 7).toString('base64') : undefined));
+      Util.execFile.mockImplementation(async () => Buffer.alloc(32, n++).toString('base64'));
+    });
+
+    it('creates a user whose code is shown once and resolves to that user', async () => {
+      const { user, code } = await wg.createUser({ name: 'ana' });
+      expect(code).toMatch(/^([0-9A-HJKMNP-TV-Z]{4}-){4}[0-9A-HJKMNP-TV-Z]{4}$/);
+      expect(user).toMatchObject({
+        name: 'ana', canCreate: true, hasCode: true, clientIds: [],
+      });
+      expect(JSON.stringify(await wg.getConfig())).not.toContain(code);
+      expect(await wg.lookupUserCode(code.toLowerCase().replace(/-/g, ' '))).toBe(user.id);
+      expect(await wg.lookupUserCode('AAAA-AAAA-AAAA-AAAA-AAAA')).toBeNull();
+      expect(await wg.lookupUserCode('nope')).toBeNull();
+
+      const { code: rotated } = await wg.rotateUserCode({ userId: user.id });
+      expect(await wg.lookupUserCode(code)).toBeNull();
+      expect(await wg.lookupUserCode(rotated)).toBe(user.id);
+    });
+
+    it('links existing profiles and unlinks them when the user is deleted', async () => {
+      const { user } = await wg.createUser({ name: 'ana' });
+      await wg.setClientOwner({ clientId: 'client1', userId: user.id });
+      expect((await wg.getUsers())[0].clientIds).toEqual(['client1']);
+      await expect(wg.setClientOwner({ clientId: 'client1', userId: 'missing' })).rejects.toMatchObject({ statusCode: 404 });
+
+      await wg.deleteUser({ userId: user.id });
+      const config = await wg.getConfig();
+      expect(config.clients.client1.ownerId).toBeNull();
+      expect(config.users).toEqual({});
+    });
+
+    it('creates one profile per family, only on an offered free port', async () => {
+      const { user } = await wg.createUser({ name: 'ana' });
+      await expect(wg.createUserProfile({ userId: user.id, family: 'v4', port: 30000 }))
+        .rejects.toMatchObject({ statusCode: 400 });
+
+      const { ports } = await wg.getUserPortOffers({ userId: user.id });
+      expect(ports).toHaveLength(5);
+      expect(ports).not.toContain(2000); // taken by client1
+      const created = await wg.createUserProfile({ userId: user.id, family: 'v4', port: ports[0] });
+      expect(created).toMatchObject({ name: 'ana-ipv4', family: 'v4' });
+
+      const config = await wg.getConfig();
+      expect(config.clients[created.id]).toMatchObject({
+        ownerId: user.id,
+        family: 'v4',
+        portForwards: [expect.objectContaining({ proto: 'both', extPort: ports[0], intPort: ports[0] })],
+      });
+      const conf = await wg.getClientConfiguration({ clientId: created.id });
+      expect(conf).toMatch(/Address = 10\.8\.0\.\d+\/24\n/);
+      expect(conf).toContain('AllowedIPs = 0.0.0.0/0\n');
+
+      // The offer is consumed, and the v4 slot is now taken.
+      await expect(wg.createUserProfile({ userId: user.id, family: 'v6', port: ports[1] }))
+        .rejects.toMatchObject({ statusCode: 400 });
+      const again = await wg.getUserPortOffers({ userId: user.id });
+      await expect(wg.createUserProfile({ userId: user.id, family: 'v4', port: again.ports[0] }))
+        .rejects.toMatchObject({ statusCode: 409 });
+      const v6 = await wg.createUserProfile({ userId: user.id, family: 'v6', port: again.ports[0] });
+      const v6conf = await wg.getClientConfiguration({ clientId: v6.id });
+      expect(v6conf).toMatch(/Address = fd42:42:42::[0-9a-f]+\/128\n/);
+      expect(v6conf).toContain('AllowedIPs = ::/0\n');
+    });
+
+    it('refuses creation when the admin disabled it and hides other users\' profiles', async () => {
+      const { user } = await wg.createUser({ name: 'ana', canCreate: false });
+      const { ports } = await wg.getUserPortOffers({ userId: user.id });
+      await expect(wg.createUserProfile({ userId: user.id, family: 'v4', port: ports[0] }))
+        .rejects.toMatchObject({ statusCode: 403 });
+      await expect(wg.assertUserOwnsClient({ userId: user.id, clientId: 'client1' }))
+        .rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('rejects configs that break user invariants', async () => {
+      const config = makeConfig();
+      config.clients.client1.ownerId = 'ghost';
+      expect(() => wg.__validateConfig(config)).toThrow('Invalid client.ownerId');
+      config.users = {
+        u1: {
+          id: 'u1', name: 'ana', codeHash: null, canCreate: true,
+        },
+      };
+      config.clients.client1.ownerId = 'u1';
+      config.clients.client1.family = 'v5';
+      expect(() => wg.__validateConfig(config)).toThrow('Invalid client.family');
+    });
+  });
 });

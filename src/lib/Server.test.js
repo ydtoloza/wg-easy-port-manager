@@ -34,6 +34,16 @@ jest.mock('../config', () => ({
 jest.mock('../services/WireGuard', () => ({
   getClients: jest.fn().mockResolvedValue([]),
   lookupPeerToken: jest.fn(),
+  lookupUserCode: jest.fn(),
+  getUserPortal: jest.fn().mockResolvedValue({ name: 'ana', profiles: [] }),
+  getUserPortOffers: jest.fn().mockResolvedValue({ ports: [31000] }),
+  createUserProfile: jest.fn().mockResolvedValue({ id: 'c1', name: 'ana-ipv4', family: 'v4' }),
+  assertUserOwnsClient: jest.fn().mockResolvedValue(),
+  getClientConfiguration: jest.fn().mockResolvedValue('[Interface]'),
+  getClientQRCodeSVG: jest.fn().mockResolvedValue('<svg/>'),
+  getUsers: jest.fn().mockResolvedValue([]),
+  createUser: jest.fn().mockResolvedValue({ user: { id: 'user1' }, code: 'ABCD-EFGH-JKMN-PQRS-TVWX' }),
+  setClientOwner: jest.fn().mockResolvedValue({ ownerId: 'user1' }),
   getPeerProfile: jest.fn().mockResolvedValue({
     id: 'client1',
     name: 'client1',
@@ -558,6 +568,71 @@ describe('HTTP server security', () => {
       // the flood instead of being evicted from a shared table.
       expect(await postSession(baseUrl, adminIp)).toBe(429);
     }, 60000);
+  });
+
+  describe('user portal', () => {
+    const code = 'Bearer ABCD-EFGH-JKMN-PQRS-TVWX';
+
+    it('serves the portal only for a valid access code, without trying the admin password', async () => {
+      WireGuard.lookupUserCode.mockResolvedValueOnce('user1');
+      const ok = await fetch(`${baseUrl}/api/portal/me`, { headers: { Authorization: code } });
+      expect(ok.status).toBe(200);
+      expect(WireGuard.getUserPortal).toHaveBeenCalledWith({ userId: 'user1' });
+
+      WireGuard.lookupUserCode.mockResolvedValueOnce(null);
+      expect((await fetch(`${baseUrl}/api/portal/me`, { headers: { Authorization: code } })).status).toBe(401);
+      expect((await fetch(`${baseUrl}/api/portal/me`)).status).toBe(401);
+      const admin = await fetch(`${baseUrl}/api/portal/me`, { headers: { Authorization: 'correct-password' } });
+      expect(admin.status).toBe(401);
+      expect((await fetch(`${baseUrl}/api/portal/../wireguard/client`, { headers: { Authorization: code } })).status)
+        .not.toBe(200);
+    });
+
+    it('creates profiles and downloads only owned configurations', async () => {
+      WireGuard.lookupUserCode.mockResolvedValue('user1');
+      const created = await fetch(`${baseUrl}/api/portal/profiles`, {
+        method: 'POST',
+        headers: { Authorization: code, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ family: 'v4', port: 31000, ownerId: 'someone-else' }),
+      });
+      expect(created.status).toBe(200);
+      expect(WireGuard.createUserProfile).toHaveBeenCalledWith({ userId: 'user1', family: 'v4', port: 31000 });
+
+      const conf = await fetch(`${baseUrl}/api/portal/profiles/c1/configuration`, { headers: { Authorization: code } });
+      expect(conf.status).toBe(200);
+      expect(WireGuard.assertUserOwnsClient).toHaveBeenCalledWith({ userId: 'user1', clientId: 'c1' });
+
+      const ServerError = require('./ServerError'); // eslint-disable-line global-require
+      WireGuard.assertUserOwnsClient.mockRejectedValueOnce(new ServerError('Client Not Found: c2', 404));
+      const foreign = await fetch(`${baseUrl}/api/portal/profiles/c2/configuration`, { headers: { Authorization: code } });
+      expect(foreign.status).toBe(404);
+      WireGuard.lookupUserCode.mockReset();
+    });
+
+    it('lets the admin create users and link profiles', async () => {
+      const created = await fetch(`${baseUrl}/api/wireguard/users`, {
+        method: 'POST',
+        headers: { Authorization: 'correct-password', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'ana', canCreate: true }),
+      });
+      expect(created.status).toBe(200);
+      expect(WireGuard.createUser).toHaveBeenCalledWith({ name: 'ana', canCreate: true });
+
+      const linked = await fetch(`${baseUrl}/api/wireguard/client/client1/owner`, {
+        method: 'PUT',
+        headers: { Authorization: 'correct-password', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: 'user1' }),
+      });
+      expect(linked.status).toBe(200);
+      expect(WireGuard.setClientOwner).toHaveBeenCalledWith({ clientId: 'client1', userId: 'user1' });
+
+      const bad = await fetch(`${baseUrl}/api/wireguard/client/client1/owner`, {
+        method: 'PUT',
+        headers: { Authorization: 'correct-password', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: 5 }),
+      });
+      expect(bad.status).toBe(400);
+    });
   });
 
   describe('token and webhook admin routes', () => {

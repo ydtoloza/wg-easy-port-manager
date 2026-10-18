@@ -175,15 +175,18 @@ const classifyPeerPath = (url) => {
     return {
       isPeerPath: asciiDecodedPathname === '/api/peer/me'
         || asciiDecodedPathname.startsWith('/api/peer/me/')
-        || asciiDecodedPathname.startsWith('/api/peer/'),
+        || asciiDecodedPathname.startsWith('/api/peer/')
+        || asciiDecodedPathname.startsWith('/api/portal'),
       malformed: true,
     };
   }
 
-  const isPeerPath = pathname === '/api/peer/me' || pathname.startsWith('/api/peer/me/');
+  // /api/portal is the user-code surface; it shares the gate and its rules.
+  const isPortal = pathname === '/api/portal' || pathname.startsWith('/api/portal/');
+  const isPeerPath = isPortal || pathname === '/api/peer/me' || pathname.startsWith('/api/peer/me/');
   if (!isPeerPath) return { isPeerPath: false, malformed: false };
   const hasDotSegment = pathname.split('/').some((segment) => segment === '.' || segment === '..');
-  return { isPeerPath: true, malformed: hasDotSegment || pathname.includes('//') };
+  return { isPeerPath: true, isPortal, malformed: hasDotSegment || pathname.includes('//') };
 };
 
 // Count bytes while streaming so oversized bodies are never fully buffered.
@@ -483,7 +486,7 @@ module.exports = class Server {
     // under it without a valid Bearer peer token is rejected here.
     app.use(
       fromNodeMiddleware(async (req, res, next) => {
-        const { isPeerPath, malformed } = classifyPeerPath(req.url);
+        const { isPeerPath, isPortal, malformed } = classifyPeerPath(req.url);
         if (!isPeerPath) return next();
 
         // Decode once for the same route identity h3 uses, but fail closed on
@@ -496,6 +499,37 @@ module.exports = class Server {
         }
 
         const auth = req.headers['authorization'];
+        if (isPortal) {
+          const code = typeof auth === 'string' && auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : '';
+          if (!code || code.length > 64) {
+            res.statusCode = 401;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'Access code required' }));
+            return;
+          }
+          const bucket = `user-code:${sha256Hex(code.toUpperCase().replace(/[\s-]/g, '')).slice(0, 16)}`;
+          const ip = getClientIp(req);
+          if (!beginPeerTokenCheck(bucket, ip)) {
+            res.statusCode = 429;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'Too many attempts, try again later' }));
+            return;
+          }
+          let userId = null;
+          try {
+            userId = await WireGuard.lookupUserCode(code);
+          } finally {
+            completePeerTokenCheck(bucket, ip, userId !== null);
+          }
+          if (!userId) {
+            res.statusCode = 401;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'Invalid access code' }));
+            return;
+          }
+          req.wgpmUserId = userId;
+          return next();
+        }
         const token = typeof auth === 'string' && auth.startsWith('Bearer wgpt_')
           ? auth.slice('Bearer wgpt_'.length)
           : null;
@@ -650,6 +684,39 @@ module.exports = class Server {
         }
         await WireGuard.removePortForwardByRuleId(clientId, ruleId, { requireSelfManagePorts: true });
         return { success: true };
+      }));
+
+    // User portal. userId comes only from the access code (req.wgpmUserId);
+    // profile ids in the path are checked against that user's ownership.
+    const portalRouter = createRouter();
+    app.use(portalRouter);
+    const ownedClientId = async (event) => {
+      const clientId = getRouterParam(event, 'clientId');
+      await WireGuard.assertUserOwnsClient({ userId: event.node.req.wgpmUserId, clientId });
+      return clientId;
+    };
+    portalRouter
+      .get('/api/portal/me', defineEventHandler((event) => {
+        return WireGuard.getUserPortal({ userId: event.node.req.wgpmUserId });
+      }))
+      .get('/api/portal/port-options', defineEventHandler((event) => {
+        return WireGuard.getUserPortOffers({ userId: event.node.req.wgpmUserId });
+      }))
+      .post('/api/portal/profiles', defineEventHandler(async (event) => {
+        const { family, port } = await readBodyLimited(event);
+        return WireGuard.createUserProfile({ userId: event.node.req.wgpmUserId, family, port });
+      }))
+      .get('/api/portal/profiles/:clientId/configuration', defineEventHandler(async (event) => {
+        const clientId = await ownedClientId(event);
+        const config = await WireGuard.getClientConfiguration({ clientId });
+        setHeader(event, 'Content-Type', 'text/plain');
+        return config;
+      }))
+      .get('/api/portal/profiles/:clientId/qrcode.svg', defineEventHandler(async (event) => {
+        const clientId = await ownedClientId(event);
+        const svg = await WireGuard.getClientQRCodeSVG({ clientId });
+        setHeader(event, 'Content-Type', 'image/svg+xml');
+        return svg;
       }));
 
     const router2 = createRouter();
@@ -882,6 +949,35 @@ module.exports = class Server {
           throw createError({ status: 403 });
         }
         return WireGuard.revokeClientToken({ clientId });
+      }))
+      .get('/api/wireguard/users', defineEventHandler(() => {
+        return WireGuard.getUsers();
+      }))
+      .post('/api/wireguard/users', defineEventHandler(async (event) => {
+        const { name, canCreate } = await readBodyLimited(event);
+        // The plaintext code is returned exactly once and never stored.
+        return WireGuard.createUser({ name, canCreate });
+      }))
+      .put('/api/wireguard/users/:userId', defineEventHandler(async (event) => {
+        const { name, canCreate } = await readBodyLimited(event);
+        return WireGuard.updateUser({ userId: getRouterParam(event, 'userId'), name, canCreate });
+      }))
+      .delete('/api/wireguard/users/:userId', defineEventHandler((event) => {
+        return WireGuard.deleteUser({ userId: getRouterParam(event, 'userId') });
+      }))
+      .post('/api/wireguard/users/:userId/code', defineEventHandler((event) => {
+        return WireGuard.rotateUserCode({ userId: getRouterParam(event, 'userId') });
+      }))
+      .put('/api/wireguard/client/:clientId/owner', defineEventHandler(async (event) => {
+        const clientId = getRouterParam(event, 'clientId');
+        if (clientId === '__proto__' || clientId === 'constructor' || clientId === 'prototype') {
+          throw createError({ status: 403 });
+        }
+        const { userId } = await readBodyLimited(event);
+        if (userId !== null && typeof userId !== 'string') {
+          throw createError({ status: 400, message: 'userId must be a string or null' });
+        }
+        return WireGuard.setClientOwner({ clientId, userId });
       }))
       .put('/api/wireguard/client/:clientId/self-manage-ports', defineEventHandler(async (event) => {
         const clientId = getRouterParam(event, 'clientId');

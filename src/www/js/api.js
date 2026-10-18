@@ -282,4 +282,49 @@ class API {
     });
   }
 
+  async getUsers() {
+    return this.call({
+      method: 'get',
+      path: '/wireguard/users',
+    });
+  }
+
+  async createUser({ name, canCreate }) {
+    return this.call({
+      method: 'post',
+      path: '/wireguard/users',
+      body: { name, canCreate },
+    });
+  }
+
+  async updateUser({ userId, name, canCreate }) {
+    return this.call({
+      method: 'put',
+      path: `/wireguard/users/${encodeURIComponent(userId)}`,
+      body: { name, canCreate },
+    });
+  }
+
+  async deleteUser({ userId }) {
+    return this.call({
+      method: 'delete',
+      path: `/wireguard/users/${encodeURIComponent(userId)}`,
+    });
+  }
+
+  async rotateUserCode({ userId }) {
+    return this.call({
+      method: 'post',
+      path: `/wireguard/users/${encodeURIComponent(userId)}/code`,
+    });
+  }
+
+  async setClientOwner({ clientId, userId }) {
+    return this.call({
+      method: 'put',
+      path: `/wireguard/client/${encodeURIComponent(clientId)}/owner`,
+      body: { userId },
+    });
+  }
+
 }
