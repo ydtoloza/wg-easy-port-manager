@@ -313,6 +313,12 @@ describe('traffic side panel', () => {
       { key: 'download', name: 'ui.download', data: [{ x: 1, y: 500 }, { x: 2, y: 1500 }] },
       { key: 'upload', name: 'ui.upload', data: [{ x: 1, y: 1000 }, { x: 2, y: 3000 }] },
     ]);
+    // 30d averages hourly samples into local-day buckets.
+    const hour = 3600 * 1000;
+    const start = new Date(2026, 0, 1, 0).getTime();
+    const hourly = Array.from({ length: 30 }, (_, i) => ({ t: start + i * hour, rx: i, tx: 2 * i }));
+    const ranged = options.computed.trafficBwSeries.call({ ...state, trafficRange: '30d', trafficBw: hourly });
+    expect(ranged[0].data).toEqual([{ x: start, y: 23 }, { x: new Date(2026, 0, 2).getTime(), y: 53 }]);
     const visible = options.computed.trafficChartSeries.call({ trafficBwSeries: series, trafficHidden: { upload: true } });
     expect(visible.map((s) => s.key)).toEqual(['download']);
     const peak = options.computed.trafficPeak.call(state);
