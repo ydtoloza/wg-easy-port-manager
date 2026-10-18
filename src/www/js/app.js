@@ -445,6 +445,18 @@ new Vue({
         this.notify(err.message || err.toString());
       }
     },
+    // One click for an existing profile: a new user named after it, linked, code shown.
+    async createAccessForClient(client) {
+      try {
+        const { user, code } = await this.api.createUser({ name: client.name.slice(0, 100), canCreate: false });
+        await this.api.setClientOwner({ clientId: client.id, userId: user.id });
+        this.userCodeShown = { name: user.name, code };
+        window.location.hash = '#/users';
+        await this.refresh();
+      } catch (err) {
+        this.notify(err.message || err.toString());
+      }
+    },
     async rotateUserCode(user) {
       if (!window.confirm(this.$t('users.rotateConfirm', { name: user.name }))) return;
       try {
