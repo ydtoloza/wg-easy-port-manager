@@ -338,6 +338,10 @@
                       <td>
                         <span v-if="!user.clientIds.length" class="muted">—</span>
                         <a v-for="clientId in user.clientIds" :key="clientId" :href="'#/client/' + clientPathId(clientId)" style="margin-right:8px" @click.prevent="jumpToPeer(clientId)">{{ clientName(clientId) }}</a>
+                        <select :aria-label="$t('users.link')" @change="setClientOwner({ id: $event.target.value }, user.id); $event.target.value = ''">
+                          <option value="">{{ $t('users.link') }}</option>
+                          <option v-for="client in (clients || []).filter((c) => !user.clientIds.includes(c.id))" :key="client.id" :value="client.id">{{ client.name }}{{ ownerByClient[client.id] ? ` (${ownerByClient[client.id].name})` : '' }}</option>
+                        </select>
                       </td>
                       <td><input type="checkbox" :checked="user.canCreate" :aria-label="$t('users.canCreate')" @change="setUserCanCreate(user, $event.target.checked)" /></td>
                       <td class="muted">{{ user.codeCreatedAt ? ago(user.codeCreatedAt) : '—' }}</td>
@@ -415,6 +419,7 @@
                           <option value="">{{ $t('users.noOwner') }}</option>
                           <option v-for="user in users" :key="user.id" :value="user.id">{{ user.name }}</option>
                         </select>
+                        <button v-if="!ownerByClient[viewClient.id]" type="button" class="btn-link small" @click="createAccessForClient(viewClient)">{{ $t('users.createAccess') }}</button>
                       </dd>
                       <dt>{{ $t('ui.publicKey') }}</dt><dd class="mono">{{ viewClient.publicKey }}</dd>
                       <dt>{{ $t('ui.lastHandshake') }}</dt><dd>{{ viewClient.latestHandshakeAt ? dateTime(new Date(viewClient.latestHandshakeAt)) : $t('ui.never') }}</dd>
@@ -697,7 +702,7 @@
   <script src="./js/vendor/timeago.full.min.js"></script>
   <script src="./js/api.js"></script>
   <script src="./js/i18n.js"></script>
-  <script src="./js/app-template.generated.js?v=ca10a9b9c50c"></script>
+  <script src="./js/app-template.generated.js?v=0ac43af9354c"></script>
   <script src="./js/app.js?v=9"></script>
 </body>
 

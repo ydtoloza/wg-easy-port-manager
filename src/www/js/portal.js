@@ -135,9 +135,8 @@
 
   const showQr = async (profile) => {
     const svg = await request(`/profiles/${encodeURIComponent(profile.id)}/qrcode.svg`, { as: 'text' });
-    const img = $('qr-img');
-    if (img.src) URL.revokeObjectURL(img.src);
-    img.src = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
+    // data: not blob: — the CSP's img-src only allows 'self' and data:.
+    $('qr-img').src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
     $('qr').hidden = false;
   };
 
