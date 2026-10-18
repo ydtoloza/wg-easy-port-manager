@@ -20,7 +20,7 @@
 <a name="español"></a>
 ## 🇪🇸 Español
 
-Versión estable actual: `2.4.0`. Consulta [Despliegue en VPS](docs/vps-deployment.md) y [CI y releases](docs/ci-and-releases.md).
+Versión estable actual: `2.5.0`. Consulta [Despliegue en VPS](docs/vps-deployment.md) y [CI y releases](docs/ci-and-releases.md).
 
 > **Aviso**: Este proyecto es un fork especializado del [wg-easy](https://github.com/wg-easy/wg-easy) original de Weejewel. Este fork introduce características avanzadas de red y mejoras en la interfaz que no están presentes en el repositorio original, diseñadas específicamente para usuarios avanzados que requieren una gestión profesional de redireccionamiento de puertos.
 
@@ -59,7 +59,7 @@ volumes:
 
 services:
   wg-easy-port-manager:
-    image: ghcr.io/ydtoloza/wg-easy-port-manager:${IMAGE_TAG:-2.4.0}
+    image: ghcr.io/ydtoloza/wg-easy-port-manager:${IMAGE_TAG:-2.5.0}
     container_name: wg-easy-port-manager
     env_file: .env
     environment:
@@ -92,7 +92,7 @@ Consulta [Despliegue en VPS](docs/vps-deployment.md) para instalación, actualiz
 <a name="english"></a>
 ## 🇺🇸 English
 
-Current stable version: `2.4.0`. See [VPS deployment](docs/vps-deployment.md) and [CI and releases](docs/ci-and-releases.md).
+Current stable version: `2.5.0`. See [VPS deployment](docs/vps-deployment.md) and [CI and releases](docs/ci-and-releases.md).
 
 > **Disclaimer**: This project is a specialized fork of the original [wg-easy](https://github.com/wg-easy/wg-easy) by Weejewel. This fork introduces advanced networking features and interface enhancements not present in the upstream repository, specifically tailored for power users requiring advanced port forwarding management.
 
@@ -131,7 +131,7 @@ volumes:
 
 services:
   wg-easy-port-manager:
-    image: ghcr.io/ydtoloza/wg-easy-port-manager:${IMAGE_TAG:-2.4.0}
+    image: ghcr.io/ydtoloza/wg-easy-port-manager:${IMAGE_TAG:-2.5.0}
     container_name: wg-easy-port-manager
     env_file: .env
     environment:
