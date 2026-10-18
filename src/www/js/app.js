@@ -186,6 +186,10 @@ new Vue({
     view: 'panel',
     viewClientId: null,
     clientSearch: '',
+    users: [],
+    userNewName: '',
+    userNewCanCreate: true,
+    userCodeShown: null, // { name, code } right after creating or rotating; never stored
     clientFilter: 'all',
 
     // Consolidated "all ports" view: every forwarding rule in one table with
@@ -411,7 +415,7 @@ new Vue({
       this.navigate('client', clientId);
     },
     navigate(view, clientId) {
-      const routes = { client: `#/client/${encodeURIComponent(clientId)}`, ports: '#/ports' };
+      const routes = { client: `#/client/${encodeURIComponent(clientId)}`, ports: '#/ports', users: '#/users' };
       const hash = routes[view] || '';
       if (window.location && window.location.hash !== hash) {
         window.location.hash = hash; // hashchange → applyRoute
@@ -426,10 +430,52 @@ new Vue({
         this.view = 'client';
         this.viewClientId = decodeURIComponent(client[1]);
       } else {
-        this.view = hash === '#/ports' ? 'ports' : 'panel';
+        this.view = { '#/ports': 'ports', '#/users': 'users' }[hash] || 'panel';
         this.viewClientId = null;
       }
       if (typeof window.scrollTo === 'function') window.scrollTo(0, 0);
+    },
+    async createUser() {
+      try {
+        const { user, code } = await this.api.createUser({ name: this.userNewName, canCreate: this.userNewCanCreate });
+        this.userCodeShown = { name: user.name, code };
+        this.userNewName = '';
+        await this.refresh();
+      } catch (err) {
+        this.notify(err.message || err.toString());
+      }
+    },
+    async rotateUserCode(user) {
+      if (!window.confirm(this.$t('users.rotateConfirm', { name: user.name }))) return;
+      try {
+        const { code } = await this.api.rotateUserCode({ userId: user.id });
+        this.userCodeShown = { name: user.name, code };
+      } catch (err) {
+        this.notify(err.message || err.toString());
+      }
+    },
+    async deleteUser(user) {
+      if (!window.confirm(this.$t('users.deleteConfirm', { name: user.name }))) return;
+      await this.api.deleteUser({ userId: user.id })
+        .catch((err) => this.notify(err.message || err.toString()));
+      await this.refresh().catch(console.error);
+    },
+    async setUserCanCreate(user, canCreate) {
+      await this.api.updateUser({ userId: user.id, canCreate })
+        .catch((err) => this.notify(err.message || err.toString()));
+      await this.refresh().catch(console.error);
+    },
+    async setClientOwner(client, userId) {
+      await this.api.setClientOwner({ clientId: client.id, userId: userId || null })
+        .catch((err) => this.notify(err.message || err.toString()));
+      await this.refresh().catch(console.error);
+    },
+    clientName(clientId) {
+      const client = (this.clients || []).find((candidate) => candidate.id === clientId);
+      return client ? client.name : clientId;
+    },
+    copyText(text) {
+      if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
     },
     // Same as the `timeago` filter, usable inside template expressions.
     ago(value) {
@@ -562,11 +608,13 @@ new Vue({
       if (!this.authenticated) return;
 
       const generation = ++this.refreshGeneration;
-      const [clients, serverConfig] = await Promise.all([
+      const [clients, serverConfig, users] = await Promise.all([
         this.api.getClients(),
         this.api.getServerConfig().catch(() => null),
+        this.api.getUsers().catch(() => null),
       ]);
       if (generation !== this.refreshGeneration) return;
+      if (users) this.users = users;
       if (serverConfig) this.publicServerConfig = serverConfig;
       const forwardingChanged = this.forwardingEnabled !== (serverConfig?.forwardingEnabled === true);
       this.forwardingEnabled = serverConfig?.forwardingEnabled === true;
@@ -1381,6 +1429,14 @@ new Vue({
     },
     onlineCount() {
       return (this.clients || []).filter((client) => client.enabled && client.online).length;
+    },
+    portalUrl() {
+      return `${window.location.origin}${window.location.pathname.replace(/[^/]*$/, '')}portal.html`;
+    },
+    ownerByClient() {
+      const owners = {};
+      for (const user of this.users) for (const clientId of user.clientIds) owners[clientId] = user;
+      return owners;
     },
     filteredClients() {
       const search = (this.clientSearch || '').trim().toLowerCase();

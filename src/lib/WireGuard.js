@@ -49,6 +49,13 @@ const TOKEN_HASH_RE = /^[0-9a-f]{64}$/;
 const sha256Hex = (value) => crypto.createHash('sha256').update(value).digest('hex');
 const CLIENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const RESERVED_CLIENT_IDS = new Set(['__proto__', 'constructor', 'prototype']);
+// User access codes: 20 Crockford base32 chars (100 bits), shown as XXXX-XXXX-...
+const USER_CODE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+const USER_CODE_RE = /^[0-9A-HJKMNP-TV-Z]{20}$/;
+const PROFILE_FAMILIES = ['v4', 'v6'];
+const PORT_OFFER_COUNT = 5;
+const PORT_OFFER_TTL_MS = 15 * 60 * 1000;
+const normalizeUserCode = (code) => (typeof code === 'string' ? code.toUpperCase().replace(/[\s-]/g, '') : '');
 const SERVER_SETTING_KEYS = ['host', 'port', 'configPort', 'device', 'defaultDns',
   'defaultAddress', 'defaultAddressV6', 'enableIpv6', 'mtu', 'allowedIps',
   'persistentKeepalive', 'portFwdMin', 'portFwdMax', 'forwardingEnabled'];
@@ -119,6 +126,8 @@ const mutationContext = new AsyncLocalStorage();
 module.exports = class WireGuard {
 
   constructor() {
+    // userId -> { ports, expiresAt }: the last port options shown in the portal.
+    this.__portOffers = new Map();
     // Runtime-mutable server settings (seeded from env vars)
     this.__serverSettings = {
       host: WG_HOST,
@@ -487,7 +496,7 @@ module.exports = class WireGuard {
       throw new ServerError('Invalid configuration structure', 400);
     }
     if (strict) {
-      const rootUnknown = Object.keys(config).filter((key) => !['server', 'clients'].includes(key));
+      const rootUnknown = Object.keys(config).filter((key) => !['server', 'clients', 'users'].includes(key));
       const serverUnknown = Object.keys(config.server)
         .filter((key) => !['privateKey', 'publicKey', 'address', 'addressV6'].includes(key));
       if (rootUnknown.length) throw new ServerError(`Invalid configuration field: ${rootUnknown[0]}`, 400);
@@ -513,7 +522,25 @@ module.exports = class WireGuard {
     const networkPolicies = new Map();
     const allowedClientKeys = ['id', 'name', 'address', 'addressV6', 'privateKey', 'publicKey',
       'preSharedKey', 'createdAt', 'updatedAt', 'enabled', 'portForwards', 'allowedIPs', 'networkPolicy',
-      'tokenHash', 'tokenCreatedAt', 'selfManagePorts', 'persistentKeepalive'];
+      'tokenHash', 'tokenCreatedAt', 'selfManagePorts', 'persistentKeepalive', 'ownerId', 'family'];
+    const users = config.users ?? {};
+    if (!isPlainObject(users)) throw new ServerError('Invalid users', 400);
+    for (const [userId, user] of Object.entries(users)) {
+      if (!CLIENT_ID_RE.test(userId) || RESERVED_CLIENT_IDS.has(userId) || !isPlainObject(user) || user.id !== userId) {
+        throw new ServerError(`Invalid user entry: ${userId}`, 400);
+      }
+      if (strict) {
+        const unknown = Object.keys(user)
+          .filter((key) => !['id', 'name', 'codeHash', 'codeCreatedAt', 'canCreate', 'createdAt'].includes(key));
+        if (unknown.length) throw new ServerError(`Invalid user field: ${unknown[0]}`, 400);
+      }
+      if (!Util.isValidName(user.name)) throw new ServerError(`Invalid user name: ${userId}`, 400);
+      if (user.codeHash != null && !TOKEN_HASH_RE.test(user.codeHash)) {
+        throw new ServerError(`Invalid user.codeHash: ${userId}`, 400);
+      }
+      if (typeof user.canCreate !== 'boolean') throw new ServerError(`Invalid user.canCreate: ${userId}`, 400);
+    }
+    const ownedFamilies = new Set();
 
     for (const [clientId, client] of Object.entries(config.clients)) {
       if (!CLIENT_ID_RE.test(clientId) || RESERVED_CLIENT_IDS.has(clientId) || !isPlainObject(client)) {
@@ -567,6 +594,18 @@ module.exports = class WireGuard {
         && (!Number.isInteger(client.persistentKeepalive)
           || client.persistentKeepalive < 0 || client.persistentKeepalive > 65535)) {
         throw new ServerError(`Invalid client.persistentKeepalive: ${clientId}`, 400);
+      }
+      if (client.ownerId != null && !Object.hasOwn(users, client.ownerId)) {
+        throw new ServerError(`Invalid client.ownerId: ${clientId}`, 400);
+      }
+      if (client.family != null) {
+        if (!PROFILE_FAMILIES.includes(client.family)) throw new ServerError(`Invalid client.family: ${clientId}`, 400);
+        // One self-created profile per family and user.
+        const slot = `${client.ownerId}:${client.family}`;
+        if (client.ownerId != null && ownedFamilies.has(slot)) {
+          throw new ServerError(`Duplicate ${client.family} profile for user ${client.ownerId}`, 409);
+        }
+        ownedFamilies.add(slot);
       }
       if (!Array.isArray(client.portForwards)) {
         throw new ServerError(`Invalid client.portForwards: ${clientId}`, 400);
@@ -944,18 +983,29 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
     return this.__withMutation(async () => {
       const config = await this.getConfig();
       const client = await this.getClient({ clientId });
+      const v6 = this.__serverSettings.enableIpv6 && client.addressV6 ? `${client.addressV6}/128` : null;
+      // Portal-created profiles tunnel a single address family.
+      let addressLine = [`${client.address}/24`, v6].filter(Boolean).join(', ');
+      let { allowedIps } = this.__serverSettings;
+      if (client.family === 'v4') {
+        addressLine = `${client.address}/24`;
+        allowedIps = '0.0.0.0/0';
+      } else if (client.family === 'v6' && v6) {
+        addressLine = v6;
+        allowedIps = '::/0';
+      }
 
       return `
 [Interface]
 PrivateKey = ${client.privateKey ? `${client.privateKey}` : 'REPLACE_ME'}
-Address = ${client.address}/24${this.__serverSettings.enableIpv6 && client.addressV6 ? `, ${client.addressV6}/128` : ''}
+Address = ${addressLine}
 ${this.__serverSettings.defaultDns ? `DNS = ${this.__serverSettings.defaultDns}\n` : ''}\
 ${this.__serverSettings.mtu ? `MTU = ${this.__serverSettings.mtu}\n` : ''}\
 
 [Peer]
 PublicKey = ${config.server.publicKey}
 ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''
-}AllowedIPs = ${this.__serverSettings.allowedIps}
+}AllowedIPs = ${allowedIps}
 PersistentKeepalive = ${client.persistentKeepalive ?? this.__serverSettings.persistentKeepalive}
 Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
     });
@@ -971,55 +1021,352 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
 
   async createClient({ name }) {
     return this.__withMutation(async () => {
-      if (!Util.isValidName(name)) {
-        throw new ServerError('Invalid name: 1-128 chars, no control characters', 400);
-      }
-
       const config = await this.getConfig();
-      const privateKey = await Util.exec('wg genkey');
-      const publicKey = await Util.execFile('wg', ['pubkey'], { input: `${privateKey}\n`, log: 'wg pubkey' });
-      const preSharedKey = await Util.exec('wg genpsk');
-
-      let address;
-      let addressV6;
-      for (let i = 2; i < 255; i++) {
-        const existingClient = Object.values(config.clients).find((candidate) => {
-          return candidate.address === this.__serverSettings.defaultAddress.replace('x', i)
-            || (this.__serverSettings.enableIpv6 && candidate.addressV6 === this.__serverSettings.defaultAddressV6.replace('x', i));
-        });
-        if (!existingClient) {
-          address = this.__serverSettings.defaultAddress.replace('x', i);
-          addressV6 = this.__serverSettings.enableIpv6 ? this.__serverSettings.defaultAddressV6.replace('x', i) : null;
-          break;
-        }
-      }
-      if (!address) throw new Error('Maximum number of clients reached.');
-
-      const id = crypto.randomUUID();
-      const client = {
-        id,
-        name,
-        address,
-        addressV6,
-        privateKey,
-        publicKey,
-        preSharedKey,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        enabled: true,
-        portForwards: [],
-        networkPolicy: createDefaultNetworkPolicy(),
-      };
+      const client = await this.__newClient(config, name);
       await this.__transactionalDnatChange(
         () => {
-          config.clients[id] = client;
+          config.clients[client.id] = client;
         },
         () => {
-          delete config.clients[id];
+          delete config.clients[client.id];
         },
         'create-client',
       );
       return client;
+    });
+  }
+
+  // Builds (but does not store) a client with fresh keys and the first free
+  // address. Callers must already hold the mutation queue.
+  async __newClient(config, name) {
+    if (!Util.isValidName(name)) {
+      throw new ServerError('Invalid name: 1-128 chars, no control characters', 400);
+    }
+    const privateKey = await Util.exec('wg genkey');
+    const publicKey = await Util.execFile('wg', ['pubkey'], { input: `${privateKey}\n`, log: 'wg pubkey' });
+    const preSharedKey = await Util.exec('wg genpsk');
+
+    let address;
+    let addressV6;
+    for (let i = 2; i < 255; i++) {
+      const existingClient = Object.values(config.clients).find((candidate) => {
+        return candidate.address === this.__serverSettings.defaultAddress.replace('x', i)
+          || (this.__serverSettings.enableIpv6 && candidate.addressV6 === this.__serverSettings.defaultAddressV6.replace('x', i));
+      });
+      if (!existingClient) {
+        address = this.__serverSettings.defaultAddress.replace('x', i);
+        addressV6 = this.__serverSettings.enableIpv6 ? this.__serverSettings.defaultAddressV6.replace('x', i) : null;
+        break;
+      }
+    }
+    if (!address) throw new Error('Maximum number of clients reached.');
+
+    const id = crypto.randomUUID();
+    const client = {
+      id,
+      name,
+      address,
+      addressV6,
+      privateKey,
+      publicKey,
+      preSharedKey,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      enabled: true,
+      portForwards: [],
+      networkPolicy: createDefaultNetworkPolicy(),
+    };
+    return client;
+  }
+
+  // ── Users (an access code groups profiles; no accounts) ─────────
+
+  __getUser(config, userId) {
+    const users = config.users || {};
+    if (typeof userId !== 'string' || RESERVED_CLIENT_IDS.has(userId) || !Object.hasOwn(users, userId)) {
+      throw new ServerError(`User Not Found: ${userId}`, 404);
+    }
+    return users[userId];
+  }
+
+  __publicUser(config, user) {
+    return {
+      id: user.id,
+      name: user.name,
+      canCreate: user.canCreate,
+      hasCode: TOKEN_HASH_RE.test(user.codeHash || ''),
+      codeCreatedAt: user.codeCreatedAt ?? null,
+      createdAt: user.createdAt,
+      clientIds: Object.values(config.clients)
+        .filter((client) => client.ownerId === user.id)
+        .map((client) => client.id),
+    };
+  }
+
+  // 20 symbols from a 32-letter alphabet: b % 32 is unbiased for a byte.
+  __newUserCode() {
+    const raw = Array.from(crypto.randomBytes(20), (byte) => USER_CODE_ALPHABET[byte % 32]).join('');
+    return raw.match(/.{4}/g).join('-');
+  }
+
+  async getUsers() {
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      return Object.values(config.users || {}).map((user) => this.__publicUser(config, user));
+    });
+  }
+
+  // The plaintext code exists only in this response; only its sha256 is stored.
+  async createUser({ name, canCreate = true }) {
+    return this.__withMutation(async () => {
+      if (!Util.isValidName(name) || name.length > 100) {
+        throw new ServerError('Invalid name: 1-100 chars, no control characters', 400);
+      }
+      if (typeof canCreate !== 'boolean') throw new ServerError('canCreate must be a boolean', 400);
+      const config = await this.getConfig();
+      const code = this.__newUserCode();
+      const now = new Date();
+      const user = {
+        id: crypto.randomUUID(),
+        name,
+        codeHash: sha256Hex(normalizeUserCode(code)),
+        codeCreatedAt: now,
+        canCreate,
+        createdAt: now,
+      };
+      const hadUsers = isPlainObject(config.users);
+      await this.__transactionalConfigChange(
+        () => {
+          if (!hadUsers) config.users = {};
+          config.users[user.id] = user;
+        },
+        () => {
+          if (hadUsers) delete config.users[user.id];
+          else delete config.users;
+        },
+        { context: 'create-user' },
+      );
+      return { user: this.__publicUser(config, user), code };
+    });
+  }
+
+  async updateUser({ userId, name, canCreate }) {
+    return this.__withMutation(async () => {
+      if (name !== undefined && (!Util.isValidName(name) || name.length > 100)) {
+        throw new ServerError('Invalid name: 1-100 chars, no control characters', 400);
+      }
+      if (canCreate !== undefined && typeof canCreate !== 'boolean') {
+        throw new ServerError('canCreate must be a boolean', 400);
+      }
+      const config = await this.getConfig();
+      const user = this.__getUser(config, userId);
+      const previous = { name: user.name, canCreate: user.canCreate };
+      await this.__transactionalConfigChange(
+        () => {
+          if (name !== undefined) user.name = name;
+          if (canCreate !== undefined) user.canCreate = canCreate;
+        },
+        () => {
+          Object.assign(user, previous);
+        },
+        { context: 'update-user' },
+      );
+      return this.__publicUser(config, user);
+    });
+  }
+
+  async rotateUserCode({ userId }) {
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      const user = this.__getUser(config, userId);
+      const previous = { codeHash: user.codeHash, codeCreatedAt: user.codeCreatedAt };
+      const code = this.__newUserCode();
+      await this.__transactionalConfigChange(
+        () => {
+          user.codeHash = sha256Hex(normalizeUserCode(code));
+          user.codeCreatedAt = new Date();
+        },
+        () => {
+          Object.assign(user, previous);
+        },
+        { context: 'rotate-user-code' },
+      );
+      this.__portOffers.delete(userId);
+      return { code, codeCreatedAt: user.codeCreatedAt };
+    });
+  }
+
+  // Unlinks the user's profiles (they keep working); it never deletes peers.
+  async deleteUser({ userId }) {
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      const user = this.__getUser(config, userId);
+      const owned = Object.values(config.clients).filter((client) => client.ownerId === userId);
+      await this.__transactionalConfigChange(
+        () => {
+          for (const client of owned) client.ownerId = null;
+          delete config.users[userId];
+        },
+        () => {
+          for (const client of owned) client.ownerId = userId;
+          config.users[userId] = user;
+        },
+        { context: 'delete-user' },
+      );
+      this.__portOffers.delete(userId);
+      return { success: true };
+    });
+  }
+
+  async setClientOwner({ clientId, userId }) {
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      const client = await this.getClient({ clientId });
+      if (userId !== null) this.__getUser(config, userId);
+      const previous = { ownerId: client.ownerId ?? null, updatedAt: client.updatedAt };
+      await this.__transactionalConfigChange(
+        () => {
+          client.ownerId = userId;
+          client.updatedAt = new Date();
+        },
+        () => {
+          Object.assign(client, previous);
+        },
+        { context: 'set-client-owner' },
+      );
+      return { ownerId: userId };
+    });
+  }
+
+  // Constant-time over every stored hash, like lookupPeerToken.
+  async lookupUserCode(code) {
+    const normalized = normalizeUserCode(code);
+    if (!USER_CODE_RE.test(normalized)) return null;
+    const presented = Buffer.from(sha256Hex(normalized), 'hex');
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      let match = null;
+      for (const user of Object.values(config.users || {})) {
+        if (!TOKEN_HASH_RE.test(user.codeHash || '')) continue;
+        const stored = Buffer.from(user.codeHash, 'hex');
+        if (crypto.timingSafeEqual(presented, stored)) match = user.id;
+      }
+      return match;
+    });
+  }
+
+  // Portal view of one user. Never spread raw clients: keys stay server-side.
+  async getUserPortal({ userId }) {
+    const { user, owned } = await this.__withMutation(async () => {
+      const config = await this.getConfig();
+      const found = this.__getUser(config, userId);
+      return {
+        user: { name: found.name, canCreate: found.canCreate },
+        owned: new Map(Object.values(config.clients)
+          .filter((client) => client.ownerId === userId)
+          .map((client) => [client.id, client.family ?? null])),
+      };
+    });
+    const ipv6Available = this.__serverSettings.enableIpv6 === true;
+    const profiles = (await this.getClients())
+      .filter((client) => owned.has(client.id))
+      .map((client) => ({
+        id: client.id,
+        name: client.name,
+        family: owned.get(client.id),
+        enabled: client.enabled,
+        address: client.address,
+        addressV6: ipv6Available ? client.addressV6 : null,
+        portForwards: client.portForwards.map(({ proto, extPort, intPort }) => ({ proto, extPort, intPort })),
+        downloadableConfig: client.downloadableConfig,
+        online: client.online,
+        latestHandshakeAt: client.latestHandshakeAt,
+      }));
+    return {
+      ...user,
+      ipv6Available,
+      host: this.__serverSettings.host,
+      profiles,
+    };
+  }
+
+  __isPortFree(config, proto, port) {
+    return !Object.values(config.clients).some((peer) => Array.isArray(peer.portForwards)
+      && peer.portForwards.some((rule) => (rule.proto === proto || rule.proto === 'both' || proto === 'both')
+        && rule.extPort === port));
+  }
+
+  // Offers a handful of random free ports; creation only accepts one of
+  // the ports last offered to this user.
+  async getUserPortOffers({ userId }) {
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      this.__getUser(config, userId);
+      const min = Number(this.__serverSettings.portFwdMin);
+      const max = Number(this.__serverSettings.portFwdMax);
+      const ports = new Set();
+      for (let tries = 0; ports.size < PORT_OFFER_COUNT && tries < 2000; tries++) {
+        const port = crypto.randomInt(min, max + 1);
+        if (this.__isPortAllowed(port) && this.__isPortFree(config, 'both', port)) ports.add(port);
+      }
+      const offered = [...ports].sort((a, b) => a - b);
+      this.__portOffers.set(userId, { ports: offered, expiresAt: Date.now() + PORT_OFFER_TTL_MS });
+      return { ports: offered };
+    });
+  }
+
+  async createUserProfile({ userId, family, port }) {
+    return this.__withMutation(async () => {
+      if (!PROFILE_FAMILIES.includes(family)) throw new ServerError('family must be v4 or v6', 400);
+      if (!Number.isInteger(port)) throw new ServerError('port must be an integer', 400);
+      const config = await this.getConfig();
+      const user = this.__getUser(config, userId);
+      if (!user.canCreate) throw new ServerError('Creating profiles is disabled for this user', 403);
+      if (family === 'v6' && !this.__serverSettings.enableIpv6) {
+        throw new ServerError('IPv6 is not enabled on this server', 400);
+      }
+      if (Object.values(config.clients).some((client) => client.ownerId === userId && client.family === family)) {
+        throw new ServerError(`This user already has an ${family === 'v4' ? 'IPv4' : 'IPv6'} profile`, 409);
+      }
+      const offer = this.__portOffers.get(userId);
+      if (!offer || offer.expiresAt < Date.now() || !offer.ports.includes(port)) {
+        throw new ServerError('Port is not one of the offered options', 400);
+      }
+      if (!this.__isPortAllowed(port) || !this.__isPortFree(config, 'both', port)) {
+        throw new ServerError('Port is no longer available, ask for new options', 409);
+      }
+      const client = await this.__newClient(config, `${user.name}-${family === 'v4' ? 'ipv4' : 'ipv6'}`);
+      Object.assign(client, {
+        ownerId: userId,
+        family,
+        portForwards: [{
+          id: crypto.randomUUID(), proto: 'both', extPort: port, intPort: port,
+        }],
+      });
+      await this.__transactionalDnatChange(
+        () => {
+          config.clients[client.id] = client;
+        },
+        () => {
+          delete config.clients[client.id];
+        },
+        'create-user-profile',
+        {
+          event: {
+            type: 'port.confirmed', clientId: client.id, proto: 'both', extPort: port, intPort: port,
+          },
+        },
+      );
+      this.__portOffers.delete(userId);
+      return { id: client.id, name: client.name, family };
+    });
+  }
+
+  async assertUserOwnsClient({ userId, clientId }) {
+    return this.__withMutation(async () => {
+      const config = await this.getConfig();
+      const client = Object.hasOwn(config.clients, clientId) ? config.clients[clientId] : null;
+      if (!client || client.ownerId !== userId) throw new ServerError(`Client Not Found: ${clientId}`, 404);
     });
   }
 
@@ -2166,16 +2513,12 @@ Endpoint = ${this.__serverSettings.host}:${this.__serverSettings.configPort}`;
         (_, offset) => windowMin + offset,
       )];
 
-      const inUse = (port) => Object.values(config.clients).some((peer) => Array.isArray(peer.portForwards)
-        && peer.portForwards.some((rule) => (rule.proto === proto || rule.proto === 'both' || proto === 'both')
-          && rule.extPort === port));
-
       for (const port of candidates) {
         if (port < windowMin || port > windowMax) continue; // sticky ports may fall outside the requested window
         // __isPortAllowed enforces the policy window and the reserved ports
         // (server port, config port).
         if (!this.__isPortAllowed(port)) continue;
-        if (inUse(port)) continue;
+        if (!this.__isPortFree(config, proto, port)) continue;
         return this.__addPortForward(clientId, proto, port, internalPort);
       }
       throw new ServerError('No free port available in the configured range', 409);

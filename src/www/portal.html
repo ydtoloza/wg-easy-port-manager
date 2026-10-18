@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html class="dark" lang="es">
+
+<head>
+  <title>WireGuard · Portal</title>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <link href="./css/app.css?v=6" rel="stylesheet">
+  <link rel="icon" type="image/png" href="./img/favicon.png">
+  <style>[hidden] { display: none !important; }</style>
+  <script>try { var t = localStorage.theme; if (t === 'light' || (t === 'auto' && !matchMedia('(prefers-color-scheme: dark)').matches)) document.documentElement.classList.remove('dark'); } catch (e) {}</script>
+</head>
+
+<body>
+  <div id="login" class="login" hidden>
+    <h1 style="text-align:center;font-size:22px"><img src="./img/logo.png" width="28" height="28" alt="" style="display:inline;vertical-align:-6px;margin-right:8px" />WireGuard</h1>
+    <form id="login-form" class="box box-body stack" style="padding:16px">
+      <label class="field" style="font-size:14px">Código de acceso
+        <input name="code" class="mono" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX" style="height:36px" required />
+      </label>
+      <p id="login-error" class="error-box" role="alert" hidden></p>
+      <button type="submit" class="btn btn-primary" style="height:36px">Entrar</button>
+      <p class="xsmall muted" style="margin:0">Tu administrador te entrega este código.</p>
+    </form>
+  </div>
+
+  <div id="home" hidden>
+    <header class="top">
+      <div class="top-in">
+        <span class="brand"><img src="./img/logo.png" width="22" height="22" alt="" />WireGuard</span>
+        <span id="user-name" class="grow muted"></span>
+        <button id="logout" type="button" class="btn">Salir</button>
+      </div>
+    </header>
+    <main class="wrap">
+      <div>
+        <h1>Mis perfiles</h1>
+        <p class="muted" style="margin:4px 0 0">Cada perfil es una configuración de WireGuard para un dispositivo.</p>
+      </div>
+      <p id="error" class="error-box" role="alert" hidden></p>
+      <div id="profiles" class="cols"></div>
+      <section id="create" class="box" aria-labelledby="h-create" hidden>
+        <div class="box-head"><h2 id="h-create">Crear perfil</h2></div>
+        <div id="create-body" class="box-body stack"></div>
+      </section>
+      <p class="small muted" style="margin:0">La configuración incluye la clave privada del perfil: descárgala solo en tus dispositivos y no la compartas.</p>
+    </main>
+  </div>
+
+  <div id="qr" class="modal" hidden>
+    <div class="modal-backdrop" data-close></div>
+    <div class="modal-panel" style="max-width:420px" role="dialog" aria-modal="true" aria-labelledby="h-qr">
+      <div class="modal-head"><h2 id="h-qr">Código QR</h2><button type="button" class="btn-link" data-close>Cerrar</button></div>
+      <div class="modal-body"><img id="qr-img" alt="Código QR de la configuración" style="width:100%;background:#fff;border-radius:6px" /></div>
+    </div>
+  </div>
+
+  <script src="./js/portal.js"></script>
+</body>
+
+</html>

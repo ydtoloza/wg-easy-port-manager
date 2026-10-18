@@ -68,6 +68,7 @@ describe('port-forward UI state', () => {
       api: {
         getClients: jest.fn().mockResolvedValue([]),
         getServerConfig: jest.fn().mockRejectedValue(new Error('unavailable')),
+        getUsers: jest.fn().mockResolvedValue([]),
       },
       scheduleAutoProbe: jest.fn(),
     };
@@ -94,6 +95,7 @@ describe('port-forward UI state', () => {
       api: {
         getClients: jest.fn().mockResolvedValue([currentClient]),
         getServerConfig: jest.fn().mockResolvedValue({ forwardingEnabled: true }),
+        getUsers: jest.fn().mockResolvedValue([]),
       },
       scheduleAutoProbe: jest.fn(),
       $set(target, key, value) {
@@ -583,6 +585,7 @@ describe('port-forwarding panel persistence', () => {
       api: {
         getClients: jest.fn().mockResolvedValue([client()]),
         getServerConfig: jest.fn().mockResolvedValue({ forwardingEnabled: true, portFwdMin: 1024, portFwdMax: 65535 }),
+        getUsers: jest.fn().mockResolvedValue([]),
       },
       scheduleAutoProbe: jest.fn(),
       $set(target, key, value) {
@@ -611,6 +614,7 @@ describe('port-forwarding panel persistence', () => {
       api: {
         getClients: jest.fn().mockResolvedValue([]),
         getServerConfig: jest.fn().mockResolvedValue({ forwardingEnabled: true }),
+        getUsers: jest.fn().mockResolvedValue([]),
       },
       scheduleAutoProbe: jest.fn(),
       $set(target, key, value) {
@@ -774,6 +778,7 @@ describe('views and client list', () => {
     };
     expect(route('')).toEqual(['panel', null]);
     expect(route('#/ports')).toEqual(['ports', null]);
+    expect(route('#/users')).toEqual(['users', null]);
     expect(route('#/client/a%2Fb')).toEqual(['client', 'a/b']);
     expect(route('#/unknown')).toEqual(['panel', null]);
 
@@ -809,5 +814,14 @@ describe('views and client list', () => {
     expect(options.computed.onlineCount.call({ clients })).toBe(1);
     expect(options.computed.viewClient.call({ clients, viewClientId: 'b' }).name).toBe('laptop');
     expect(options.computed.viewClient.call({ clients, viewClientId: 'zz' })).toBeNull();
+  });
+
+  it('maps each linked client to its user', () => {
+    const options = loadAppOptions();
+    const users = [{ id: 'u1', name: 'ana', clientIds: ['a', 'b'] }, { id: 'u2', name: 'luis', clientIds: [] }];
+    const owners = options.computed.ownerByClient.call({ users });
+    expect(owners.a.name).toBe('ana');
+    expect(owners.b.id).toBe('u1');
+    expect(owners.c).toBeUndefined();
   });
 });

@@ -35,8 +35,9 @@
           <div class="top-in">
             <span class="brand"><img src="./img/logo.png" width="22" height="22" alt="" />WireGuard</span>
             <nav class="top-nav" :aria-label="$t('ui.panel')">
-              <a href="#" :aria-current="view !== 'ports' ? 'page' : null" @click.prevent="navigate('panel')">{{ $t('ui.panel') }}</a>
+              <a href="#" :aria-current="view === 'panel' || view === 'client' ? 'page' : null" @click.prevent="navigate('panel')">{{ $t('ui.panel') }}</a>
               <a href="#/ports" :aria-current="view === 'ports' ? 'page' : null">{{ $t('ui.ports') }} <span v-if="totalPortRules" class="muted">{{ totalPortRules }}</span></a>
+              <a href="#/users" :aria-current="view === 'users' ? 'page' : null">{{ $t('users.title') }} <span v-if="users.length" class="muted">{{ users.length }}</span></a>
             </nav>
             <div class="top-actions">
               <div style="position:relative">
@@ -295,6 +296,65 @@
             <p class="muted small" style="margin:0">{{ $t('ui.rulesShown', { shown: allPortsRows.length, total: totalPortRules }) }}</p>
           </template>
 
+          <!-- ───────────── Users ───────────── -->
+          <template v-else-if="view === 'users'">
+            <div>
+              <h1>{{ $t('users.title') }}</h1>
+              <p class="muted" style="margin:4px 0 0">{{ $t('users.hint') }} <a :href="portalUrl" target="_blank" rel="noopener">{{ portalUrl }}</a></p>
+            </div>
+            <div v-if="userCodeShown" class="notice" role="status">
+              <div class="row">
+                <div class="grow">
+                  <div>{{ $t('users.codeFor', { name: userCodeShown.name }) }}</div>
+                  <div class="mono strong" style="font-size:18px;margin:4px 0">{{ userCodeShown.code }}</div>
+                  <div class="xsmall muted">{{ $t('users.codeOnce') }}</div>
+                </div>
+                <button type="button" class="btn btn-sm" @click="copyText(userCodeShown.code)">{{ $t('users.copy') }}</button>
+                <button type="button" class="btn-link small" @click="userCodeShown = null">{{ $t('users.hide') }}</button>
+              </div>
+            </div>
+            <form class="box box-body row" @submit.prevent="createUser">
+              <label class="field grow">{{ $t('name') }}
+                <input v-model.trim="userNewName" required maxlength="100" />
+              </label>
+              <label class="row small"><input v-model="userNewCanCreate" type="checkbox" /> {{ $t('users.canCreate') }}</label>
+              <button type="submit" class="btn btn-primary" :disabled="!userNewName">{{ $t('users.create') }}</button>
+            </form>
+            <section class="box">
+              <div class="scroll-x">
+                <table class="table" style="min-width:640px">
+                  <thead>
+                    <tr>
+                      <th>{{ $t('name') }}</th>
+                      <th>{{ $t('users.profiles') }}</th>
+                      <th>{{ $t('users.canCreate') }}</th>
+                      <th>{{ $t('users.code') }}</th>
+                      <th><span class="sr-only">{{ $t('ui.colActions') }}</span></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="user in users" :key="user.id">
+                      <td class="strong">{{ user.name }}</td>
+                      <td>
+                        <span v-if="!user.clientIds.length" class="muted">—</span>
+                        <a v-for="clientId in user.clientIds" :key="clientId" :href="'#/client/' + clientPathId(clientId)" style="margin-right:8px" @click.prevent="jumpToPeer(clientId)">{{ clientName(clientId) }}</a>
+                      </td>
+                      <td><input type="checkbox" :checked="user.canCreate" :aria-label="$t('users.canCreate')" @change="setUserCanCreate(user, $event.target.checked)" /></td>
+                      <td class="muted">{{ user.codeCreatedAt ? ago(user.codeCreatedAt) : '—' }}</td>
+                      <td class="right nowrap">
+                        <button type="button" class="btn-link" @click="rotateUserCode(user)">{{ $t('users.rotate') }}</button>
+                        <span class="muted">·</span>
+                        <button type="button" class="btn-link" style="color:var(--danger)" @click="deleteUser(user)">{{ $t('users.delete') }}</button>
+                      </td>
+                    </tr>
+                    <tr v-if="!users.length"><td colspan="5" class="empty">{{ $t('users.empty') }}</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+            <p class="muted small" style="margin:0">{{ $t('users.linkHint') }}</p>
+          </template>
+
           <!-- ───────────── Client detail ───────────── -->
           <template v-else>
             <div v-if="clients === null" class="empty"><div class="spinner"></div></div>
@@ -349,6 +409,13 @@
                           <span v-else><span class="mono">{{ viewClient.addressV6 }}</span> <button type="button" class="btn-link small" @click="clientEditAddressV6 = viewClient.addressV6; clientEditAddressV6Id = viewClient.id">{{ $t('ui.edit') }}</button></span>
                         </dd>
                       </template>
+                      <dt>{{ $t('users.owner') }}</dt>
+                      <dd>
+                        <select :value="ownerByClient[viewClient.id] ? ownerByClient[viewClient.id].id : ''" :aria-label="$t('users.owner')" @change="setClientOwner(viewClient, $event.target.value)">
+                          <option value="">{{ $t('users.noOwner') }}</option>
+                          <option v-for="user in users" :key="user.id" :value="user.id">{{ user.name }}</option>
+                        </select>
+                      </dd>
                       <dt>{{ $t('ui.publicKey') }}</dt><dd class="mono">{{ viewClient.publicKey }}</dd>
                       <dt>{{ $t('ui.lastHandshake') }}</dt><dd>{{ viewClient.latestHandshakeAt ? dateTime(new Date(viewClient.latestHandshakeAt)) : $t('ui.never') }}</dd>
                       <dt>{{ $t('ui.colUsage') }}</dt><dd class="num">{{ viewClient.transferTx != null ? fmtBytes(viewClient.transferTx) : '—' }} / {{ viewClient.transferRx != null ? fmtBytes(viewClient.transferRx) : '—' }}</dd>
@@ -630,7 +697,7 @@
   <script src="./js/vendor/timeago.full.min.js"></script>
   <script src="./js/api.js"></script>
   <script src="./js/i18n.js"></script>
-  <script src="./js/app-template.generated.js?v=7d7bf3cdb8e0"></script>
+  <script src="./js/app-template.generated.js?v=ca10a9b9c50c"></script>
   <script src="./js/app.js?v=9"></script>
 </body>
 

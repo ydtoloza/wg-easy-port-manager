@@ -2,6 +2,26 @@
 
 const messages = { // eslint-disable-line no-unused-vars
   en: {
+    users: {
+      title: 'Users',
+      hint: 'Each user gets an access code for the self-service portal:',
+      codeFor: 'Access code for {name}',
+      codeOnce: 'Shown only once. Rotate it if it gets lost.',
+      copy: 'Copy',
+      hide: 'Hide',
+      canCreate: 'Can create profiles',
+      create: 'Create user',
+      profiles: 'Profiles',
+      code: 'Code issued',
+      rotate: 'New code',
+      delete: 'Delete',
+      empty: 'No users yet.',
+      linkHint: 'Link existing profiles from each client’s detail page. With "Can create profiles", the user can add one IPv4 and one IPv6 profile, each with a port chosen from 5 options.',
+      owner: 'User',
+      noOwner: 'No user',
+      rotateConfirm: 'Issue a new code for {name}? The current code stops working.',
+      deleteConfirm: 'Delete the user {name}? Their profiles keep working, unlinked.',
+    },
     ui: {
       panel: 'Panel',
       ports: 'Ports',
@@ -448,6 +468,26 @@ const messages = { // eslint-disable-line no-unused-vars
     donate: 'Donatiu',
   },
   es: { // github.com/amarqz
+    users: {
+      title: 'Usuarios',
+      hint: 'Cada usuario recibe un código de acceso al portal:',
+      codeFor: 'Código de acceso de {name}',
+      codeOnce: 'Se muestra una sola vez. Si se pierde, genera uno nuevo.',
+      copy: 'Copiar',
+      hide: 'Ocultar',
+      canCreate: 'Puede crear perfiles',
+      create: 'Crear usuario',
+      profiles: 'Perfiles',
+      code: 'Código emitido',
+      rotate: 'Nuevo código',
+      delete: 'Eliminar',
+      empty: 'Aún no hay usuarios.',
+      linkHint: 'Vincula perfiles existentes desde el detalle de cada cliente. Con "Puede crear perfiles", el usuario puede agregar un perfil IPv4 y uno IPv6, cada uno con un puerto elegido entre 5 opciones.',
+      owner: 'Usuario',
+      noOwner: 'Sin usuario',
+      rotateConfirm: '¿Generar un código nuevo para {name}? El código actual dejará de funcionar.',
+      deleteConfirm: '¿Eliminar al usuario {name}? Sus perfiles siguen funcionando, sin vincular.',
+    },
     ui: {
       panel: 'Panel',
       ports: 'Puertos',
