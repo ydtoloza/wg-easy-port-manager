@@ -73,6 +73,25 @@ const RANDOM_PORT_BLOCKLIST = new Set([
 const LINUX_EPHEMERAL_MIN = 32768;
 const LINUX_EPHEMERAL_MAX = 60999;
 
+// Long ranges average samples into local-time buckets so spikes don't bury
+// the trend; the legend's peak/total still use the raw samples.
+const CHART_BUCKET_MS = { '24h': 30 * 60 * 1000, '30d': 24 * 60 * 60 * 1000 };
+function bucketAverage(samples, ms) {
+  const buckets = new Map();
+  for (const s of samples) {
+    const offset = new Date(s.t).getTimezoneOffset() * 60000;
+    const t = Math.floor((s.t - offset) / ms) * ms + offset;
+    const b = buckets.get(t) || {
+      t, rx: 0, tx: 0, n: 0,
+    };
+    b.rx += s.rx || 0;
+    b.tx += s.tx || 0;
+    b.n += 1;
+    buckets.set(t, b);
+  }
+  return [...buckets.values()].map((b) => ({ t: b.t, rx: b.rx / b.n, tx: b.tx / b.n }));
+}
+
 const isEphemeralPort = (port) => port >= LINUX_EPHEMERAL_MIN && port <= LINUX_EPHEMERAL_MAX;
 
 // Uniform draw from [min, max] avoiding blocked values, preferring ports that
@@ -1400,9 +1419,11 @@ new Vue({
     trafficBwSeries() {
       // Named from the clients' point of view: what wg0 transmits is what
       // clients download. x/y pairs so the tooltip shows the hour.
+      const bucket = CHART_BUCKET_MS[this.trafficRange];
+      const bw = bucket ? bucketAverage(this.trafficBw, bucket) : this.trafficBw;
       return [
-        { key: 'download', name: this.$t('ui.download'), data: this.trafficBw.map((s) => ({ x: s.t, y: Math.round(s.tx || 0) })) },
-        { key: 'upload', name: this.$t('ui.upload'), data: this.trafficBw.map((s) => ({ x: s.t, y: Math.round(s.rx || 0) })) },
+        { key: 'download', name: this.$t('ui.download'), data: bw.map((s) => ({ x: s.t, y: Math.round(s.tx || 0) })) },
+        { key: 'upload', name: this.$t('ui.upload'), data: bw.map((s) => ({ x: s.t, y: Math.round(s.rx || 0) })) },
       ];
     },
     trafficChartSeries() {
@@ -1410,7 +1431,10 @@ new Vue({
     },
     trafficChartOptions() {
       const c = THEME_COLORS[this.theme] || THEME_COLORS.dark;
-      return { ...this.trafficPanelOptions, colors: this.trafficChartSeries.map((s) => c[s.key]) };
+      const base = this.trafficPanelOptions;
+      // Daily buckets: the hour in the tooltip would always read 00:00.
+      const tooltip = this.trafficRange === '30d' ? { ...base.tooltip, x: { format: 'dd MMM' } } : base.tooltip;
+      return { ...base, tooltip, colors: this.trafficChartSeries.map((s) => c[s.key]) };
     },
     // Legend numbers for the displayed window: current, average, peak and
     // bytes transferred (rate integrated over each sample interval).
