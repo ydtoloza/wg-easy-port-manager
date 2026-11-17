@@ -6,7 +6,7 @@
 ![GitHub last commit](https://img.shields.io/github/last-commit/ydtoloza/wg-easy-port-manager)
 
 
-### 📸 UI Preview (Port Forwarding Manager)
+### 📸 UI Preview (Admin Panel)
 <p align="center">
   <img src="assets/ui_preview.png" alt="WG-Easy Port Manager UI" width="600" />
 </p>
