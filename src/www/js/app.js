@@ -1549,7 +1549,8 @@ new Vue({
           labels: {
             show: true,
             style: { colors: c.text, fontSize: '12px' },
-            formatter: (v) => `${bytes(v, 0)}/s`,
+            // 1 decimal: nice-scale ticks like 2.5 MB/s must not round into their neighbours.
+            formatter: (v) => `${bytes(v, 1)}/s`,
           },
         },
         tooltip: {
