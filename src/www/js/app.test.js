@@ -267,6 +267,15 @@ describe('traffic side panel', () => {
     expect(state.setTheme).toHaveBeenCalledWith('light');
   });
 
+  it('keeps y-axis rate labels distinct for half-step ticks', () => {
+    const options = loadAppOptions();
+    const fmt = options.computed.trafficPanelOptions.call({ theme: 'dark' }).yaxis.labels.formatter;
+    const labels = [0, 0.5e6, 1e6, 1.5e6, 2e6, 2.5e6, 3e6].map(fmt);
+    expect(new Set(labels).size).toBe(labels.length);
+    expect(fmt(2.5e6)).toBe('2.5 MB/s');
+    expect(fmt(3e6)).toBe('3 MB/s');
+  });
+
   it('computes legend stats for the displayed window, integrating bytes per interval', () => {
     const options = loadAppOptions();
     // wg0 tx = clients' download, rx = clients' upload; samples 2 s apart.
