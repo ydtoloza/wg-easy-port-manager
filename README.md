@@ -20,7 +20,7 @@
 <a name="español"></a>
 ## 🇪🇸 Español
 
-Versión estable actual: `2.5.0`. Consulta [Despliegue en VPS](docs/vps-deployment.md) y [CI y releases](docs/ci-and-releases.md).
+Versión estable actual: `2.5.0`. Consulta [Despliegue en VPS](docs/vps-deployment.md), [CI y releases](docs/ci-and-releases.md) y las [notas de versión](docs/releases/).
 
 > **Aviso**: Este proyecto es un fork especializado del [wg-easy](https://github.com/wg-easy/wg-easy) original de Weejewel. Este fork introduce características avanzadas de red y mejoras en la interfaz que no están presentes en el repositorio original, diseñadas específicamente para usuarios avanzados que requieren una gestión profesional de redireccionamiento de puertos.
 
@@ -38,6 +38,12 @@ Este fork mantiene la simplicidad de la interfaz original de WireGuard e introdu
 *   **Gestión de Sesiones Robusta**: Se resolvieron problemas de bloqueos silenciosos durante el inicio de sesión y caídas de tokens de autenticación en entornos con proxy inverso o alta latencia.
 *   **Soporte para Modo de Red Host**: Optimizado para ejecutarse con `network_mode: "host"` para obtener el máximo rendimiento.
 *   **Optimizado para Seeding qBittorrent**: `WG_MTU` ahora se aplica al servidor `wg0` (`MTU=`), `txqueuelen 5000`, `masquerade` atómico via `nft` (`WG_NFT_MASQUERADE`), `BBR/fq` y buffers `16M` + `conntrack_max 262144` via `scripts/host-tune.sh`. Ver `docs/qbittorrent-seed.md`.
+*   **Panel de Administración Rediseñado (2.4)**: Tema oscuro por defecto, gráfico de tráfico de `wg0` (2m / 1h / 24h / 30d, agrupado en intervalos) con tasa actual, promedio, pico y total; CPU/RAM y tasas de `wg0` y WAN; tabla de clientes con búsqueda y filtro de estado; vistas de detalle de cliente (`#/client/<id>`) y de todos los puertos (`#/ports`) con búsqueda y filtros.
+*   **Usuarios y Portal de Autoservicio (2.5)**: Pestaña **Usuarios** para crear personas con un código de acceso (sin cuentas) y vincularles perfiles. En `/portal.html` el usuario ve sus perfiles y puertos abiertos, descarga el `.conf` o su QR y, si se le permite, crea un perfil IPv4 y uno IPv6 con un puerto elegido entre 5 libres.
+*   **Indicadores de Alcanzabilidad y Notificaciones**: Punto de estado por regla (verde, ámbar, rojo, gris) mediante sondeos automáticos, centro de notificaciones persistente y generador de puerto aleatorio libre para seeding.
+*   **Estadísticas y Backups Persistentes**: El historial de tráfico sobrevive a reinicios y el estado (`wg0.json`, `server-settings.json`, `webhook.json`) se respalda automáticamente en `/etc/wireguard/backups/` (`WG_BACKUP_ENABLED`, `WG_BACKUP_INTERVAL_HOURS=24`, `WG_BACKUP_RETENTION=7`).
+
+> **Portal público**: para publicar solo el portal, usa un proxy inverso que reenvíe únicamente `/portal.html`, `/js/portal.js`, `/css/`, `/img/` y `/api/portal/`, y define `TRUSTED_PROXY_IP`. Mantén el panel de administración en una red privada.
 
 ### 🛠 Instalación y Despliegue
 
@@ -92,7 +98,7 @@ Consulta [Despliegue en VPS](docs/vps-deployment.md) para instalación, actualiz
 <a name="english"></a>
 ## 🇺🇸 English
 
-Current stable version: `2.5.0`. See [VPS deployment](docs/vps-deployment.md) and [CI and releases](docs/ci-and-releases.md).
+Current stable version: `2.5.0`. See [VPS deployment](docs/vps-deployment.md), [CI and releases](docs/ci-and-releases.md) and the [release notes](docs/releases/).
 
 > **Disclaimer**: This project is a specialized fork of the original [wg-easy](https://github.com/wg-easy/wg-easy) by Weejewel. This fork introduces advanced networking features and interface enhancements not present in the upstream repository, specifically tailored for power users requiring advanced port forwarding management.
 
@@ -110,6 +116,12 @@ This fork maintains the simplicity of the original WireGuard UI while injecting 
 *   **Robust Session Management**: Resolved silent hanging issues during login and authentication token drops in reverse-proxy or high-latency environments.
 *   **Host Network Mode Support**: Optimized to run with `network_mode: "host"` for maximum performance and reduced overhead.
 *   **Optimized for qBittorrent Seeding**: Server `MTU` applied to `wg0`, `txqueuelen 5000`, atomic `nft` masquerade (`WG_NFT_MASQUERADE`), `BBR/fq` and `16M` buffers + `conntrack_max 262144` via `scripts/host-tune.sh`. See `docs/qbittorrent-seed.md`.
+*   **Redesigned Admin Panel (2.4)**: Dark theme by default, a `wg0` traffic chart (2m / 1h / 24h / 30d, averaged into time buckets) with current rate, average, peak and total; CPU/RAM plus `wg0` and WAN rates; a clients table with search and status filter; client detail (`#/client/<id>`) and all-ports (`#/ports`) views with search and filters.
+*   **Users & Self-Service Portal (2.5)**: A **Users** tab creates people with an access code (no accounts) and links profiles to them. At `/portal.html` a user sees their profiles and open ports, downloads the `.conf` or its QR code and, when allowed, creates one IPv4 and one IPv6 profile with a port picked from 5 free ones.
+*   **Reachability Indicators & Notifications**: Per-rule status dots (green, amber, red, gray) from automatic probes, a persistent notification center and a random free port generator for seeding.
+*   **Persistent Stats & Backups**: Traffic history survives restarts, and state (`wg0.json`, `server-settings.json`, `webhook.json`) is backed up automatically into `/etc/wireguard/backups/` (`WG_BACKUP_ENABLED`, `WG_BACKUP_INTERVAL_HOURS=24`, `WG_BACKUP_RETENTION=7`).
+
+> **Public portal**: to publish only the portal, put a reverse proxy in front that forwards just `/portal.html`, `/js/portal.js`, `/css/`, `/img/` and `/api/portal/`, and set `TRUSTED_PROXY_IP`. Keep the admin panel on a private network.
 
 ### 🛠 Installation & Deployment
 
